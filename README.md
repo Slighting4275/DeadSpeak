@@ -121,3 +121,7 @@ adb shell am start -n org.deadspeak/android.app.NativeActivity
 Recordings and the word log are stored in the app's private `files/evidence` directory. Grant camera and microphone permissions when prompted. The app does not upload recordings.
 
 On GrapheneOS, also allow DeadSpeak's Sensors permission to use the magnetometer. [GrapheneOS's sensor-permission control](https://grapheneos.org/features#sensors-permission-toggle) can block readings independently of whether sensor hardware is present. The manifest declares that permission explicitly; recording permissions remain separate.
+
+## License
+
+DeadSpeak is free software licensed under the **GNU General Public License Version 3 or later (GPL-3.0-or-later)** combined with the **GNU Affero General Public License Version 3 or later (AGPL-3.0-or-later)** pursuant to Section 13. See the [LICENSE](LICENSE) file for complete terms and conditions.
