@@ -53,6 +53,26 @@ set(DS_ZIG_OBJECT_DIR "${CMAKE_CURRENT_BINARY_DIR}/zig-objects")
 set(DS_MAIN_OBJECT "${DS_ZIG_OBJECT_DIR}/main.c.o")
 set(DS_GLUE_OBJECT "${DS_ZIG_OBJECT_DIR}/android_native_app_glue.c.o")
 set(DS_VIDEO_OBJECT "${DS_ZIG_OBJECT_DIR}/video_capture.c.o")
+set(DS_EXPLORE_OBJECT "${DS_ZIG_OBJECT_DIR}/explore.c.o")
+
+add_custom_command(
+    OUTPUT "${DS_EXPLORE_OBJECT}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DS_ZIG_OBJECT_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E env "ZIG_LIB_DIR=${DS_ZIG_LIB_DIR}"
+            ${DS_ZIG_EXECUTABLE} cc
+            -target ${DS_ZIG_TARGET}
+            --sysroot=${CMAKE_SYSROOT}
+            -I${CMAKE_SYSROOT}/usr/include
+            -I${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
+            -I${CMAKE_CURRENT_SOURCE_DIR}
+            -std=c17 -O3 -fPIC -ffunction-sections -fdata-sections
+            -DANDROID
+            -c "${CMAKE_CURRENT_SOURCE_DIR}/explore.c"
+            -o "${DS_EXPLORE_OBJECT}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/explore.c" "${CMAKE_CURRENT_SOURCE_DIR}/explore.h"
+    COMMENT "Compiling native Wikipedia Explore client with Zig cc (${DS_ZIG_TARGET})"
+    VERBATIM
+)
 
 add_custom_command(
     OUTPUT "${DS_VIDEO_OBJECT}"
@@ -112,13 +132,14 @@ add_custom_command(
     VERBATIM
 )
 
-add_custom_target(ds_c_objects DEPENDS "${DS_MAIN_OBJECT}" "${DS_GLUE_OBJECT}" "${DS_VIDEO_OBJECT}")
-set_source_files_properties("${DS_MAIN_OBJECT}" "${DS_GLUE_OBJECT}" "${DS_VIDEO_OBJECT}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+add_custom_target(ds_c_objects DEPENDS "${DS_MAIN_OBJECT}" "${DS_GLUE_OBJECT}" "${DS_VIDEO_OBJECT}" "${DS_EXPLORE_OBJECT}")
+set_source_files_properties("${DS_MAIN_OBJECT}" "${DS_GLUE_OBJECT}" "${DS_VIDEO_OBJECT}" "${DS_EXPLORE_OBJECT}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
 
 add_library(deadspeak SHARED
     "${DS_MAIN_OBJECT}"
     "${DS_GLUE_OBJECT}"
     "${DS_VIDEO_OBJECT}"
+    "${DS_EXPLORE_OBJECT}"
 )
 set_target_properties(deadspeak PROPERTIES LINKER_LANGUAGE C)
 target_include_directories(deadspeak PRIVATE

@@ -1,6 +1,11 @@
 #include <stdint.h>
+#include <ctype.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+
+#define MAX_WORDS 6000
+#define WORD_BYTES 32
 
 static const char *words[] = {
     "MORROW", "HOLLOW", "NORTH", "EMBER", "STILL", "BELOW", "THRESHOLD", "RIVER",
@@ -64,16 +69,61 @@ static int write_u32(FILE *file, uint32_t value) {
 }
 
 int main(void) {
+    char entries[MAX_WORDS][WORD_BYTES];
+    uint32_t count = 0;
+    for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); ++i) {
+        bool duplicate = false;
+        for (uint32_t n = 0; n < count; ++n) {
+            if (strcmp(entries[n], words[i]) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate && count < MAX_WORDS) snprintf(entries[count++], WORD_BYTES, "%s", words[i]);
+    }
+
+    FILE *source = fopen("tools/data/english-common.txt", "r");
+    if (!source) {
+        fprintf(stderr, "Could not open tools/data/english-common.txt\n");
+        return 1;
+    }
+    char line[128];
+    while (count < MAX_WORDS && fgets(line, sizeof(line), source)) {
+        size_t length = strcspn(line, "\r\n");
+        if (length < 3 || length >= WORD_BYTES) continue;
+        char normalized[WORD_BYTES];
+        bool valid = true;
+        for (size_t i = 0; i < length; ++i) {
+            const unsigned char c = (unsigned char)line[i];
+            if (!isalpha(c) || c > 127) {
+                valid = false;
+                break;
+            }
+            normalized[i] = (char)toupper(c);
+        }
+        if (!valid) continue;
+        normalized[length] = '\0';
+        bool duplicate = false;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (strcmp(entries[i], normalized) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) snprintf(entries[count++], WORD_BYTES, "%s", normalized);
+    }
+    fclose(source);
+
     FILE *file = fopen("app/src/main/assets/words.bin", "wb");
     if (!file) return 1;
-    const uint32_t count = (uint32_t)(sizeof(words) / sizeof(words[0]));
     int ok = fwrite("DSWB", 1, 4, file) == 4;
     ok = ok && write_u32(file, 1);
     ok = ok && write_u32(file, count);
     for (uint32_t i = 0; ok && i < count; ++i) {
-        const size_t length = strlen(words[i]);
-        ok = write_u16(file, (uint16_t)length) && fwrite(words[i], 1, length, file) == length;
+        const size_t length = strlen(entries[i]);
+        ok = write_u16(file, (uint16_t)length) && fwrite(entries[i], 1, length, file) == length;
     }
     fclose(file);
+    if (ok) fprintf(stderr, "Wrote %u unique dictionary entries\n", count);
     return ok ? 0 : 1;
 }

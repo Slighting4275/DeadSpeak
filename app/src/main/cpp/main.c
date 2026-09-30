@@ -6,6 +6,7 @@
 #include <android_native_app_glue.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
+#include <ctype.h>
 #include <math.h>
 #include <stdbool.h>
 #include <dirent.h>
@@ -19,6 +20,7 @@
 #include <unistd.h>
 
 #include "engine.h"
+#include "explore.h"
 #include "video_capture.h"
 
 #define LOG_TAG "DeadSpeak"
@@ -57,6 +59,12 @@ typedef struct {
     _Atomic uint32_t audio_level_milli;
     _Atomic uint32_t spectrum_milli[3];
     DSVideoCapture video;
+    DSVideoFilter video_filter;
+    DSExplore explore;
+    char explore_cache_path[512];
+    char explore_query[48];
+    size_t explore_page;
+    bool explore_search_active;
     char evidence_dir[512];
     char word_log_path[512];
     char words[DS_LOG_CAPACITY][32];
@@ -510,6 +518,77 @@ static void draw_guide(DeadSpeak *state, float panel_r, float panel_g, float pan
     text(state, "EVP CAPTURE SAVES MONO WAV AUDIO", 34, 510, 1.0f, muted_r, muted_g, muted_b, 1.0f);
     text(state, "VIDEO SAVES MP4 UP TO 1080P", 34, 532, 1.0f, muted_r, muted_g, muted_b, 1.0f);
     text(state, "AUDIO AND VIDEO ARE SEPARATE FILES", 34, 554, 0.95f, muted_r, muted_g, muted_b, 1.0f);
+    text(state, "NIGHT BOOSTS CAMERA EXPOSURE", 34, 576, 0.95f, amber_r, amber_g, amber_b, 1.0f);
+    text(state, "MONO AND SEPIA NEED CAMERA SUPPORT", 34, 598, 0.8f, muted_r, muted_g, muted_b, 1.0f);
+}
+
+static void draw_explore(DeadSpeak *state, float panel_r, float panel_g, float panel_b,
+                         float mint_r, float mint_g, float mint_b, float muted_r, float muted_g, float muted_b,
+                         float amber_r, float amber_g, float amber_b) {
+    rect(state, 18, 150, state->width - 36, state->height - 270, panel_r, panel_g, panel_b, 1.0f);
+    text(state, "WIKIPEDIA FIELD INDEX", 34, 170, 1.7f, mint_r, mint_g, mint_b, 1.0f);
+    text(state, "REFRESH", state->width - 92.0f, 170, 0.95f, amber_r, amber_g, amber_b, 1.0f);
+    text(state, "REPORTED HAUNTED LOCATIONS", 34, 192, 1.0f, muted_r, muted_g, muted_b, 1.0f);
+    rect(state, 30, 211, state->width - 60, 36, 0.13f, 0.18f, 0.18f, 1.0f);
+    text(state, state->explore_query[0] ? state->explore_query : "TAP TO SEARCH", 42, 223, 1.4f,
+         state->explore_query[0] ? mint_r : muted_r, state->explore_query[0] ? mint_g : muted_g,
+         state->explore_query[0] ? mint_b : muted_b, 1.0f);
+
+    DSExplorePlace places[DS_EXPLORE_PAGE_SIZE];
+    size_t match_count = 0;
+    const size_t count = ds_explore_page(&state->explore, state->explore_query,
+                                        state->explore_page, places, &match_count);
+    if (atomic_load(&state->explore.loading) && match_count == 0) {
+        text(state, "LOADING PUBLIC PLACE INDEX", 34, 285, 1.3f, amber_r, amber_g, amber_b, 1.0f);
+        text(state, "WIKIPEDIA COMMUNITY CATEGORIES", 34, 315, 1.0f, muted_r, muted_g, muted_b, 1.0f);
+    } else if (match_count == 0) {
+        text(state, atomic_load(&state->explore.failed) ? "INDEX UNAVAILABLE - TAP REFRESH" : "NO MATCHING PLACES",
+             34, 285, 1.1f, amber_r, amber_g, amber_b, 1.0f);
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const float y = 275.0f + (float)i * 62.0f;
+        text(state, places[i].title, 34, y, 1.4f, mint_r, mint_g, mint_b, 1.0f);
+        char source_line[80];
+        snprintf(source_line, sizeof(source_line), "%s  %s", places[i].region,
+                 places[i].wikidata_id[0] ? places[i].wikidata_id : "NO WIKIDATA ITEM");
+        text(state, source_line, 34, y + 20.0f, 0.8f, muted_r, muted_g, muted_b, 1.0f);
+        if (places[i].has_coordinates) {
+            char coordinate_line[64];
+            snprintf(coordinate_line, sizeof(coordinate_line), "LAT %.0f  LON %.0f",
+                     places[i].latitude, places[i].longitude);
+            text(state, coordinate_line, 34, y + 36.0f, 0.75f, amber_r, amber_g, amber_b, 1.0f);
+        }
+        rect(state, 34, y + 45.0f, state->width - 68, 1.0f, 0.17f, 0.24f, 0.23f, 1.0f);
+    }
+    char page_label[48];
+    snprintf(page_label, sizeof(page_label), "MATCHES %u  PAGE %u", (unsigned)match_count,
+             (unsigned)(state->explore_page + 1U));
+    text(state, page_label, 34, state->height - 174.0f, 0.95f, muted_r, muted_g, muted_b, 1.0f);
+    text(state, "PREV", 34, state->height - 143.0f, 1.2f, muted_r, muted_g, muted_b, 1.0f);
+    text(state, "NEXT", state->width - 90.0f, state->height - 143.0f, 1.2f, mint_r, mint_g, mint_b, 1.0f);
+    text(state, "TOP: WIKIPEDIA  LOWER: WIKIDATA", 34, state->height - 113.0f,
+         0.82f, amber_r, amber_g, amber_b, 1.0f);
+}
+
+static void start_explore(DeadSpeak *state) {
+    if (state->explore_cache_path[0]) {
+        ds_explore_start(&state->explore, state->app->activity, state->explore_cache_path);
+    }
+}
+
+static int32_t ascii_from_key(int32_t key, int32_t meta) {
+    const bool shifted = (meta & AMETA_SHIFT_ON) != 0;
+    if (key >= AKEYCODE_A && key <= AKEYCODE_Z) {
+        const int32_t letter = 'a' + key - AKEYCODE_A;
+        return shifted ? letter - ('a' - 'A') : letter;
+    }
+    if (key >= AKEYCODE_0 && key <= AKEYCODE_9) return '0' + key - AKEYCODE_0;
+    if (key == AKEYCODE_SPACE) return ' ';
+    if (key == AKEYCODE_PERIOD) return '.';
+    if (key == AKEYCODE_COMMA) return ',';
+    if (key == AKEYCODE_MINUS) return shifted ? '_' : '-';
+    if (key == AKEYCODE_APOSTROPHE) return shifted ? '"' : '\'';
+    return 0;
 }
 
 static void draw_frame(DeadSpeak *state) {
@@ -532,14 +611,24 @@ static void draw_frame(DeadSpeak *state) {
     text(state, "RAW SENSOR FIELDWORK", w - 138, 29, 1.25f, muted_r, muted_g, muted_b, 1.0f);
     rect(state, 18, 72, w - 36, 1, 0.19f, 0.27f, 0.26f, 0.9f);
 
-    text(state, state->tab == 0 ? "FIELD SCAN" : (state->tab == 1 ? "EVIDENCE LOG" : "FIELD GUIDE"), 22, 94, 3.4f, 0.95f, 0.98f, 0.94f, 1.0f);
-    text(state, state->has_magnetometer ? "MAGNETOMETER ONLINE" : "MAGNETOMETER UNAVAILABLE", 22, 122, 1.5f, state->has_magnetometer ? mint_r : amber_r, state->has_magnetometer ? mint_g : amber_g, state->has_magnetometer ? mint_b : amber_b, 1.0f);
+    const char *screen_title = state->tab == 0 ? "FIELD SCAN" : (state->tab == 1 ? "EVIDENCE LOG" :
+                               (state->tab == 2 ? "EXPLORE" : "FIELD GUIDE"));
+    text(state, screen_title, 22, 94, 3.4f, 0.95f, 0.98f, 0.94f, 1.0f);
+    if (state->tab == 2) {
+        text(state, "PUBLIC REPORTS - NOT VERIFIED CLAIMS", 22, 122, 1.05f, amber_r, amber_g, amber_b, 1.0f);
+    } else {
+        text(state, state->has_magnetometer ? "MAGNETOMETER ONLINE" : "MAGNETOMETER UNAVAILABLE", 22, 122, 1.5f, state->has_magnetometer ? mint_r : amber_r, state->has_magnetometer ? mint_g : amber_g, state->has_magnetometer ? mint_b : amber_b, 1.0f);
+    }
 
     if (state->tab == 1) {
         draw_log(state, panel_r, panel_g, panel_b, mint_r, mint_g, mint_b, muted_r, muted_g, muted_b);
         goto navigation;
     }
     if (state->tab == 2) {
+        draw_explore(state, panel_r, panel_g, panel_b, mint_r, mint_g, mint_b, muted_r, muted_g, muted_b, amber_r, amber_g, amber_b);
+        goto navigation;
+    }
+    if (state->tab == 3) {
         draw_guide(state, panel_r, panel_g, panel_b, mint_r, mint_g, mint_b, muted_r, muted_g, muted_b, amber_r, amber_g, amber_b);
         goto navigation;
     }
@@ -582,7 +671,10 @@ static void draw_frame(DeadSpeak *state) {
     const bool capture_failed = atomic_load(&state->audio_failed) || ds_video_failed(&state->video);
     const char *capture_label = capture_active ? "LIVE" : (state->capture_requested ? "ALLOW ACCESS" : (capture_failed ? "ERROR" : "READY"));
     text(state, capture_label, second_x + 14, 526, 3.2f, capture_active ? amber_r : (capture_failed ? amber_r : mint_r), capture_active ? amber_g : (capture_failed ? amber_g : mint_g), capture_active ? amber_b : (capture_failed ? amber_b : mint_b), 1.0f);
-    text(state, capture_active ? "WAV VIDEO" : "TAP TO RECORD", second_x + 14, 575, 1.15f, muted_r, muted_g, muted_b, 1.0f);
+    static const char *const filter_names[] = {"NIGHT", "MONO", "SEPIA", "RAW"};
+    char filter_label[32];
+    snprintf(filter_label, sizeof(filter_label), "FILTER: %s", filter_names[state->video_filter]);
+    text(state, filter_label, second_x + 14, 575, 1.05f, muted_r, muted_g, muted_b, 1.0f);
     const unsigned audio_level = atomic_load(&state->audio_level_milli);
     rect(state, 18, 620, w - 36, 76, panel_r, panel_g, panel_b, 1.0f);
     text(state, "MIC", 32, 630, 1.0f, muted_r, muted_g, muted_b, 1.0f);
@@ -602,9 +694,10 @@ navigation:
     ;
     const float nav_y = h - 92;
     rect(state, 18, nav_y, w - 36, 1, 0.19f, 0.27f, 0.26f, 0.9f);
-    text(state, "SCAN", 40, nav_y + 25, 1.7f, state->tab == 0 ? mint_r : muted_r, state->tab == 0 ? mint_g : muted_g, state->tab == 0 ? mint_b : muted_b, 1.0f);
-    text(state, "LOG", w * 0.46f, nav_y + 25, 1.7f, state->tab == 1 ? mint_r : muted_r, state->tab == 1 ? mint_g : muted_g, state->tab == 1 ? mint_b : muted_b, 1.0f);
-    text(state, "GUIDE", w - 92, nav_y + 25, 1.7f, state->tab == 2 ? mint_r : muted_r, state->tab == 2 ? mint_g : muted_g, state->tab == 2 ? mint_b : muted_b, 1.0f);
+    text(state, "SCAN", w * 0.08f, nav_y + 25, 1.2f, state->tab == 0 ? mint_r : muted_r, state->tab == 0 ? mint_g : muted_g, state->tab == 0 ? mint_b : muted_b, 1.0f);
+    text(state, "LOG", w * 0.32f, nav_y + 25, 1.2f, state->tab == 1 ? mint_r : muted_r, state->tab == 1 ? mint_g : muted_g, state->tab == 1 ? mint_b : muted_b, 1.0f);
+    text(state, "EXPLORE", w * 0.51f, nav_y + 25, 1.1f, state->tab == 2 ? mint_r : muted_r, state->tab == 2 ? mint_g : muted_g, state->tab == 2 ? mint_b : muted_b, 1.0f);
+    text(state, "GUIDE", w * 0.81f, nav_y + 25, 1.2f, state->tab == 3 ? mint_r : muted_r, state->tab == 3 ? mint_g : muted_g, state->tab == 3 ? mint_b : muted_b, 1.0f);
     text(state, "SKEPTICISM IS A FEATURE", 22, h - 39, 1.1f, muted_r, muted_g, muted_b, 1.0f);
 
     eglSwapBuffers(state->display, state->surface);
@@ -623,16 +716,71 @@ static void handle_cmd(struct android_app *app, int32_t cmd) {
 
 static int32_t handle_input(struct android_app *app, AInputEvent *event) {
     DeadSpeak *state = (DeadSpeak *)app->userData;
+    if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_KEY && state->tab == 2 && state->explore_search_active &&
+        AKeyEvent_getAction(event) == AKEY_EVENT_ACTION_DOWN) {
+        const int32_t key = AKeyEvent_getKeyCode(event);
+        size_t length = strlen(state->explore_query);
+        if (key == AKEYCODE_DEL) {
+            if (length > 0) state->explore_query[length - 1U] = '\0';
+            state->explore_page = 0;
+        } else if (key == AKEYCODE_ENTER || key == AKEYCODE_BACK) {
+            state->explore_search_active = false;
+            ANativeActivity_hideSoftInput(state->app->activity, ANATIVEACTIVITY_HIDE_SOFT_INPUT_NOT_ALWAYS);
+        } else {
+            const int32_t unicode = ascii_from_key(key, AKeyEvent_getMetaState(event));
+            if (unicode >= 32 && unicode <= 126 && length + 1U < sizeof(state->explore_query)) {
+                state->explore_query[length] = (char)toupper((unsigned char)unicode);
+                state->explore_query[length + 1U] = '\0';
+                state->explore_page = 0;
+            }
+        }
+        return 1;
+    }
     if (AInputEvent_getType(event) != AINPUT_EVENT_TYPE_MOTION) return 0;
     if ((AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK) != AMOTION_EVENT_ACTION_UP) return 1;
     const float x = AMotionEvent_getX(event, 0);
     const float y = AMotionEvent_getY(event, 0);
     const float nav_y = state->height - 110.0f;
     if (y > nav_y) {
-        if (x < state->width * 0.33f) state->tab = 0;
-        else if (x < state->width * 0.66f) state->tab = 1;
-        else state->tab = 2;
-    } else if (state->tab == 0 && y > 460.0f && y < 610.0f && x > state->width * 0.52f) {
+        const int previous_tab = state->tab;
+        if (x < state->width * 0.25f) state->tab = 0;
+        else if (x < state->width * 0.50f) state->tab = 1;
+        else if (x < state->width * 0.75f) state->tab = 2;
+        else state->tab = 3;
+        if (previous_tab == 2 && state->tab != 2 && state->explore_search_active) {
+            state->explore_search_active = false;
+            ANativeActivity_hideSoftInput(state->app->activity, ANATIVEACTIVITY_HIDE_SOFT_INPUT_NOT_ALWAYS);
+        }
+        if (state->tab == 2) start_explore(state);
+    } else if (state->tab == 2 && y >= 155.0f && y <= 194.0f && x > state->width - 115.0f) {
+        ds_explore_refresh(&state->explore, state->app->activity, state->explore_cache_path);
+    } else if (state->tab == 2 && y >= 207.0f && y <= 252.0f) {
+        state->explore_search_active = true;
+        ANativeActivity_showSoftInput(state->app->activity, ANATIVEACTIVITY_SHOW_SOFT_INPUT_IMPLICIT);
+    } else if (state->tab == 2 && y >= state->height - 166.0f && y <= state->height - 128.0f) {
+        DSExplorePlace places[DS_EXPLORE_PAGE_SIZE];
+        size_t match_count = 0;
+        (void)ds_explore_page(&state->explore, state->explore_query, 0, places, &match_count);
+        const size_t last_page = match_count == 0 ? 0 : (match_count - 1U) / DS_EXPLORE_PAGE_SIZE;
+        if (x > state->width * 0.5f && state->explore_page < last_page) ++state->explore_page;
+        else if (x <= state->width * 0.5f && state->explore_page > 0) --state->explore_page;
+    } else if (state->tab == 2 && y >= 268.0f && y < 268.0f + DS_EXPLORE_PAGE_SIZE * 62.0f) {
+        const unsigned row = (unsigned)((y - 268.0f) / 62.0f);
+        DSExplorePlace places[DS_EXPLORE_PAGE_SIZE];
+        size_t match_count = 0;
+        const size_t count = ds_explore_page(&state->explore, state->explore_query,
+                                            state->explore_page, places, &match_count);
+        if (row < count) {
+            state->explore_search_active = false;
+            ANativeActivity_hideSoftInput(state->app->activity, ANATIVEACTIVITY_HIDE_SOFT_INPUT_NOT_ALWAYS);
+            if ((y - 268.0f - (float)row * 62.0f) >= 29.0f && places[row].wikidata_id[0])
+                ds_explore_open_wikidata(state->app->activity, places[row].wikidata_id);
+            else
+                ds_explore_open_article(state->app->activity, places[row].page_id);
+        }
+    } else if (state->tab == 0 && y >= 556.0f && y < 610.0f && x > state->width * 0.52f) {
+        state->video_filter = (DSVideoFilter)(((unsigned)state->video_filter + 1U) % 4U);
+    } else if (state->tab == 0 && y > 460.0f && y < 556.0f && x > state->width * 0.52f) {
         if (atomic_load(&state->audio_active) || ds_video_active(&state->video) || state->capture_requested) {
             state->capture_requested = false;
             state->permission_requested = false;
@@ -640,7 +788,7 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
             ds_video_stop(&state->video);
         } else if (has_capture_permissions(state)) {
             start_audio_capture(state);
-            ds_video_start(&state->video, state->evidence_dir);
+            ds_video_start(&state->video, state->evidence_dir, state->video_filter);
         } else {
             state->capture_requested = true;
             state->permission_deadline = now_millis() + 15000U;
@@ -692,10 +840,13 @@ void android_main(struct android_app *app) {
     state.context = EGL_NO_CONTEXT;
     state.smoothed_field = 47.0f;
     state.scanning = true;
+    state.video_filter = DS_VIDEO_FILTER_RAW;
     state.word[0] = 0;
+    ds_explore_init(&state.explore);
     load_dictionary(&state);
     snprintf(state.evidence_dir, sizeof(state.evidence_dir), "%s/evidence", app->activity->internalDataPath);
     snprintf(state.word_log_path, sizeof(state.word_log_path), "%s/word-log.csv", state.evidence_dir);
+    snprintf(state.explore_cache_path, sizeof(state.explore_cache_path), "%s/wikipedia-places-v2.tsv", state.evidence_dir);
     mkdir(state.evidence_dir, 0700);
     load_word_log(&state);
     refresh_media_files(&state);
@@ -717,7 +868,7 @@ void android_main(struct android_app *app) {
                 state.capture_requested = false;
                 state.permission_requested = false;
                 start_audio_capture(&state);
-                ds_video_start(&state.video, state.evidence_dir);
+                ds_video_start(&state.video, state.evidence_dir, state.video_filter);
             } else if (loop_time >= state.permission_deadline) {
                 state.capture_requested = false;
                 state.permission_requested = false;
@@ -739,6 +890,7 @@ void android_main(struct android_app *app) {
                 stop_audio_capture(&state);
                 ds_video_stop(&state.video);
                 free(state.dictionary);
+                ds_explore_destroy(&state.explore);
                 teardown_display(&state);
                 return;
             }

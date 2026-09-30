@@ -128,6 +128,28 @@ static bool camera_id_and_size(ACameraManager *manager, char *selected_id, size_
     return selected;
 }
 
+static bool configure_filter(ACameraMetadata *metadata, ACaptureRequest *request, DSVideoFilter filter) {
+    if (filter == DS_VIDEO_FILTER_RAW) return true;
+    if (filter == DS_VIDEO_FILTER_NIGHT) {
+        ACameraMetadata_const_entry range = {0};
+        if (ACameraMetadata_getConstEntry(metadata, ACAMERA_CONTROL_AE_COMPENSATION_RANGE, &range) != ACAMERA_OK ||
+            range.count < 2 || range.data.i32[1] <= 0) return false;
+        const int32_t compensation = range.data.i32[1] < 6 ? range.data.i32[1] : 6;
+        return ACaptureRequest_setEntry_i32(request, ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION,
+                                            1, &compensation) == ACAMERA_OK;
+    }
+
+    ACameraMetadata_const_entry effects = {0};
+    if (ACameraMetadata_getConstEntry(metadata, ACAMERA_CONTROL_AVAILABLE_EFFECTS, &effects) != ACAMERA_OK) return false;
+    const uint8_t effect = filter == DS_VIDEO_FILTER_MONO ? ACAMERA_CONTROL_EFFECT_MODE_MONO : ACAMERA_CONTROL_EFFECT_MODE_SEPIA;
+    bool supported = false;
+    for (uint32_t i = 0; i < effects.count; ++i) {
+        if (effects.data.u8[i] == effect) supported = true;
+    }
+    if (!supported) return false;
+    return ACaptureRequest_setEntry_u8(request, ACAMERA_CONTROL_EFFECT_MODE, 1, &effect) == ACAMERA_OK;
+}
+
 static bool pump_encoder(AMediaCodec *codec, AMediaMuxer *muxer, ssize_t *video_track,
                          bool *muxer_started, bool *saw_frame, bool *saw_eos, int64_t timeout_us) {
     AMediaCodecBufferInfo info = {0};
@@ -186,6 +208,7 @@ static void *video_thread(void *user_data) {
     ssize_t video_track = -1;
     char video_path[640] = {0};
     int32_t width = 0, height = 0;
+    ACameraMetadata *characteristics = NULL;
 
     pthread_mutex_init(&wait.mutex, NULL);
     pthread_cond_init(&wait.condition, NULL);
@@ -193,6 +216,7 @@ static void *video_thread(void *user_data) {
     manager = ACameraManager_create();
     char camera_id[64] = {0};
     if (!manager || !camera_id_and_size(manager, camera_id, sizeof(camera_id), &width, &height)) goto cleanup;
+    if (ACameraManager_getCameraCharacteristics(manager, camera_id, &characteristics) != ACAMERA_OK || !characteristics) goto cleanup;
 
     ACameraDevice_StateCallbacks device_callbacks = {
         .context = &wait,
@@ -245,6 +269,7 @@ static void *video_thread(void *user_data) {
     session_callbacks_ready = true;
     if (!wait_for_camera(&wait, false)) goto cleanup;
     if (ACameraDevice_createCaptureRequest(device, TEMPLATE_RECORD, &request) != ACAMERA_OK || !request ||
+        !configure_filter(characteristics, request, capture->filter) ||
         ACameraOutputTarget_create(input_surface, &target) != ACAMERA_OK || !target ||
         ACaptureRequest_addTarget(request, target) != ACAMERA_OK ||
         ACameraCaptureSession_setRepeatingRequest(session, NULL, 1, &request, NULL) != ACAMERA_OK) goto cleanup;
@@ -273,6 +298,7 @@ cleanup:
     if (outputs) ACaptureSessionOutputContainer_free(outputs);
     if (output) ACaptureSessionOutput_free(output);
     if (device) ACameraDevice_close(device);
+    if (characteristics) ACameraMetadata_free(characteristics);
     if (manager) ACameraManager_delete(manager);
     if (codec_started) {
         AMediaCodec_stop(codec);
@@ -297,9 +323,10 @@ cleanup:
     return NULL;
 }
 
-void ds_video_start(DSVideoCapture *capture, const char *evidence_dir) {
+void ds_video_start(DSVideoCapture *capture, const char *evidence_dir, DSVideoFilter filter) {
     if (capture->thread_created || atomic_load(&capture->active)) return;
     snprintf(capture->evidence_dir, sizeof(capture->evidence_dir), "%s", evidence_dir);
+    capture->filter = filter;
     atomic_store(&capture->failed, false);
     atomic_store(&capture->active, true);
     if (pthread_create(&capture->thread, NULL, video_thread, capture) != 0) {
