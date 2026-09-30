@@ -7,6 +7,7 @@
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <ctype.h>
+#include <errno.h>
 #include <math.h>
 #include <stdbool.h>
 #include <dirent.h>
@@ -24,6 +25,7 @@
 #include "jni_scope.h"
 #include "video_capture.h"
 #include "ui_layout.h"
+#include "sensor_state.h"
 
 #define LOG_TAG "DeadSpeak"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -32,6 +34,11 @@
 #define DS_AUDIO_RATE 48000
 #define DS_EXPLORE_ROW_HEIGHT 62.0f
 #define DS_EXPLORE_ROW_SOURCE 27.0f
+#define DS_SENSOR_COUNT 3
+static const int sensor_types[DS_SENSOR_COUNT] = {
+    ASENSOR_TYPE_MAGNETIC_FIELD, ASENSOR_TYPE_ACCELEROMETER, ASENSOR_TYPE_GYROSCOPE
+};
+static const char *const sensor_names[DS_SENSOR_COUNT] = {"MAGNETIC", "ACCEL", "GYRO"};
 
 typedef struct {
     struct android_app *app;
@@ -52,14 +59,17 @@ typedef struct {
     GLint position;
     GLint color;
     ASensorManager *sensor_manager;
-    const ASensor *magnetometer;
+    const ASensor *sensors[DS_SENSOR_COUNT];
     ASensorEventQueue *sensor_queue;
+    DSSensorReading readings[DS_SENSOR_COUNT];
+    bool sensors_resumed;
+    uint64_t next_sensor_access_check;
+    int64_t last_magnetic_log_ns;
     float magnetic_field;
     float smoothed_field;
     float signal;
     uint32_t sample_count;
     char word[32];
-    bool has_magnetometer;
     bool scanning;
     bool capture_requested;
     bool permission_requested;
@@ -91,8 +101,16 @@ typedef struct {
     unsigned log_count;
     unsigned log_next;
     int tab;
-    float sweep;
 } DeadSpeak;
+
+static void start_sensors(DeadSpeak *state);
+static void stop_sensors(DeadSpeak *state, DSSensorStatus status);
+static void maintain_sensors(DeadSpeak *state);
+static int64_t sensor_now_ns(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_BOOTTIME, &ts) != 0) return 0;
+    return (int64_t)ts.tv_sec * INT64_C(1000000000) + ts.tv_nsec;
+}
 
 static void append_word_log(DeadSpeak *state, const char *word) {
     if (!word || !word[0]) return;
@@ -727,8 +745,8 @@ static void draw_frame(DeadSpeak *state) {
     const float panel_r = 0.075f, panel_g = 0.105f, panel_b = 0.11f;
     const float w = (float)state->width;
     const float h = (float)state->height;
-    const float now = (float)(now_millis() % 10000ULL) / 10000.0f;
-    state->sweep = now * 6.2831853f;
+    const int64_t sensor_time = sensor_now_ns();
+    const bool magnetic_live = ds_sensor_live(&state->readings[0], sensor_time);
 
     glClearColor(0.027f, 0.043f, 0.047f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
@@ -752,8 +770,9 @@ static void draw_frame(DeadSpeak *state) {
     if (state->tab == 2) {
         text(state, "PUBLIC REPORTS - NOT VERIFIED CLAIMS", 22, state->ui.subtitle_y, fit_text_scale("PUBLIC REPORTS - NOT VERIFIED CLAIMS", 1.05f, w - 44), amber_r, amber_g, amber_b, 1.0f);
     } else {
-        const char *sensor_label = state->has_magnetometer ? "MAGNETOMETER ONLINE" : "MAGNETOMETER UNAVAILABLE";
-        text(state, sensor_label, 22, state->ui.subtitle_y, fit_text_scale(sensor_label, state->ui.compact ? 1.1f : 1.5f, w - 44), state->has_magnetometer ? mint_r : amber_r, state->has_magnetometer ? mint_g : amber_g, state->has_magnetometer ? mint_b : amber_b, 1.0f);
+        char sensor_label[64];
+        snprintf(sensor_label, sizeof(sensor_label), "MAGNETOMETER %s", ds_sensor_status_name(state->readings[0].status));
+        text(state, sensor_label, 22, state->ui.subtitle_y, fit_text_scale(sensor_label, state->ui.compact ? 1.1f : 1.5f, w - 44), magnetic_live ? mint_r : amber_r, magnetic_live ? mint_g : amber_g, magnetic_live ? mint_b : amber_b, 1.0f);
     }
 
     const DSRect body = state->ui.body;
@@ -792,26 +811,33 @@ static void draw_frame(DeadSpeak *state) {
     circle(state, cx, cy, radius * 0.67f, 0.14f, 0.24f, 0.23f, 0.9f);
     line(state, cx - radius - 12, cy, cx + radius + 12, cy, 0.13f, 0.23f, 0.22f, 0.9f);
     line(state, cx, cy - radius - 12, cx, cy + radius + 12, 0.13f, 0.23f, 0.22f, 0.9f);
-    line(state, cx, cy, cx + cosf(state->sweep) * radius, cy + sinf(state->sweep) * radius, mint_r, mint_g, mint_b, 0.9f);
+    if (magnetic_live) {
+        const float angle = atan2f(state->readings[0].xyz[1], state->readings[0].xyz[0]);
+        line(state, cx, cy, cx + cosf(angle) * radius, cy + sinf(angle) * radius, mint_r, mint_g, mint_b, 0.9f);
+    }
     circle(state, cx, cy, 5, mint_r, mint_g, mint_b, 1.0f);
 
     char value[32];
-    snprintf(value, sizeof(value), "%05.1f", state->smoothed_field);
+    if (magnetic_live) snprintf(value, sizeof(value), "%05.1f", state->magnetic_field);
+    else snprintf(value, sizeof(value), "%s", ds_sensor_status_name(state->readings[0].status));
     const float value_scale = fit_text_scale(value, 5.0f, field.w - 84.0f);
     const float value_width = (float)strlen(value) * 6.0f * value_scale;
     const float value_x = cx - (value_width + 12.0f + 2.0f * 6.0f * 1.6f) * 0.5f;
     text(state, value, value_x, cy - value_scale * 3.5f, value_scale, 0.95f, 0.98f, 0.94f, 1.0f);
-    text(state, "UT", value_x + value_width + 12.0f, cy - 5.6f, 1.6f, muted_r, muted_g, muted_b, 1.0f);
+    if (magnetic_live) text(state, "UT", value_x + value_width + 12.0f, cy - 5.6f, 1.6f, muted_r, muted_g, muted_b, 1.0f);
 
-    const float signal_width = (field.w - 36) * state->signal;
+    const float signal_width = (field.w - 36) * (magnetic_live ? state->signal : 0.0f);
     rect(state, field.x + 18, field.y + field.h - 36, field.w - 36, 4, 0.14f, 0.20f, 0.20f, 1.0f);
     rect(state, field.x + 18, field.y + field.h - 36, signal_width, 4, mint_r, mint_g, mint_b, 1.0f);
-    text(state, "BASELINE 47.0", field.x + 18, field.y + field.h - 20, 1.2f, muted_r, muted_g, muted_b, 1.0f);
+    char motion_label[64];
+    snprintf(motion_label, sizeof(motion_label), "ACCEL %s  GYRO %s", ds_sensor_status_name(state->readings[1].status), ds_sensor_status_name(state->readings[2].status));
+    text(state, motion_label, field.x + 18, field.y + field.h - 20,
+         fit_text_scale(motion_label, 1.0f, field.w - 110), muted_r, muted_g, muted_b, 1.0f);
     text(state, state->scanning ? "SCANNING" : "STANDBY", field.x + field.w - 72, field.y + field.h - 20, 1.2f, state->scanning ? mint_r : amber_r, state->scanning ? mint_g : amber_g, state->scanning ? mint_b : amber_b, 1.0f);
 
     rect(state, word.x, word.y, word.w, word.h, panel_r, panel_g, panel_b, 1.0f);
     text(state, "SIGNAL WORD", word.x + 14, word.y + 20, fit_text_scale("SIGNAL WORD", 1.4f, word.w - 28), muted_r, muted_g, muted_b, 1.0f);
-    const char *word_label = state->word[0] ? state->word : "QUIET";
+    const char *word_label = magnetic_live ? (state->word[0] ? state->word : "QUIET") : "NO SENSOR DATA";
     const float word_width = word.w - 28.0f;
     text(state, word_label, word.x + 14, word.y + word.h * 0.43f, fit_text_scale(word_label, 3.8f, word_width), mint_r, mint_g, mint_b, 1.0f);
     text(state, "ENVIRONMENTAL TRIGGER", word.x + 14, word.y + word.h - 25, fit_text_scale("ENVIRONMENTAL TRIGGER", 1.15f, word_width), muted_r, muted_g, muted_b, 1.0f);
@@ -874,7 +900,13 @@ static void handle_cmd(struct android_app *app, int32_t cmd) {
     else if (cmd == APP_CMD_TERM_WINDOW) teardown_display(state);
     else if (cmd == APP_CMD_CONFIG_CHANGED || cmd == APP_CMD_WINDOW_RESIZED || cmd == APP_CMD_CONTENT_RECT_CHANGED)
         update_display_geometry(state);
+    else if (cmd == APP_CMD_RESUME) {
+        state->sensors_resumed = true;
+        start_sensors(state);
+    }
     else if (cmd == APP_CMD_PAUSE) {
+        state->sensors_resumed = false;
+        stop_sensors(state, DS_SENSOR_PAUSED);
         state->capture_requested = false;
         stop_audio_capture(state);
         ds_video_stop(&state->video);
@@ -1012,14 +1044,26 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
 static void poll_sensor(DeadSpeak *state) {
     ASensorEvent event;
     while (state->sensor_queue && ASensorEventQueue_getEvents(state->sensor_queue, &event, 1) > 0) {
-        if (event.type != ASENSOR_TYPE_MAGNETIC_FIELD) continue;
-        const float x = event.magnetic.x;
-        const float y = event.magnetic.y;
-        const float z = event.magnetic.z;
-        state->magnetic_field = sqrtf(x * x + y * y + z * z);
-        state->smoothed_field = ds_engine_smooth(state->smoothed_field, state->magnetic_field, 0.15f);
+        unsigned index;
+        for (index = 0; index < DS_SENSOR_COUNT; ++index) if (event.type == sensor_types[index]) break;
+        if (index == DS_SENSOR_COUNT || !state->sensors_resumed) continue;
+        DSSensorReading *reading = &state->readings[index];
+        const int64_t received = sensor_now_ns();
+        DSSampleResult sample = ds_sensor_accept(reading, event.timestamp, received,
+            event.vector.x, event.vector.y, event.vector.z, event.vector.status);
+        if (sample == DS_SAMPLE_REJECTED || index != 0) continue;
+        state->magnetic_field = reading->magnitude;
+        state->smoothed_field = sample == DS_SAMPLE_FIRST ? reading->magnitude :
+            ds_engine_smooth(state->smoothed_field, reading->magnitude, 0.15f);
         state->signal = ds_engine_signal(state->smoothed_field);
+        if (state->sample_count == UINT32_MAX) state->sample_count = 0;
         ++state->sample_count;
+        if (!state->last_magnetic_log_ns || received - state->last_magnetic_log_ns >= INT64_C(5000000000)) {
+            state->last_magnetic_log_ns = received;
+            __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG,
+                "MAGNETOMETER LIVE samples=%u field=%.3f uT xyz=%.3f,%.3f,%.3f accuracy=%d",
+                state->sample_count, state->magnetic_field, reading->xyz[0], reading->xyz[1], reading->xyz[2], reading->accuracy);
+        }
         if (state->scanning && state->sample_count % 10U == 0U) {
             ds_engine_next_word(state->smoothed_field, state->sample_count, state->dictionary,
                                 state->dictionary_size, state->word, sizeof(state->word));
@@ -1028,17 +1072,65 @@ static void poll_sensor(DeadSpeak *state) {
     }
 }
 
+static void stop_sensors(DeadSpeak *state, DSSensorStatus status) {
+    for (unsigned i = 0; i < DS_SENSOR_COUNT; ++i) {
+        if (state->sensor_queue && state->sensors[i] && state->readings[i].enabled)
+            ASensorEventQueue_disableSensor(state->sensor_queue, state->sensors[i]);
+        state->readings[i].enabled = false;
+        ds_sensor_clear(&state->readings[i], state->sensors[i] ? status : DS_SENSOR_ABSENT);
+    }
+    state->magnetic_field = state->smoothed_field = state->signal = 0.0f;
+    state->word[0] = '\0';
+}
+
+static void start_sensors(DeadSpeak *state) {
+    if (!state->sensors_resumed || !state->sensor_queue) return;
+    const int64_t started = sensor_now_ns();
+    for (unsigned i = 0; i < DS_SENSOR_COUNT; ++i) {
+        DSSensorReading *reading = &state->readings[i];
+        if (reading->enabled || !state->sensors[i]) continue;
+        const ASensor *sensor = state->sensors[i];
+        const int enable = ASensorEventQueue_enableSensor(state->sensor_queue, sensor);
+        int delay = ASensor_getMinDelay(sensor);
+        if (delay < 100000) delay = 100000;
+        const int rate = enable == 0 ? ASensorEventQueue_setEventRate(state->sensor_queue, sensor, delay) : enable;
+        ds_sensor_configure(reading, true, true, enable, rate, started);
+        if (!reading->enabled && enable == 0) ASensorEventQueue_disableSensor(state->sensor_queue, sensor);
+        __android_log_print(reading->enabled ? ANDROID_LOG_DEBUG : ANDROID_LOG_ERROR, LOG_TAG,
+            "%s sensor %s: enable=%d rate=%d period=%d us", sensor_names[i],
+            ds_sensor_status_name(reading->status), enable, rate, delay);
+    }
+}
+
+static void maintain_sensors(DeadSpeak *state) {
+    if (!state->sensors_resumed) return;
+    const int64_t now = sensor_now_ns();
+    for (unsigned i = 0; i < DS_SENSOR_COUNT; ++i) {
+        DSSensorReading *reading = &state->readings[i];
+        ds_sensor_expire(reading, now);
+        if (reading->enabled && reading->status == DS_SENSOR_WAITING && now > reading->started_ns &&
+            now - reading->started_ns > DS_SENSOR_FRESH_NS) ds_sensor_clear(reading, DS_SENSOR_STALE);
+    }
+    if (!ds_sensor_live(&state->readings[0], now)) {
+        state->magnetic_field = state->smoothed_field = state->signal = 0.0f;
+        state->word[0] = '\0';
+    }
+    if (now_millis() >= state->next_sensor_access_check) {
+        state->next_sensor_access_check = now_millis() + 1000U;
+        /* Re-attempt an explicitly failed registration after an OS grant;
+           this never substitutes readings or a different sensor. */
+        start_sensors(state);
+    }
+}
+
 static void setup_sensors(DeadSpeak *state) {
     state->sensor_manager = ASensorManager_getInstanceForPackage("org.deadspeak");
     if (!state->sensor_manager) return;
-    state->magnetometer = ASensorManager_getDefaultSensor(state->sensor_manager, ASENSOR_TYPE_MAGNETIC_FIELD);
-    state->has_magnetometer = state->magnetometer != NULL;
-    if (!state->has_magnetometer) return;
-    state->sensor_queue = ASensorManager_createEventQueue(state->sensor_manager, ALooper_forThread(), LOOPER_ID_SENSOR, NULL, NULL);
-    if (state->sensor_queue) {
-        ASensorEventQueue_enableSensor(state->sensor_queue, state->magnetometer);
-        ASensorEventQueue_setEventRate(state->sensor_queue, state->magnetometer, 100000);
+    for (unsigned i = 0; i < DS_SENSOR_COUNT; ++i) {
+        state->sensors[i] = ASensorManager_getDefaultSensor(state->sensor_manager, sensor_types[i]);
+        ds_sensor_configure(&state->readings[i], state->sensors[i] != NULL, true, -1, -1, sensor_now_ns());
     }
+    state->sensor_queue = ASensorManager_createEventQueue(state->sensor_manager, ALooper_forThread(), LOOPER_ID_SENSOR, NULL, NULL);
 }
 
 void android_main(struct android_app *app) {
@@ -1048,7 +1140,6 @@ void android_main(struct android_app *app) {
     state.surface = EGL_NO_SURFACE;
     state.context = EGL_NO_CONTEXT;
     state.ui_scale = 1.0f;
-    state.smoothed_field = 47.0f;
     state.scanning = true;
     state.video_filter = DS_VIDEO_FILTER_RAW;
     state.word[0] = 0;
@@ -1068,6 +1159,7 @@ void android_main(struct android_app *app) {
     while (true) {
         static uint64_t next_permission_check = 0;
         const uint64_t loop_time = now_millis();
+        maintain_sensors(&state);
         if (loop_time >= state.next_media_refresh) {
             state.next_media_refresh = loop_time + 1000U;
             refresh_media_files(&state);
@@ -1099,6 +1191,9 @@ void android_main(struct android_app *app) {
             if (app->destroyRequested) {
                 stop_audio_capture(&state);
                 ds_video_stop(&state.video);
+                stop_sensors(&state, DS_SENSOR_PAUSED);
+                if (state.sensor_manager && state.sensor_queue)
+                    ASensorManager_destroyEventQueue(state.sensor_manager, state.sensor_queue);
                 free(state.dictionary);
                 ds_explore_destroy(&state.explore);
                 teardown_display(&state);

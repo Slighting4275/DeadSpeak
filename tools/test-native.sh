@@ -15,7 +15,7 @@ if [ -n "$zig_library_dir" ]; then
     fi
     export ZIG_LIB_DIR="$zig_library_dir"
 fi
-ndk_version=$(sed -n 's/.*ndkVersion = "\([^"]*\)".*/\1/p' "$project_dir/app/build.gradle.kts")
+ndk_version=$(sed -n 's/^#define DS_NDK_VERSION "\([^"]*\)"/\1/p' "$project_dir/tools/build_config.h")
 ndk_tools="$sdk_dir/ndk/$ndk_version/toolchains/llvm/prebuilt/linux-x86_64"
 if [ ! -x "$ndk_tools/bin/aarch64-linux-android30-clang" ]; then
     echo "Configure sdk.dir in local.properties and install the project's NDK." >&2

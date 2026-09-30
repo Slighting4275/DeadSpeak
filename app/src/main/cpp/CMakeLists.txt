@@ -123,7 +123,7 @@ add_custom_command(
             -DANDROID
             -c "${CMAKE_CURRENT_SOURCE_DIR}/main.c"
             -o "${DS_MAIN_OBJECT}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/main.c" "${CMAKE_CURRENT_SOURCE_DIR}/engine.h" "${CMAKE_CURRENT_SOURCE_DIR}/explore.h" "${CMAKE_CURRENT_SOURCE_DIR}/jni_scope.h" "${CMAKE_CURRENT_SOURCE_DIR}/ui_layout.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.h" "${DS_ZIG_EXECUTABLE}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/main.c" "${CMAKE_CURRENT_SOURCE_DIR}/sensor_state.h" "${CMAKE_CURRENT_SOURCE_DIR}/engine.h" "${CMAKE_CURRENT_SOURCE_DIR}/explore.h" "${CMAKE_CURRENT_SOURCE_DIR}/jni_scope.h" "${CMAKE_CURRENT_SOURCE_DIR}/ui_layout.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.h" "${DS_ZIG_EXECUTABLE}"
     COMMENT "Compiling DeadSpeak C platform layer with Zig cc (${DS_ZIG_TARGET})"
     VERBATIM
 )

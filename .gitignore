@@ -1,10 +1,7 @@
-.gradle/
 build/
-app/build/
 local.properties
-.cxx/
 *.iml
 .idea/
 .toolchain/
-!build-logic/src/**/build/
-!build-logic/src/**/build/**
+.signing/
+.signing-stage-*/

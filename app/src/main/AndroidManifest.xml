@@ -1,4 +1,6 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.deadspeak"
+    android:versionCode="2" android:versionName="0.2.0">
+    <uses-sdk android:minSdkVersion="30" android:targetSdkVersion="37" />
     <uses-feature android:glEsVersion="0x00020000" android:required="true" />
     <uses-feature android:name="android.hardware.sensor.magnetometer" android:required="false" />
     <uses-feature android:name="android.hardware.camera" android:required="true" />
@@ -6,8 +8,12 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Explicit sensor access for Android variants exposing this permission. -->
+    <uses-permission android:name="android.permission.OTHER_SENSORS" />
 
     <application
+        android:hasCode="false"
+        android:extractNativeLibs="false"
         android:theme="@style/DeadSpeakTheme"
         android:label="DeadSpeak"
         android:icon="@mipmap/ic_launcher"
