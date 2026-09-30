@@ -7,9 +7,10 @@ export fn ds_engine_smooth(previous: f32, current: f32, alpha: f32) f32 {
     return previous + ((current - previous) * bounded);
 }
 
-export fn ds_engine_signal(magnetic_field: f32) f32 {
-    const distance = magnitude(magnetic_field - 47.0);
-    const normalized = distance / 120.0;
+export fn ds_engine_signal(magnetic_field: f32, measured_baseline: f32) f32 {
+    if (!@import("std").math.isFinite(magnetic_field) or !@import("std").math.isFinite(measured_baseline)) return 0;
+    const distance = magnitude(magnetic_field - measured_baseline);
+    const normalized = distance / 20.0;
     return if (normalized > 1.0) 1.0 else normalized;
 }
 
@@ -37,6 +38,19 @@ export fn ds_engine_spectrum(samples: [*]const i16, count: usize, sample_rate: u
     bands[2] = goertzel(samples, count, sample_rate, 3000.0);
 }
 
+// Log-spaced measurements of actual microphone samples, not a decorative EQ.
+// Frequencies above Nyquist are deliberately left empty.
+export fn ds_engine_spectrum_bins(samples: [*]const i16, count: usize, sample_rate: u32,
+                                 bins: [*]f32, bin_count: usize) void {
+    if (bin_count == 0 or bin_count > 64) return;
+    for (0..bin_count) |i| {
+        const t = if (bin_count == 1) 0.0 else @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(bin_count - 1));
+        const frequency = 125.0 * @exp(t * @log(@as(f64, 64.0)));
+        bins[i] = if (frequency < @as(f64, @floatFromInt(sample_rate)) * 0.5)
+            goertzel(samples, count, sample_rate, frequency) else 0.0;
+    }
+}
+
 fn read_u16(bytes: [*]const u8, offset: usize) u16 {
     return @as(u16, bytes[offset]) | (@as(u16, bytes[offset + 1]) << 8);
 }
@@ -58,8 +72,12 @@ export fn ds_engine_next_word(magnetic_field: f32, sample: u32, dictionary: ?[*]
     const word_count = read_u32(bytes, 8);
     if (word_count == 0) return 0;
 
-    const quantized: usize = @intFromFloat(magnitude(magnetic_field) * 10.0);
-    const index = (quantized + @as(usize, sample)) % @as(usize, word_count);
+    // Reject invalid/out-of-range fields before float-to-integer conversion.
+    // A malformed reading must never panic the native engine or select a word.
+    if (!@import("std").math.isFinite(magnetic_field) or magnitude(magnetic_field) > 1000000.0) return 0;
+
+    const quantized: u64 = @intFromFloat(magnitude(magnetic_field) * 10.0);
+    const index: usize = @intCast((quantized + @as(u64, sample)) % @as(u64, word_count));
     var offset: usize = 12;
     for (0..index + 1) |word_index| {
         if (offset + 2 > dictionary_size) return 0;

@@ -1,0 +1,362 @@
+#include "voice_synth.h"
+#include <ctype.h>
+#include <math.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+typedef struct {
+    float f1, f2, f3;       /* Formant frequencies in Hz */
+    float bw1, bw2, bw3;    /* Bandwidths in Hz */
+    float gain1, gain2, gain3;
+    float duration_sec;
+    bool voiced;
+    float noise_mix;        /* 0.0 to 1.0 */
+} DSPhoneme;
+
+/* Biquad resonator filter state */
+typedef struct {
+    float x1, x2;
+    float y1, y2;
+    float b0, b1, b2;
+    float a1, a2;
+} DSResonator;
+
+static void resonator_init(DSResonator *r, float freq, float bw, float sample_rate) {
+    if (freq <= 0.0f || bw <= 0.0f || freq >= sample_rate * 0.48f) {
+        memset(r, 0, sizeof(*r));
+        return;
+    }
+    const float c = -expf(-2.0f * (float)M_PI * bw / sample_rate);
+    const float b = 2.0f * expf(-(float)M_PI * bw / sample_rate) * cosf(2.0f * (float)M_PI * freq / sample_rate);
+    const float a = 1.0f - b - c;
+    r->b0 = a;
+    r->b1 = 0.0f;
+    r->b2 = 0.0f;
+    r->a1 = -b;
+    r->a2 = -c;
+    r->x1 = r->x2 = r->y1 = r->y2 = 0.0f;
+}
+
+static inline float resonator_process(DSResonator *r, float in) {
+    const float out = r->b0 * in - r->a1 * r->y1 - r->a2 * r->y2;
+    r->y2 = r->y1;
+    r->y1 = out;
+    return out;
+}
+
+static uint32_t rng_state = 0x12345678;
+static inline float next_noise(void) {
+    rng_state = rng_state * 1664525u + 1013904223u;
+    return ((float)(int32_t)rng_state / 2147483648.0f);
+}
+
+static DSPhoneme get_phoneme_for_char(char c) {
+    c = (char)toupper((unsigned char)c);
+    DSPhoneme p = {0};
+    p.bw1 = 90.0f;
+    p.bw2 = 110.0f;
+    p.bw3 = 140.0f;
+    p.gain1 = 1.0f;
+    p.gain2 = 0.6f;
+    p.gain3 = 0.3f;
+    p.duration_sec = 0.12f;
+    p.voiced = true;
+    p.noise_mix = 0.0f;
+
+    switch (c) {
+        case 'A': /* "ah" */
+            p.f1 = 750.0f; p.f2 = 1200.0f; p.f3 = 2400.0f;
+            break;
+        case 'E': /* "eh" */
+            p.f1 = 530.0f; p.f2 = 1840.0f; p.f3 = 2480.0f;
+            break;
+        case 'I': /* "ee" */
+            p.f1 = 270.0f; p.f2 = 2290.0f; p.f3 = 3010.0f;
+            break;
+        case 'O': /* "oh" */
+            p.f1 = 500.0f; p.f2 = 700.0f;  p.f3 = 2400.0f;
+            break;
+        case 'U': /* "oo" */
+            p.f1 = 300.0f; p.f2 = 870.0f;  p.f3 = 2240.0f;
+            break;
+        case 'Y':
+            p.f1 = 300.0f; p.f2 = 2000.0f; p.f3 = 2800.0f;
+            break;
+        case 'S':
+        case 'C':
+            p.f1 = 200.0f; p.f2 = 4000.0f; p.f3 = 6000.0f;
+            p.duration_sec = 0.10f;
+            p.voiced = false;
+            p.noise_mix = 1.0f;
+            p.gain1 = 0.1f; p.gain2 = 0.8f; p.gain3 = 1.0f;
+            break;
+        case 'Z':
+            p.f1 = 250.0f; p.f2 = 3500.0f; p.f3 = 5500.0f;
+            p.duration_sec = 0.09f;
+            p.voiced = true;
+            p.noise_mix = 0.7f;
+            break;
+        case 'T':
+            p.f1 = 300.0f; p.f2 = 2500.0f; p.f3 = 4500.0f;
+            p.duration_sec = 0.06f;
+            p.voiced = false;
+            p.noise_mix = 1.0f;
+            break;
+        case 'K':
+        case 'Q':
+            p.f1 = 300.0f; p.f2 = 1800.0f; p.f3 = 2700.0f;
+            p.duration_sec = 0.07f;
+            p.voiced = false;
+            p.noise_mix = 0.9f;
+            break;
+        case 'P':
+            p.f1 = 200.0f; p.f2 = 1000.0f; p.f3 = 2200.0f;
+            p.duration_sec = 0.06f;
+            p.voiced = false;
+            p.noise_mix = 0.8f;
+            break;
+        case 'B':
+            p.f1 = 200.0f; p.f2 = 1000.0f; p.f3 = 2200.0f;
+            p.duration_sec = 0.07f;
+            p.voiced = true;
+            p.noise_mix = 0.2f;
+            break;
+        case 'D':
+            p.f1 = 300.0f; p.f2 = 2000.0f; p.f3 = 3000.0f;
+            p.duration_sec = 0.07f;
+            p.voiced = true;
+            p.noise_mix = 0.3f;
+            break;
+        case 'G':
+            p.f1 = 300.0f; p.f2 = 1800.0f; p.f3 = 2600.0f;
+            p.duration_sec = 0.07f;
+            p.voiced = true;
+            p.noise_mix = 0.2f;
+            break;
+        case 'M':
+            p.f1 = 250.0f; p.f2 = 1000.0f; p.f3 = 2200.0f;
+            p.duration_sec = 0.10f;
+            p.voiced = true;
+            p.gain1 = 1.2f; p.gain2 = 0.2f; p.gain3 = 0.1f;
+            break;
+        case 'N':
+            p.f1 = 250.0f; p.f2 = 1700.0f; p.f3 = 2600.0f;
+            p.duration_sec = 0.10f;
+            p.voiced = true;
+            p.gain1 = 1.1f; p.gain2 = 0.3f; p.gain3 = 0.1f;
+            break;
+        case 'L':
+            p.f1 = 380.0f; p.f2 = 1200.0f; p.f3 = 2700.0f;
+            p.duration_sec = 0.09f;
+            p.voiced = true;
+            break;
+        case 'R':
+            p.f1 = 420.0f; p.f2 = 1300.0f; p.f3 = 1600.0f;
+            p.duration_sec = 0.10f;
+            p.voiced = true;
+            break;
+        case 'F':
+            p.f1 = 250.0f; p.f2 = 1500.0f; p.f3 = 3500.0f;
+            p.duration_sec = 0.09f;
+            p.voiced = false;
+            p.noise_mix = 1.0f;
+            break;
+        case 'V':
+            p.f1 = 250.0f; p.f2 = 1500.0f; p.f3 = 3500.0f;
+            p.duration_sec = 0.09f;
+            p.voiced = true;
+            p.noise_mix = 0.5f;
+            break;
+        case 'W':
+            p.f1 = 300.0f; p.f2 = 700.0f;  p.f3 = 2200.0f;
+            p.duration_sec = 0.08f;
+            p.voiced = true;
+            break;
+        case 'H':
+            p.f1 = 400.0f; p.f2 = 1500.0f; p.f3 = 2500.0f;
+            p.duration_sec = 0.08f;
+            p.voiced = false;
+            p.noise_mix = 1.0f;
+            break;
+        case ' ':
+        default:
+            p.f1 = 0.0f; p.f2 = 0.0f; p.f3 = 0.0f;
+            p.duration_sec = 0.06f;
+            p.voiced = false;
+            break;
+    }
+    return p;
+}
+
+#define COMB1_LEN 520
+#define COMB2_LEN 690
+#define COMB3_LEN 840
+#define AP_LEN    180
+
+void ds_voice_synth_reverb(int16_t *pcm, size_t num_samples, float wet_mix) {
+    if (!pcm || num_samples == 0 || wet_mix <= 0.0f) return;
+    if (wet_mix > 1.0f) wet_mix = 1.0f;
+
+    float comb1_buf[COMB1_LEN];
+    float comb2_buf[COMB2_LEN];
+    float comb3_buf[COMB3_LEN];
+    float ap_buf[AP_LEN];
+
+    memset(comb1_buf, 0, sizeof(comb1_buf));
+    memset(comb2_buf, 0, sizeof(comb2_buf));
+    memset(comb3_buf, 0, sizeof(comb3_buf));
+    memset(ap_buf, 0, sizeof(ap_buf));
+
+    size_t c1_idx = 0, c2_idx = 0, c3_idx = 0, ap_idx = 0;
+    const float dry_mix = 1.0f - wet_mix * 0.4f;
+
+    for (size_t i = 0; i < num_samples; ++i) {
+        const float in = (float)pcm[i];
+
+        /* Comb filters in parallel */
+        const float c1_out = comb1_buf[c1_idx];
+        comb1_buf[c1_idx] = in + c1_out * 0.72f;
+        c1_idx = (c1_idx + 1) % COMB1_LEN;
+
+        const float c2_out = comb2_buf[c2_idx];
+        comb2_buf[c2_idx] = in + c2_out * 0.68f;
+        c2_idx = (c2_idx + 1) % COMB2_LEN;
+
+        const float c3_out = comb3_buf[c3_idx];
+        comb3_buf[c3_idx] = in + c3_out * 0.64f;
+        c3_idx = (c3_idx + 1) % COMB3_LEN;
+
+        const float comb_sum = (c1_out + c2_out + c3_out) * 0.33f;
+
+        /* All-pass diffuser in series */
+        const float ap_in = comb_sum;
+        const float ap_delayed = ap_buf[ap_idx];
+        const float ap_out = -0.5f * ap_in + ap_delayed;
+        ap_buf[ap_idx] = ap_in + 0.5f * ap_delayed;
+        ap_idx = (ap_idx + 1) % AP_LEN;
+
+        float out = in * dry_mix + ap_out * wet_mix;
+        if (out > 32000.0f) out = 32000.0f;
+        if (out < -32000.0f) out = -32000.0f;
+        pcm[i] = (int16_t)out;
+    }
+}
+
+size_t ds_voice_synthesize(const char *text, const DSVoiceConfig *config,
+                           int16_t *pcm_out, size_t max_samples) {
+    if (!text || !text[0] || !pcm_out || max_samples < 256) return 0;
+    if (config && !config->enabled) return 0;
+
+    const DSVoiceMode mode = config ? config->mode : DS_VOICE_MODE_CLASSIC;
+    const float base_pitch = (config && config->pitch_hz >= 60.0f && config->pitch_hz <= 300.0f)
+                             ? config->pitch_hz : 115.0f;
+    const float speed_mult = (config && config->speed >= 0.5f && config->speed <= 2.5f)
+                             ? config->speed : 1.0f;
+
+    size_t out_index = 0;
+    float phase = 0.0f;
+    const float sample_rate = (float)DS_VOICE_SAMPLE_RATE;
+
+    /* If Spirit Box mode: prepend a brief static radio burst */
+    if (mode == DS_VOICE_MODE_SPIRIT_BOX) {
+        const size_t burst_samples = (size_t)(sample_rate * 0.05f);
+        for (size_t i = 0; i < burst_samples && out_index < max_samples; ++i) {
+            const float env = 1.0f - (float)i / (float)burst_samples;
+            const float val = next_noise() * env * 4000.0f;
+            pcm_out[out_index++] = (int16_t)val;
+        }
+    }
+
+    const size_t text_len = strlen(text);
+    for (size_t i = 0; i < text_len; ++i) {
+        const char c = text[i];
+        if (!isalnum((unsigned char)c) && c != ' ') continue;
+
+        DSPhoneme phoneme = get_phoneme_for_char(c);
+        if (phoneme.f1 <= 0.0f && phoneme.noise_mix <= 0.0f) {
+            /* Pause / space */
+            const size_t pause_samples = (size_t)(phoneme.duration_sec / speed_mult * sample_rate);
+            for (size_t s = 0; s < pause_samples && out_index < max_samples; ++s) {
+                pcm_out[out_index++] = 0;
+            }
+            continue;
+        }
+
+        /* Adjust phoneme parameters for Whisper / Spirit Box */
+        if (mode == DS_VOICE_MODE_WHISPER) {
+            phoneme.voiced = false;
+            phoneme.noise_mix = 1.0f;
+            phoneme.gain1 *= 0.5f;
+            phoneme.gain2 *= 1.2f;
+            phoneme.gain3 *= 1.4f;
+        }
+
+        DSResonator r1, r2, r3;
+        resonator_init(&r1, phoneme.f1, phoneme.bw1, sample_rate);
+        resonator_init(&r2, phoneme.f2, phoneme.bw2, sample_rate);
+        resonator_init(&r3, phoneme.f3, phoneme.bw3, sample_rate);
+
+        const size_t num_samples = (size_t)(phoneme.duration_sec / speed_mult * sample_rate);
+        const float pitch_step = 2.0f * (float)M_PI * base_pitch / sample_rate;
+
+        for (size_t s = 0; s < num_samples && out_index < max_samples; ++s) {
+            const float progress = (float)s / (float)num_samples;
+
+            /* Smooth Attack-Decay envelope */
+            float env = 1.0f;
+            if (progress < 0.15f) env = progress / 0.15f;
+            else if (progress > 0.85f) env = (1.0f - progress) / 0.15f;
+
+            /* Excitation signal */
+            float excitation = 0.0f;
+            if (phoneme.voiced) {
+                /* Band-limited glottal pulse approximation */
+                phase += pitch_step;
+                if (phase >= 2.0f * (float)M_PI) phase -= 2.0f * (float)M_PI;
+                const float pulse = (phase < 0.4f * (float)M_PI) ? sinf(phase * 2.5f) : 0.0f;
+                excitation += pulse;
+            }
+
+            if (phoneme.noise_mix > 0.0f) {
+                excitation += next_noise() * phoneme.noise_mix;
+            }
+
+            /* Resonators */
+            const float out1 = resonator_process(&r1, excitation) * phoneme.gain1;
+            const float out2 = resonator_process(&r2, excitation) * phoneme.gain2;
+            const float out3 = resonator_process(&r3, excitation) * phoneme.gain3;
+            float total = (out1 + out2 + out3) * env;
+
+            /* Spirit box modulation */
+            if (mode == DS_VOICE_MODE_SPIRIT_BOX) {
+                total += next_noise() * 0.08f * env;
+            }
+
+            /* Master scaling and soft clipping */
+            total *= 12000.0f;
+            if (total > 32000.0f) total = 32000.0f;
+            if (total < -32000.0f) total = -32000.0f;
+
+            pcm_out[out_index++] = (int16_t)total;
+        }
+    }
+
+    /* Trailing decay */
+    const size_t decay_samples = (size_t)(sample_rate * 0.04f);
+    for (size_t s = 0; s < decay_samples && out_index < max_samples; ++s) {
+        pcm_out[out_index++] = 0;
+    }
+
+    /* Atmospheric spatial reverberation */
+    const float wet = (mode == DS_VOICE_MODE_SPIRIT_BOX) ? 0.48f :
+                      (mode == DS_VOICE_MODE_WHISPER) ? 0.35f : 0.22f;
+    ds_voice_synth_reverb(pcm_out, out_index, wet);
+
+    return out_index;
+}

@@ -69,6 +69,60 @@ set(DS_MAIN_OBJECT "${DS_ZIG_OBJECT_DIR}/main.c.o")
 set(DS_GLUE_OBJECT "${DS_ZIG_OBJECT_DIR}/android_native_app_glue.c.o")
 set(DS_VIDEO_OBJECT "${DS_ZIG_OBJECT_DIR}/video_capture.c.o")
 set(DS_EXPLORE_OBJECT "${DS_ZIG_OBJECT_DIR}/explore.c.o")
+set(DS_CUSTOM_WORDS_OBJECT "${DS_ZIG_OBJECT_DIR}/custom_words.c.o")
+set(DS_VOICE_OBJECT "${DS_ZIG_OBJECT_DIR}/voice_synth.c.o")
+set(DS_VOICE_PLAYER_OBJECT "${DS_ZIG_OBJECT_DIR}/voice_player.c.o")
+
+add_custom_command(
+    OUTPUT "${DS_VOICE_OBJECT}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DS_ZIG_OBJECT_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E env "${DS_ZIG_ENV}"
+            ${DS_ZIG_EXECUTABLE} cc -target ${DS_ZIG_TARGET}
+            --sysroot=${CMAKE_SYSROOT}
+            -isystem ${CMAKE_SYSROOT}/usr/include
+            -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
+            -I${CMAKE_CURRENT_SOURCE_DIR}
+            -std=c17 -O3 -Wall -Wextra -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
+            -DANDROID -c "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.c"
+            -o "${DS_VOICE_OBJECT}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.c" "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.h" "${DS_ZIG_EXECUTABLE}"
+    COMMENT "Compiling formant voice synthesizer with Zig cc (${DS_ZIG_TARGET})"
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT "${DS_VOICE_PLAYER_OBJECT}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DS_ZIG_OBJECT_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E env "${DS_ZIG_ENV}"
+            ${DS_ZIG_EXECUTABLE} cc -target ${DS_ZIG_TARGET}
+            --sysroot=${CMAKE_SYSROOT}
+            -isystem ${CMAKE_SYSROOT}/usr/include
+            -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
+            -I${CMAKE_CURRENT_SOURCE_DIR}
+            -std=c17 -O3 -Wall -Wextra -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
+            -DANDROID -c "${CMAKE_CURRENT_SOURCE_DIR}/voice_player.c"
+            -o "${DS_VOICE_PLAYER_OBJECT}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/voice_player.c" "${CMAKE_CURRENT_SOURCE_DIR}/voice_player.h" "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.h" "${DS_ZIG_EXECUTABLE}"
+    COMMENT "Compiling native audio voice player with Zig cc (${DS_ZIG_TARGET})"
+    VERBATIM
+)
+
+add_custom_command(
+    OUTPUT "${DS_CUSTOM_WORDS_OBJECT}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DS_ZIG_OBJECT_DIR}"
+    COMMAND ${CMAKE_COMMAND} -E env "${DS_ZIG_ENV}"
+            ${DS_ZIG_EXECUTABLE} cc -target ${DS_ZIG_TARGET}
+            --sysroot=${CMAKE_SYSROOT}
+            -isystem ${CMAKE_SYSROOT}/usr/include
+            -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
+            -I${CMAKE_CURRENT_SOURCE_DIR}
+            -std=c17 -O3 -Wall -Wextra -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
+            -DANDROID -c "${CMAKE_CURRENT_SOURCE_DIR}/custom_words.c"
+            -o "${DS_CUSTOM_WORDS_OBJECT}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/custom_words.c" "${CMAKE_CURRENT_SOURCE_DIR}/custom_words.h" "${DS_ZIG_EXECUTABLE}"
+    COMMENT "Compiling local custom word bank with Zig cc (${DS_ZIG_TARGET})"
+    VERBATIM
+)
 
 add_custom_command(
     OUTPUT "${DS_EXPLORE_OBJECT}"
@@ -103,7 +157,7 @@ add_custom_command(
             -DANDROID
             -c "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.c"
             -o "${DS_VIDEO_OBJECT}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.c" "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_orientation.h" "${DS_ZIG_EXECUTABLE}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.c" "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.h" "${CMAKE_CURRENT_SOURCE_DIR}/preview_frame.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_orientation.h" "${DS_ZIG_EXECUTABLE}"
     COMMENT "Compiling native Camera2 and MediaCodec capture with Zig cc (${DS_ZIG_TARGET})"
     VERBATIM
 )
@@ -123,7 +177,7 @@ add_custom_command(
             -DANDROID
             -c "${CMAKE_CURRENT_SOURCE_DIR}/main.c"
             -o "${DS_MAIN_OBJECT}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/main.c" "${CMAKE_CURRENT_SOURCE_DIR}/sensor_state.h" "${CMAKE_CURRENT_SOURCE_DIR}/engine.h" "${CMAKE_CURRENT_SOURCE_DIR}/explore.h" "${CMAKE_CURRENT_SOURCE_DIR}/jni_scope.h" "${CMAKE_CURRENT_SOURCE_DIR}/ui_layout.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.h" "${DS_ZIG_EXECUTABLE}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/main.c" "${CMAKE_CURRENT_SOURCE_DIR}/voice_player.h" "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.h" "${CMAKE_CURRENT_SOURCE_DIR}/motion_filter.h" "${CMAKE_CURRENT_SOURCE_DIR}/field_baseline.h" "${CMAKE_CURRENT_SOURCE_DIR}/camera_ui.h" "${CMAKE_CURRENT_SOURCE_DIR}/custom_words.h" "${CMAKE_CURRENT_SOURCE_DIR}/sensor_state.h" "${CMAKE_CURRENT_SOURCE_DIR}/engine.h" "${CMAKE_CURRENT_SOURCE_DIR}/explore.h" "${CMAKE_CURRENT_SOURCE_DIR}/jni_scope.h" "${CMAKE_CURRENT_SOURCE_DIR}/ui_layout.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.h" "${DS_ZIG_EXECUTABLE}"
     COMMENT "Compiling DeadSpeak C platform layer with Zig cc (${DS_ZIG_TARGET})"
     VERBATIM
 )
@@ -150,14 +204,17 @@ add_custom_command(
     VERBATIM
 )
 
-add_custom_target(ds_c_objects DEPENDS "${DS_MAIN_OBJECT}" "${DS_GLUE_OBJECT}" "${DS_VIDEO_OBJECT}" "${DS_EXPLORE_OBJECT}")
-set_source_files_properties("${DS_MAIN_OBJECT}" "${DS_GLUE_OBJECT}" "${DS_VIDEO_OBJECT}" "${DS_EXPLORE_OBJECT}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+add_custom_target(ds_c_objects DEPENDS "${DS_MAIN_OBJECT}" "${DS_GLUE_OBJECT}" "${DS_VIDEO_OBJECT}" "${DS_EXPLORE_OBJECT}" "${DS_CUSTOM_WORDS_OBJECT}" "${DS_VOICE_OBJECT}" "${DS_VOICE_PLAYER_OBJECT}")
+set_source_files_properties("${DS_MAIN_OBJECT}" "${DS_GLUE_OBJECT}" "${DS_VIDEO_OBJECT}" "${DS_EXPLORE_OBJECT}" "${DS_CUSTOM_WORDS_OBJECT}" "${DS_VOICE_OBJECT}" "${DS_VOICE_PLAYER_OBJECT}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
 
 add_library(deadspeak SHARED
     "${DS_MAIN_OBJECT}"
     "${DS_GLUE_OBJECT}"
     "${DS_VIDEO_OBJECT}"
     "${DS_EXPLORE_OBJECT}"
+    "${DS_CUSTOM_WORDS_OBJECT}"
+    "${DS_VOICE_OBJECT}"
+    "${DS_VOICE_PLAYER_OBJECT}"
 )
 set_target_properties(deadspeak PROPERTIES LINKER_LANGUAGE C)
 target_include_directories(deadspeak PRIVATE

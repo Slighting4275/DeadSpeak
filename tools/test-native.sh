@@ -22,13 +22,36 @@ if [ ! -x "$ndk_tools/bin/aarch64-linux-android30-clang" ]; then
     exit 1
 fi
 test_build_dir=$(mktemp -d /tmp/deadspeak-tests-XXXXXX) || exit 1
-trap 'rm -f "$test_build_dir/test.o" "$test_build_dir/test"; rmdir "$test_build_dir"' EXIT
+trap 'rm -rf "$test_build_dir"' EXIT
 zig cc -target aarch64-linux-android.30 --sysroot="$ndk_tools/sysroot" \
     -isystem "$ndk_tools/sysroot/usr/include" \
     -isystem "$ndk_tools/sysroot/usr/include/aarch64-linux-android" \
     -std=c17 -O1 -Wall -Wextra -Werror -fPIC -ffunction-sections -fdata-sections \
-    -c "$project_dir/tests/explore_test.c" -o "$test_build_dir/test.o" || exit 1
-"$ndk_tools/bin/aarch64-linux-android30-clang" "$test_build_dir/test.o" \
-    -Wl,--gc-sections -llog -lm -o "$test_build_dir/test" || exit 1
-adb push "$test_build_dir/test" /data/local/tmp/deadspeak-explore-test || exit 1
-adb shell /data/local/tmp/deadspeak-explore-test
+    -c "$project_dir/tests/explore_test.c" -o "$test_build_dir/explore_test.o" || exit 1
+"$ndk_tools/bin/aarch64-linux-android30-clang" "$test_build_dir/explore_test.o" \
+    -Wl,--gc-sections -llog -lm -o "$test_build_dir/explore_test" || exit 1
+adb push "$test_build_dir/explore_test" /data/local/tmp/deadspeak-explore-test || exit 1
+adb shell /data/local/tmp/deadspeak-explore-test || exit 1
+
+zig cc -target aarch64-linux-android.30 --sysroot="$ndk_tools/sysroot" \
+    -isystem "$ndk_tools/sysroot/usr/include" \
+    -isystem "$ndk_tools/sysroot/usr/include/aarch64-linux-android" \
+    -I"$project_dir/app/src/main/cpp" \
+    -std=c17 -O1 -Wall -Wextra -Werror -fPIC -ffunction-sections -fdata-sections \
+    -c "$project_dir/tests/voice_player_test.c" -o "$test_build_dir/vptest.o" || exit 1
+zig cc -target aarch64-linux-android.30 --sysroot="$ndk_tools/sysroot" \
+    -isystem "$ndk_tools/sysroot/usr/include" \
+    -isystem "$ndk_tools/sysroot/usr/include/aarch64-linux-android" \
+    -I"$project_dir/app/src/main/cpp" \
+    -std=c17 -O1 -Wall -Wextra -Werror -fPIC -ffunction-sections -fdata-sections \
+    -c "$project_dir/app/src/main/cpp/voice_player.c" -o "$test_build_dir/vp.o" || exit 1
+zig cc -target aarch64-linux-android.30 --sysroot="$ndk_tools/sysroot" \
+    -isystem "$ndk_tools/sysroot/usr/include" \
+    -isystem "$ndk_tools/sysroot/usr/include/aarch64-linux-android" \
+    -I"$project_dir/app/src/main/cpp" \
+    -std=c17 -O1 -Wall -Wextra -Werror -fPIC -ffunction-sections -fdata-sections \
+    -c "$project_dir/app/src/main/cpp/voice_synth.c" -o "$test_build_dir/vs.o" || exit 1
+"$ndk_tools/bin/aarch64-linux-android30-clang" "$test_build_dir/vptest.o" "$test_build_dir/vp.o" "$test_build_dir/vs.o" \
+    -Wl,--gc-sections -llog -lm -laaudio -o "$test_build_dir/voice_player_test" || exit 1
+adb push "$test_build_dir/voice_player_test" /data/local/tmp/deadspeak-voice-player-test || exit 1
+adb shell /data/local/tmp/deadspeak-voice-player-test || exit 1
