@@ -26,7 +26,7 @@ trap 'rm -rf "$test_build_dir"' EXIT
 zig cc -target aarch64-linux-android.30 --sysroot="$ndk_tools/sysroot" \
     -isystem "$ndk_tools/sysroot/usr/include" \
     -isystem "$ndk_tools/sysroot/usr/include/aarch64-linux-android" \
-    -std=c17 -O1 -Wall -Wextra -Werror -fPIC -ffunction-sections -fdata-sections \
+    -std=c23 -O1 -Wall -Wextra -Werror -fPIC -ffunction-sections -fdata-sections \
     -c "$project_dir/tests/explore_test.c" -o "$test_build_dir/explore_test.o" || exit 1
 "$ndk_tools/bin/aarch64-linux-android30-clang" "$test_build_dir/explore_test.o" \
     -Wl,--gc-sections -llog -lm -o "$test_build_dir/explore_test" || exit 1
@@ -37,19 +37,19 @@ zig cc -target aarch64-linux-android.30 --sysroot="$ndk_tools/sysroot" \
     -isystem "$ndk_tools/sysroot/usr/include" \
     -isystem "$ndk_tools/sysroot/usr/include/aarch64-linux-android" \
     -I"$project_dir/app/src/main/cpp" \
-    -std=c17 -O1 -Wall -Wextra -Werror -fPIC -ffunction-sections -fdata-sections \
+    -std=c23 -O1 -Wall -Wextra -Werror -fPIC -ffunction-sections -fdata-sections \
     -c "$project_dir/tests/voice_player_test.c" -o "$test_build_dir/vptest.o" || exit 1
 zig cc -target aarch64-linux-android.30 --sysroot="$ndk_tools/sysroot" \
     -isystem "$ndk_tools/sysroot/usr/include" \
     -isystem "$ndk_tools/sysroot/usr/include/aarch64-linux-android" \
     -I"$project_dir/app/src/main/cpp" \
-    -std=c17 -O1 -Wall -Wextra -Werror -fPIC -ffunction-sections -fdata-sections \
+    -std=c23 -O1 -Wall -Wextra -Werror -fPIC -ffunction-sections -fdata-sections \
     -c "$project_dir/app/src/main/cpp/voice_player.c" -o "$test_build_dir/vp.o" || exit 1
 zig cc -target aarch64-linux-android.30 --sysroot="$ndk_tools/sysroot" \
     -isystem "$ndk_tools/sysroot/usr/include" \
     -isystem "$ndk_tools/sysroot/usr/include/aarch64-linux-android" \
     -I"$project_dir/app/src/main/cpp" \
-    -std=c17 -O1 -Wall -Wextra -Werror -fPIC -ffunction-sections -fdata-sections \
+    -std=c23 -O1 -Wall -Wextra -Werror -fPIC -ffunction-sections -fdata-sections \
     -c "$project_dir/app/src/main/cpp/voice_synth.c" -o "$test_build_dir/vs.o" || exit 1
 "$ndk_tools/bin/aarch64-linux-android30-clang" "$test_build_dir/vptest.o" "$test_build_dir/vp.o" "$test_build_dir/vs.o" \
     -Wl,--gc-sections -llog -lm -laaudio -o "$test_build_dir/voice_player_test" || exit 1

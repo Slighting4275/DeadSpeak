@@ -4,9 +4,9 @@ DeadSpeak is a native Android fieldwork and evidence-recording app for paranorma
 
 ## Current features
 
-- Native C17 Android UI using OpenGL ES 2, built with Zig's `zig cc` frontend with zero Java/Kotlin/JVM dependencies.
+- Native C23 Android UI using OpenGL ES 2, built with Zig's `zig cc` frontend with zero Java/Kotlin/JVM dependencies.
 - Adaptive portrait, landscape, and resizable-window layouts with shared drawing/touch geometry, scrollable evidence logs and field notes, and viewport-sized Explore pagination.
-- **Formant Voice Synthesizer & Audio Player**: Pure C17 formant resonator synthesizer outputting through low-latency native `AAudio`. Features three acoustic voicing profiles:
+- **Formant Voice Synthesizer & Audio Player**: Pure C23 formant resonator synthesizer outputting through low-latency native `AAudio`. Features three acoustic voicing profiles:
   - `CLASSIC`: Resonant vocal tract glottal impulse filtering.
   - `WHISPER`: Unvoiced spectral noise shaped through resonant oral cavities.
   - `SPIRIT BOX`: Swept formant modulation combined with burst radio static.
@@ -47,7 +47,7 @@ Audio and video are saved as separate files. Explore operates entirely locally o
 
 ## Requirements and language boundary
 
-DeadSpeak and its build contain no Java/Kotlin code, bytecode, DEX, JARs, or JVM-based tools. Application logic is C17 and Zig; binary assets contain data, not disguised bytecode. Android's operating-system framework remains a platform dependency: C uses JNI for system permissions, window APIs, and platform network/JSON services. No app-defined Java classes are compiled or packaged. The manifest explicitly sets `android:hasCode="false"`.
+DeadSpeak and its build contain no Java/Kotlin code, bytecode, DEX, JARs, or JVM-based tools. Application logic is C23 and Zig; binary assets contain data, not disguised bytecode. Android's operating-system framework remains a platform dependency: C uses JNI for system permissions, window APIs, and platform network/JSON services. No app-defined Java classes are compiled or packaged. The manifest explicitly sets `android:hasCode="false"`.
 
 - Linux build host with Zig, CMake, Ninja, pkg-config, libarchive, libxml2, and OpenSSL 3 development headers.
 - Installed Android NDK 30.0.16248370, SDK platform 37.2 (including its raw `data/res` directory), and native build tools 37.0.0. Versions are pinned in `tools/build_config.h`.

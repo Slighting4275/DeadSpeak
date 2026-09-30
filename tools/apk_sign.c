@@ -1,5 +1,5 @@
 /* Native APK Signature Scheme v2 signer/verifier (Android 11+).
- * Build: zig cc -std=c17 -O2 -Wall -Wextra -Werror tools/apk_sign.c -lcrypto -o apk-sign
+ * Build: zig cc -std=c23 -O2 -Wall -Wextra -Werror tools/apk_sign.c -lcrypto -o apk-sign
  * Usage: apk-sign sign input.apk output.apk key.pem cert.pem
  *        apk-sign verify signed.apk
  * Strict ZIP32, one v2 signer, one RSA/PKCS1-v1_5 SHA-256 algorithm (0x0103),

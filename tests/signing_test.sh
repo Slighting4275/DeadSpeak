@@ -32,7 +32,7 @@ signing_archive_cflags=$(pkg-config --cflags libarchive) || fail "libarchive dev
 signing_archive_libs=$(pkg-config --libs libarchive) || fail "libarchive development library required for packaging fixtures"
 # Intentional word splitting for ordinary compiler/pkg-config argument lists; no eval.
 # shellcheck disable=SC2086
-must zig cc -std=c17 -Wall -Wextra -Werror $signing_cc_flags $signing_crypto_cflags \
+must zig cc -std=c23 -Wall -Wextra -Werror $signing_cc_flags $signing_crypto_cflags \
     "$project_dir/tools/apk_sign.c" $signing_crypto_libs -o "$signing_test_dir/apk-sign"
 
 cat >"$signing_test_dir/fixture.c" <<'C'
@@ -225,7 +225,7 @@ int main(int argc,char **argv) {
 }
 C
 # shellcheck disable=SC2086
-must zig cc -std=c17 -Wall -Wextra -Werror $signing_cc_flags $signing_crypto_cflags $signing_archive_cflags \
+must zig cc -std=c23 -Wall -Wextra -Werror $signing_cc_flags $signing_crypto_cflags $signing_archive_cflags \
     "$signing_test_dir/fixture.c" $signing_crypto_libs $signing_archive_libs -o "$signing_test_dir/fixture"
 signer="$signing_test_dir/apk-sign"
 fixture="$signing_test_dir/fixture"
@@ -326,7 +326,7 @@ cat >"$signing_test_dir/owner-test.c" <<'C'
 uid_t geteuid(void) { return getuid() ^ (uid_t)1; }
 C
 # shellcheck disable=SC2086
-must zig cc -std=c17 -Wall -Wextra -Werror $signing_cc_flags $signing_crypto_cflags \
+must zig cc -std=c23 -Wall -Wextra -Werror $signing_cc_flags $signing_crypto_cflags \
     "$project_dir/tools/apk_sign.c" "$signing_test_dir/owner-test.c" $signing_crypto_libs -o "$signing_test_dir/owner-test"
 reject "$signing_test_dir/owner-test" sign "$small" "$signing_test_dir/owner-rejected.apk" "$signing_test_dir/key.pem" "$signing_test_dir/cert.pem"
 rg -q 'private key must be owned by the effective user' "$signing_test_dir/rejection.log" || fail "effective-owner check did not reject a mismatched owner"

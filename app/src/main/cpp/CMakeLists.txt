@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.22.1)
+cmake_minimum_required(VERSION 3.25)
 
 if(DEFINED DS_ZIG_LIB_DIR)
     if(NOT EXISTS "${DS_ZIG_LIB_DIR}/std/std.zig")
@@ -24,7 +24,7 @@ endif()
 
 project(deadspeak C)
 
-set(CMAKE_C_STANDARD 17)
+set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 find_program(DS_ZIG_EXECUTABLE zig
@@ -82,7 +82,7 @@ add_custom_command(
             -isystem ${CMAKE_SYSROOT}/usr/include
             -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
             -I${CMAKE_CURRENT_SOURCE_DIR}
-            -std=c17 -O3 -Wall -Wextra -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
+            -std=c23 -O3 -Wall -Wextra -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
             -DANDROID -c "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.c"
             -o "${DS_VOICE_OBJECT}"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.c" "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.h" "${DS_ZIG_EXECUTABLE}"
@@ -99,7 +99,7 @@ add_custom_command(
             -isystem ${CMAKE_SYSROOT}/usr/include
             -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
             -I${CMAKE_CURRENT_SOURCE_DIR}
-            -std=c17 -O3 -Wall -Wextra -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
+            -std=c23 -O3 -Wall -Wextra -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
             -DANDROID -c "${CMAKE_CURRENT_SOURCE_DIR}/voice_player.c"
             -o "${DS_VOICE_PLAYER_OBJECT}"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/voice_player.c" "${CMAKE_CURRENT_SOURCE_DIR}/voice_player.h" "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.h" "${DS_ZIG_EXECUTABLE}"
@@ -116,7 +116,7 @@ add_custom_command(
             -isystem ${CMAKE_SYSROOT}/usr/include
             -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
             -I${CMAKE_CURRENT_SOURCE_DIR}
-            -std=c17 -O3 -Wall -Wextra -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
+            -std=c23 -O3 -Wall -Wextra -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
             -DANDROID -c "${CMAKE_CURRENT_SOURCE_DIR}/custom_words.c"
             -o "${DS_CUSTOM_WORDS_OBJECT}"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/custom_words.c" "${CMAKE_CURRENT_SOURCE_DIR}/custom_words.h" "${DS_ZIG_EXECUTABLE}"
@@ -134,7 +134,7 @@ add_custom_command(
             -isystem ${CMAKE_SYSROOT}/usr/include
             -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
             -I${CMAKE_CURRENT_SOURCE_DIR}
-            -std=c17 -O3 -Wall -Wextra -Wno-unused-parameter -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
+            -std=c23 -O3 -Wall -Wextra -Wno-unused-parameter -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
             -DANDROID
             -c "${CMAKE_CURRENT_SOURCE_DIR}/explore.c"
             -o "${DS_EXPLORE_OBJECT}"
@@ -153,7 +153,7 @@ add_custom_command(
             -isystem ${CMAKE_SYSROOT}/usr/include
             -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
             -I${CMAKE_CURRENT_SOURCE_DIR}
-            -std=c17 -O3 -Wall -Wextra -Wno-unused-parameter -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
+            -std=c23 -O3 -Wall -Wextra -Wno-unused-parameter -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
             -DANDROID
             -c "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.c"
             -o "${DS_VIDEO_OBJECT}"
@@ -173,7 +173,7 @@ add_custom_command(
             -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
             -I${CMAKE_CURRENT_SOURCE_DIR}
             -I${ANDROID_NDK}/sources/android/native_app_glue
-            -std=c17 -O3 -Wall -Wextra -Wno-unused-parameter -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
+            -std=c23 -O3 -Wall -Wextra -Wno-unused-parameter -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
             -DANDROID
             -c "${CMAKE_CURRENT_SOURCE_DIR}/main.c"
             -o "${DS_MAIN_OBJECT}"
@@ -192,7 +192,7 @@ add_custom_command(
             -isystem ${CMAKE_SYSROOT}/usr/include
             -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
             -I${ANDROID_NDK}/sources/android/native_app_glue
-            -std=c17 -O3 -Wall -Wextra -Wno-unused-parameter -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
+            -std=c23 -O3 -Wall -Wextra -Wno-unused-parameter -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections
             -DANDROID
             -c "${DS_NATIVE_GLUE}"
             -o "${DS_GLUE_OBJECT}"

@@ -16,6 +16,6 @@ if [ -n "$zig_library_dir" ]; then
     fi
 fi
 mkdir -p build/host || exit 1
-zig cc -std=c17 -O2 -Wall -Wextra -Werror tools/build.c \
+zig cc -std=c23 -O2 -Wall -Wextra -Werror tools/build.c \
     $(pkg-config --cflags --libs libarchive openssl libxml-2.0) -o build/host/deadspeak-build || exit 1
 exec build/host/deadspeak-build "$@"
