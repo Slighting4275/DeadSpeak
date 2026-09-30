@@ -5,3 +5,6 @@ local.properties
 .cxx/
 *.iml
 .idea/
+.toolchain/
+!build-logic/src/**/build/
+!build-logic/src/**/build/**

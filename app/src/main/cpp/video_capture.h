@@ -18,10 +18,11 @@ typedef struct {
     _Atomic bool failed;
     bool thread_created;
     DSVideoFilter filter;
+    int display_rotation;
     char evidence_dir[512];
 } DSVideoCapture;
 
-void ds_video_start(DSVideoCapture *capture, const char *evidence_dir, DSVideoFilter filter);
+void ds_video_start(DSVideoCapture *capture, const char *evidence_dir, DSVideoFilter filter, int display_rotation);
 void ds_video_stop(DSVideoCapture *capture);
 bool ds_video_active(const DSVideoCapture *capture);
 bool ds_video_failed(const DSVideoCapture *capture);

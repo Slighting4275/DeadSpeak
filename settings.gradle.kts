@@ -1,9 +1,15 @@
 pluginManagement {
+    includeBuild("build-logic")
+
     repositories {
         google()
         mavenCentral()
         gradlePluginPortal()
     }
+}
+
+plugins {
+    id("org.deadspeak.agp-visible-patch")
 }
 
 dependencyResolutionManagement {

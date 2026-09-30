@@ -1,9 +1,17 @@
+import java.util.Properties
+
 plugins {
-    id("com.android.application")
+    id("org.deadspeak.android-application")
+}
+
+val localBuildProperties = Properties().apply {
+    rootProject.file("local.properties").takeIf { it.isFile }?.inputStream()?.use { load(it) }
 }
 
 android {
     namespace = "org.deadspeak"
+    // This module is native C/Zig; do not add Kotlin tasks or its runtime library.
+    enableKotlin = false
     compileSdk {
         version = release(37) {
             minorApiLevel = 2
@@ -23,7 +31,11 @@ android {
 
         externalNativeBuild {
             cmake {
-                cFlags += listOf("-std=c17", "-O3", "-Wall", "-Wextra", "-Wno-unused-parameter")
+                cFlags += listOf("-std=c17", "-O3", "-Wall", "-Wextra", "-Wno-unused-parameter", "-Werror=deprecated-declarations")
+                val zigLibDir = providers.gradleProperty("deadspeak.zigLibDir")
+                    .orElse(providers.environmentVariable("ZIG_LIB_DIR")).orNull
+                    ?: localBuildProperties.getProperty("deadspeak.zigLibDir")
+                if (zigLibDir != null) arguments += "-DDS_ZIG_LIB_DIR=$zigLibDir"
             }
         }
     }

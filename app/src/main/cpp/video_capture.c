@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "video_capture.h"
+#include "video_orientation.h"
 
 #include <android/log.h>
 #include <camera/NdkCameraManager.h>
@@ -217,6 +218,11 @@ static void *video_thread(void *user_data) {
     char camera_id[64] = {0};
     if (!manager || !camera_id_and_size(manager, camera_id, sizeof(camera_id), &width, &height)) goto cleanup;
     if (ACameraManager_getCameraCharacteristics(manager, camera_id, &characteristics) != ACAMERA_OK || !characteristics) goto cleanup;
+    ACameraMetadata_const_entry orientation = {0};
+    if (ACameraMetadata_getConstEntry(characteristics, ACAMERA_SENSOR_ORIENTATION, &orientation) != ACAMERA_OK ||
+        orientation.count != 1 || orientation.type != ACAMERA_TYPE_INT32) goto cleanup;
+    const int orientation_hint = ds_video_orientation_hint(orientation.data.i32[0], capture->display_rotation);
+    if (orientation_hint < 0) goto cleanup;
 
     ACameraDevice_StateCallbacks device_callbacks = {
         .context = &wait,
@@ -254,7 +260,7 @@ static void *video_thread(void *user_data) {
     if (output_fd < 0) goto cleanup;
     muxer = AMediaMuxer_new(output_fd, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
     if (!muxer) goto cleanup;
-    AMediaMuxer_setOrientationHint(muxer, 90);
+    if (AMediaMuxer_setOrientationHint(muxer, orientation_hint) != AMEDIA_OK) goto cleanup;
 
     if (ACaptureSessionOutputContainer_create(&outputs) != ACAMERA_OK || !outputs ||
         ACaptureSessionOutput_create(input_surface, &output) != ACAMERA_OK || !output ||
@@ -323,10 +329,11 @@ cleanup:
     return NULL;
 }
 
-void ds_video_start(DSVideoCapture *capture, const char *evidence_dir, DSVideoFilter filter) {
+void ds_video_start(DSVideoCapture *capture, const char *evidence_dir, DSVideoFilter filter, int display_rotation) {
     if (capture->thread_created || atomic_load(&capture->active)) return;
     snprintf(capture->evidence_dir, sizeof(capture->evidence_dir), "%s", evidence_dir);
     capture->filter = filter;
+    capture->display_rotation = display_rotation;
     atomic_store(&capture->failed, false);
     atomic_store(&capture->active, true);
     if (pthread_create(&capture->thread, NULL, video_thread, capture) != 0) {

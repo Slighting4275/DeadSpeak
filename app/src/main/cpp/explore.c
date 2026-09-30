@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "explore.h"
+#include "jni_scope.h"
 
 #include <android/log.h>
 #include <ctype.h>
@@ -30,6 +31,8 @@ typedef struct {
     jmethodID set_connect_timeout;
     jmethodID set_read_timeout;
     jmethodID set_request_property;
+    jmethodID set_use_caches;
+    jmethodID get_response_code;
     jmethodID get_input_stream;
     jmethodID disconnect;
     jmethodID stream_read;
@@ -42,6 +45,8 @@ typedef struct {
     jmethodID json_get_array;
     jmethodID json_get_int;
     jmethodID json_get_string;
+    jmethodID json_opt_string;
+    jmethodID json_has;
     jmethodID json_opt_object;
     jmethodID json_opt_array;
     jmethodID json_keys;
@@ -73,7 +78,10 @@ static bool jni_methods(DSJni *jni, JNIEnv *env) {
     jclass input_stream_class = (*env)->FindClass(env, "java/io/InputStream");
     clear_exception(env);
     if (!jni->url_class || !jni->url_connection_class || !jni->http_connection_class ||
-        !jni->byte_stream_class || !jni->json_object_class || !jni->json_array_class || !jni->iterator_class) return false;
+        !jni->byte_stream_class || !jni->json_object_class || !jni->json_array_class || !jni->iterator_class || !input_stream_class) {
+        if (input_stream_class) (*env)->DeleteLocalRef(env, input_stream_class);
+        return false;
+    }
 
     jni->url_constructor = (*env)->GetMethodID(env, jni->url_class, "<init>", "(Ljava/lang/String;)V");
     jni->url_open_connection = (*env)->GetMethodID(env, jni->url_class, "openConnection", "()Ljava/net/URLConnection;");
@@ -81,6 +89,8 @@ static bool jni_methods(DSJni *jni, JNIEnv *env) {
     jni->set_read_timeout = (*env)->GetMethodID(env, jni->url_connection_class, "setReadTimeout", "(I)V");
     jni->set_request_property = (*env)->GetMethodID(env, jni->url_connection_class, "setRequestProperty",
                                                     "(Ljava/lang/String;Ljava/lang/String;)V");
+    jni->set_use_caches = (*env)->GetMethodID(env, jni->url_connection_class, "setUseCaches", "(Z)V");
+    jni->get_response_code = (*env)->GetMethodID(env, jni->http_connection_class, "getResponseCode", "()I");
     jni->get_input_stream = (*env)->GetMethodID(env, jni->url_connection_class, "getInputStream", "()Ljava/io/InputStream;");
     jni->disconnect = (*env)->GetMethodID(env, jni->http_connection_class, "disconnect", "()V");
     jni->stream_read = (*env)->GetMethodID(env, input_stream_class, "read", "([B)I");
@@ -93,6 +103,8 @@ static bool jni_methods(DSJni *jni, JNIEnv *env) {
     jni->json_get_array = (*env)->GetMethodID(env, jni->json_object_class, "getJSONArray", "(Ljava/lang/String;)Lorg/json/JSONArray;");
     jni->json_get_int = (*env)->GetMethodID(env, jni->json_object_class, "getInt", "(Ljava/lang/String;)I");
     jni->json_get_string = (*env)->GetMethodID(env, jni->json_object_class, "getString", "(Ljava/lang/String;)Ljava/lang/String;");
+    jni->json_opt_string = (*env)->GetMethodID(env, jni->json_object_class, "optString", "(Ljava/lang/String;)Ljava/lang/String;");
+    jni->json_has = (*env)->GetMethodID(env, jni->json_object_class, "has", "(Ljava/lang/String;)Z");
     jni->json_opt_object = (*env)->GetMethodID(env, jni->json_object_class, "optJSONObject", "(Ljava/lang/String;)Lorg/json/JSONObject;");
     jni->json_opt_array = (*env)->GetMethodID(env, jni->json_object_class, "optJSONArray", "(Ljava/lang/String;)Lorg/json/JSONArray;");
     jni->json_keys = (*env)->GetMethodID(env, jni->json_object_class, "keys", "()Ljava/util/Iterator;");
@@ -105,11 +117,11 @@ static bool jni_methods(DSJni *jni, JNIEnv *env) {
     if (input_stream_class) (*env)->DeleteLocalRef(env, input_stream_class);
     clear_exception(env);
     return jni->url_constructor && jni->url_open_connection && jni->set_connect_timeout &&
-           jni->set_read_timeout && jni->set_request_property && jni->get_input_stream &&
+           jni->set_read_timeout && jni->set_request_property && jni->set_use_caches && jni->get_response_code && jni->get_input_stream &&
            jni->disconnect && jni->stream_read && jni->stream_close && jni->byte_stream_constructor &&
            jni->byte_stream_write && jni->byte_stream_to_string && jni->json_constructor &&
            jni->json_get_object && jni->json_get_array && jni->json_get_int &&
-           jni->json_get_string && jni->json_opt_object && jni->json_opt_array && jni->json_keys &&
+           jni->json_get_string && jni->json_opt_string && jni->json_has && jni->json_opt_object && jni->json_opt_array && jni->json_keys &&
            jni->json_get_double && jni->array_opt_object && jni->array_length && jni->array_get_object &&
            jni->iterator_has_next && jni->iterator_next;
 }
@@ -132,14 +144,22 @@ static jobject request_json(DSJni *jni, const char *url_text) {
     jobject result = NULL;
     jstring url_string = (*env)->NewStringUTF(env, url_text);
     jstring user_agent_key = (*env)->NewStringUTF(env, "User-Agent");
-    jstring user_agent_value = (*env)->NewStringUTF(env, "DeadSpeak/0.1 (native open-source fieldwork app)");
+    jstring user_agent_value = (*env)->NewStringUTF(env, "DeadSpeak/0.1 (https://codeberg.org/Exalted6165/DeadSpeak)");
     jstring utf8 = (*env)->NewStringUTF(env, "UTF-8");
     jobject url = (*env)->NewObject(env, jni->url_class, jni->url_constructor, url_string);
     if (url) connection = (*env)->CallObjectMethod(env, url, jni->url_open_connection);
     if (!connection || (*env)->ExceptionCheck(env)) goto cleanup;
     (*env)->CallVoidMethod(env, connection, jni->set_connect_timeout, 6000);
     (*env)->CallVoidMethod(env, connection, jni->set_read_timeout, 12000);
+    (*env)->CallVoidMethod(env, connection, jni->set_use_caches, JNI_FALSE);
     (*env)->CallVoidMethod(env, connection, jni->set_request_property, user_agent_key, user_agent_value);
+    if ((*env)->ExceptionCheck(env)) goto cleanup;
+    const jint response_code = (*env)->CallIntMethod(env, connection, jni->get_response_code);
+    if ((*env)->ExceptionCheck(env)) goto cleanup;
+    if (response_code != 200) {
+        __android_log_print(ANDROID_LOG_WARN, DS_EXPLORE_LOG, "HTTP %d fetching %s", response_code, url_text);
+        goto cleanup;
+    }
     input = (*env)->CallObjectMethod(env, connection, jni->get_input_stream);
     if (!input || (*env)->ExceptionCheck(env)) goto cleanup;
     output = (*env)->NewObject(env, jni->byte_stream_class, jni->byte_stream_constructor);
@@ -346,26 +366,46 @@ static bool api_get_categories(DSJni *jni, jobject root, int64_t *ids, char name
     return *count > 0;
 }
 
-static void api_get_places(DSJni *jni, DSExplore *explore, int64_t category_id, const char *region) {
+static bool api_get_places(DSJni *jni, DSExplore *explore, int64_t category_id, const char *region) {
     char url[512];
     snprintf(url, sizeof(url), "https://en.wikipedia.org/w/api.php?action=query&generator=categorymembers&gcmpageid=%lld&gcmtype=page&gcmlimit=500&prop=coordinates%%7Cpageprops&ppprop=wikibase_item&format=json&maxlag=5",
              (long long)category_id);
     jobject root = request_json(jni, url);
-    if (!root) return;
+    if (!root) return false;
     JNIEnv *env = jni->env;
     jstring query_key = (*env)->NewStringUTF(env, "query");
-    jobject query = (*env)->CallObjectMethod(env, root, jni->json_get_object, query_key);
+    if (!query_key) { clear_exception(env); (*env)->DeleteLocalRef(env, root); return false; }
+    jobject query = (*env)->CallObjectMethod(env, root, jni->json_opt_object, query_key);
     (*env)->DeleteLocalRef(env, query_key);
+    if (!query || (*env)->ExceptionCheck(env)) {
+        bool empty = false;
+        if (!(*env)->ExceptionCheck(env)) {
+            jstring complete_key = (*env)->NewStringUTF(env, "batchcomplete");
+            if (complete_key) empty = (*env)->CallBooleanMethod(env, root, jni->json_has, complete_key);
+            if (complete_key) (*env)->DeleteLocalRef(env, complete_key);
+        }
+        const bool okay = empty && !(*env)->ExceptionCheck(env);
+        clear_exception(env);
+        if (query) (*env)->DeleteLocalRef(env, query);
+        (*env)->DeleteLocalRef(env, root);
+        return okay;
+    }
     jstring pages_key = (*env)->NewStringUTF(env, "pages");
-    jobject pages = query ? (*env)->CallObjectMethod(env, query, jni->json_get_object, pages_key) : NULL;
+    if (!pages_key) {
+        clear_exception(env);
+        (*env)->DeleteLocalRef(env, query);
+        (*env)->DeleteLocalRef(env, root);
+        return false;
+    }
+    jobject pages = (*env)->CallObjectMethod(env, query, jni->json_opt_object, pages_key);
     (*env)->DeleteLocalRef(env, pages_key);
     if (query) (*env)->DeleteLocalRef(env, query);
-    jobject keys = pages ? (*env)->CallObjectMethod(env, pages, jni->json_keys) : NULL;
+    jobject keys = pages && !(*env)->ExceptionCheck(env) ? (*env)->CallObjectMethod(env, pages, jni->json_keys) : NULL;
     if (!pages || !keys) {
         if (pages) (*env)->DeleteLocalRef(env, pages);
         (*env)->DeleteLocalRef(env, root);
         clear_exception(env);
-        return;
+        return false;
     }
     const jstring lat_key = (*env)->NewStringUTF(env, "lat");
     const jstring lon_key = (*env)->NewStringUTF(env, "lon");
@@ -374,38 +414,54 @@ static void api_get_places(DSJni *jni, DSExplore *explore, int64_t category_id, 
     const jstring coordinates_key = (*env)->NewStringUTF(env, "coordinates");
     const jstring id_key = (*env)->NewStringUTF(env, "pageid");
     const jstring title_key = (*env)->NewStringUTF(env, "title");
+    bool okay = true;
     while ((*env)->CallBooleanMethod(env, keys, jni->iterator_has_next)) {
         jstring key = (jstring)(*env)->CallObjectMethod(env, keys, jni->iterator_next);
-        jobject item = key ? (*env)->CallObjectMethod(env, pages, jni->json_get_object, key) : NULL;
+        jobject item = key && !(*env)->ExceptionCheck(env) ? (*env)->CallObjectMethod(env, pages, jni->json_get_object, key) : NULL;
         if (key) (*env)->DeleteLocalRef(env, key);
-        if (!item) { clear_exception(env); continue; }
+        if (!item || (*env)->ExceptionCheck(env)) {
+            if (item) (*env)->DeleteLocalRef(env, item);
+            okay = false;
+            clear_exception(env);
+            break;
+        }
+        jstring title = NULL, qid = NULL;
+        jobject props = NULL, coords = NULL, coord = NULL;
         const jint page_id = (*env)->CallIntMethod(env, item, jni->json_get_int, id_key);
-        jstring title = (jstring)(*env)->CallObjectMethod(env, item, jni->json_get_string, title_key);
-        jobject props = (*env)->CallObjectMethod(env, item, jni->json_opt_object, props_key);
-        jstring qid = props ? (jstring)(*env)->CallObjectMethod(env, props, jni->json_get_string, qid_key) : NULL;
-        if ((*env)->ExceptionCheck(env)) clear_exception(env);
+        if ((*env)->ExceptionCheck(env) || page_id <= 0) { okay = false; goto item_cleanup; }
+        title = (jstring)(*env)->CallObjectMethod(env, item, jni->json_get_string, title_key);
+        if (!title || (*env)->ExceptionCheck(env)) { okay = false; goto item_cleanup; }
+        props = (*env)->CallObjectMethod(env, item, jni->json_opt_object, props_key);
+        if ((*env)->ExceptionCheck(env)) { okay = false; goto item_cleanup; }
+        qid = props ? (jstring)(*env)->CallObjectMethod(env, props, jni->json_opt_string, qid_key) : NULL;
+        if ((*env)->ExceptionCheck(env)) { okay = false; goto item_cleanup; }
         char qid_text[16] = {0};
         if (qid) {
             const char *q = (*env)->GetStringUTFChars(env, qid, NULL);
-            if (q) { snprintf(qid_text, sizeof(qid_text), "%s", q); (*env)->ReleaseStringUTFChars(env, qid, q); }
+            if (!q) { okay = false; goto item_cleanup; }
+            snprintf(qid_text, sizeof(qid_text), "%s", q);
+            (*env)->ReleaseStringUTFChars(env, qid, q);
         }
-        jobject coords = (*env)->CallObjectMethod(env, item, jni->json_opt_array, coordinates_key);
-        jobject coord = coords ? (*env)->CallObjectMethod(env, coords, jni->array_opt_object, 0) : NULL;
+        coords = (*env)->CallObjectMethod(env, item, jni->json_opt_array, coordinates_key);
+        if ((*env)->ExceptionCheck(env)) { okay = false; goto item_cleanup; }
+        coord = coords ? (*env)->CallObjectMethod(env, coords, jni->array_opt_object, 0) : NULL;
+        if ((*env)->ExceptionCheck(env)) { okay = false; goto item_cleanup; }
         bool has_coords = false;
         double latitude = 0.0, longitude = 0.0;
         if (coord) {
             latitude = (*env)->CallDoubleMethod(env, coord, jni->json_get_double, lat_key);
+            if ((*env)->ExceptionCheck(env)) { okay = false; goto item_cleanup; }
             longitude = (*env)->CallDoubleMethod(env, coord, jni->json_get_double, lon_key);
-            has_coords = !(*env)->ExceptionCheck(env);
-            clear_exception(env);
+            if ((*env)->ExceptionCheck(env)) { okay = false; goto item_cleanup; }
+            has_coords = true;
         }
         if (!(*env)->ExceptionCheck(env) && page_id > 0 && title) {
             const char *chars = (*env)->GetStringUTFChars(env, title, NULL);
-            if (chars) {
-                add_place(explore, page_id, region, chars, qid_text, has_coords, latitude, longitude);
-                (*env)->ReleaseStringUTFChars(env, title, chars);
-            }
+            if (!chars) { okay = false; goto item_cleanup; }
+            add_place(explore, page_id, region, chars, qid_text, has_coords, latitude, longitude);
+            (*env)->ReleaseStringUTFChars(env, title, chars);
         }
+item_cleanup:
         clear_exception(env);
         if (title) (*env)->DeleteLocalRef(env, title);
         if (qid) (*env)->DeleteLocalRef(env, qid);
@@ -416,8 +472,10 @@ static void api_get_places(DSJni *jni, DSExplore *explore, int64_t category_id, 
         pthread_mutex_lock(&explore->mutex);
         const bool full = explore->count >= DS_EXPLORE_LIMIT;
         pthread_mutex_unlock(&explore->mutex);
-        if (full) break;
+        if (full || !okay) break;
     }
+    if ((*env)->ExceptionCheck(env)) okay = false;
+    clear_exception(env);
     (*env)->DeleteLocalRef(env, title_key);
     (*env)->DeleteLocalRef(env, id_key);
     (*env)->DeleteLocalRef(env, coordinates_key);
@@ -428,26 +486,48 @@ static void api_get_places(DSJni *jni, DSExplore *explore, int64_t category_id, 
     (*env)->DeleteLocalRef(env, keys);
     (*env)->DeleteLocalRef(env, pages);
     (*env)->DeleteLocalRef(env, root);
+    return okay;
+}
+
+/* Publish a complete download under one lock, replacing updated/removed pages. */
+static void publish_places(DSExplore *explore, DSExplore *fresh) {
+    pthread_mutex_lock(&explore->mutex);
+    DSExplorePlace *old = explore->places;
+    const size_t old_count = explore->count;
+    explore->places = fresh->places;
+    explore->count = fresh->count;
+    fresh->places = old;
+    fresh->count = old_count;
+    pthread_mutex_unlock(&explore->mutex);
 }
 
 static void *explore_thread(void *context) {
     DSExplore *explore = (DSExplore *)context;
     time_t cache_modified = 0;
-    const size_t cached = load_cache(explore, &cache_modified);
+    const size_t cached = explore->force_refresh ? 0 : load_cache(explore, &cache_modified);
     const time_t now = time(NULL);
     if (!explore->force_refresh && cached > 0 && now - cache_modified < DS_EXPLORE_CACHE_SECONDS) {
         atomic_store(&explore->loading, false);
         return NULL;
     }
 
+    DSExplore fresh;
+    if (!ds_explore_init(&fresh)) {
+        ds_explore_destroy(&fresh);
+        goto failed;
+    }
     JavaVM *vm = explore->activity->vm;
     JNIEnv *env = NULL;
-    if ((*vm)->AttachCurrentThread(vm, &env, NULL) != JNI_OK || !env) goto failed;
+    if ((*vm)->AttachCurrentThread(vm, &env, NULL) != JNI_OK || !env) {
+        ds_explore_destroy(&fresh);
+        goto failed;
+    }
     DSJni jni;
     if (!jni_methods(&jni, env)) {
         clear_exception(env);
         release_jni(&jni);
         (*vm)->DetachCurrentThread(vm);
+        ds_explore_destroy(&fresh);
         goto failed;
     }
 
@@ -455,6 +535,7 @@ static void *explore_thread(void *context) {
     if (!root) {
         release_jni(&jni);
         (*vm)->DetachCurrentThread(vm);
+        ds_explore_destroy(&fresh);
         goto failed;
     }
     int64_t category_ids[100];
@@ -465,22 +546,29 @@ static void *explore_thread(void *context) {
     if (!categories_found) {
         release_jni(&jni);
         (*vm)->DetachCurrentThread(vm);
+        ds_explore_destroy(&fresh);
         goto failed;
     }
 
-    for (size_t i = 0; i < category_count && !(*env)->ExceptionCheck(env); ++i) {
-        api_get_places(&jni, explore, category_ids[i], regions[i]);
+    bool complete = true;
+    for (size_t i = 0; i < category_count; ++i) {
+        if (!api_get_places(&jni, &fresh, category_ids[i], regions[i])) {
+            __android_log_print(ANDROID_LOG_WARN, DS_EXPLORE_LOG, "Wikipedia category %lld could not be refreshed", (long long)category_ids[i]);
+            complete = false;
+            break;
+        }
         struct timespec delay = {.tv_sec = 0, .tv_nsec = 250000000L};
         nanosleep(&delay, NULL);
     }
+    if ((*env)->ExceptionCheck(env)) complete = false;
     clear_exception(env);
     release_jni(&jni);
     (*vm)->DetachCurrentThread(vm);
+    if (!complete) { ds_explore_destroy(&fresh); goto failed; }
+    publish_places(explore, &fresh);
+    ds_explore_destroy(&fresh);
     save_cache(explore);
-    pthread_mutex_lock(&explore->mutex);
-    const bool has_places = explore->count > 0;
-    pthread_mutex_unlock(&explore->mutex);
-    if (!has_places) goto failed;
+    __android_log_print(ANDROID_LOG_INFO, DS_EXPLORE_LOG, "Published %zu places from %zu Wikipedia categories", explore->count, category_count);
     atomic_store(&explore->failed, false);
     atomic_store(&explore->loading, false);
     return NULL;
@@ -558,16 +646,20 @@ void ds_explore_destroy(DSExplore *explore) {
     memset(explore, 0, sizeof(*explore));
 }
 
-size_t ds_explore_page(DSExplore *explore, const char *query, size_t page,
+size_t ds_explore_page(DSExplore *explore, const char *query, size_t page, size_t page_size,
                        DSExplorePlace out[DS_EXPLORE_PAGE_SIZE], size_t *match_count) {
     size_t matches = 0;
     size_t copied = 0;
-    const size_t first = page * DS_EXPLORE_PAGE_SIZE;
+    if (page_size == 0 || page_size > DS_EXPLORE_PAGE_SIZE) {
+        if (match_count) *match_count = 0;
+        return 0;
+    }
+    const size_t first = page <= SIZE_MAX / page_size ? page * page_size : SIZE_MAX;
     pthread_mutex_lock(&explore->mutex);
     for (size_t i = 0; i < explore->count; ++i) {
         if (!contains_folded(explore->places[i].title, query) &&
             !contains_folded(explore->places[i].region, query)) continue;
-        if (matches >= first && copied < DS_EXPLORE_PAGE_SIZE) out[copied++] = explore->places[i];
+        if (matches >= first && copied < page_size) out[copied++] = explore->places[i];
         ++matches;
     }
     pthread_mutex_unlock(&explore->mutex);
@@ -575,60 +667,48 @@ size_t ds_explore_page(DSExplore *explore, const char *query, size_t page,
     return copied;
 }
 
+static bool open_url(ANativeActivity *activity, const char *url) {
+    DSJniScope scope;
+    if (!ds_jni_scope_begin(&scope, activity)) return false;
+    JNIEnv *env = scope.env;
+    bool opened = false;
+    jclass uri_class = (*env)->FindClass(env, "android/net/Uri");
+    if (!uri_class) goto done;
+    jclass intent_class = (*env)->FindClass(env, "android/content/Intent");
+    if (!intent_class) goto done;
+    jmethodID parse = (*env)->GetStaticMethodID(env, uri_class, "parse", "(Ljava/lang/String;)Landroid/net/Uri;");
+    if (!parse) goto done;
+    jmethodID constructor = (*env)->GetMethodID(env, intent_class, "<init>", "(Ljava/lang/String;Landroid/net/Uri;)V");
+    if (!constructor) goto done;
+    jclass activity_class = (*env)->GetObjectClass(env, activity->clazz);
+    if (!activity_class) goto done;
+    jmethodID start_activity = (*env)->GetMethodID(env, activity_class, "startActivity", "(Landroid/content/Intent;)V");
+    if (!start_activity) goto done;
+    jstring action = (*env)->NewStringUTF(env, "android.intent.action.VIEW");
+    if (!action) goto done;
+    jstring url_string = (*env)->NewStringUTF(env, url);
+    if (!url_string) goto done;
+    jobject uri = (*env)->CallStaticObjectMethod(env, uri_class, parse, url_string);
+    if (!uri || (*env)->ExceptionCheck(env)) goto done;
+    jobject intent = (*env)->NewObject(env, intent_class, constructor, action, uri);
+    if (!intent || (*env)->ExceptionCheck(env)) goto done;
+    (*env)->CallVoidMethod(env, activity->clazz, start_activity, intent);
+    opened = !(*env)->ExceptionCheck(env);
+done:
+    return ds_jni_scope_end(&scope) && opened;
+}
+
 bool ds_explore_open_article(ANativeActivity *activity, int64_t page_id) {
     if (!activity || page_id <= 0) return false;
-    JNIEnv *env = activity->env;
-    jclass uri_class = (*env)->FindClass(env, "android/net/Uri");
-    jclass intent_class = (*env)->FindClass(env, "android/content/Intent");
-    if (!uri_class || !intent_class) { clear_exception(env); return false; }
-    jmethodID parse = (*env)->GetStaticMethodID(env, uri_class, "parse", "(Ljava/lang/String;)Landroid/net/Uri;");
-    jmethodID constructor = (*env)->GetMethodID(env, intent_class, "<init>", "(Ljava/lang/String;Landroid/net/Uri;)V");
-    jmethodID start_activity = (*env)->GetMethodID(env, activity->clazz ? (*env)->GetObjectClass(env, activity->clazz) : intent_class,
-                                                   "startActivity", "(Landroid/content/Intent;)V");
     char url[96];
     snprintf(url, sizeof(url), "https://en.wikipedia.org/?curid=%lld", (long long)page_id);
-    jstring action = (*env)->NewStringUTF(env, "android.intent.action.VIEW");
-    jstring url_string = (*env)->NewStringUTF(env, url);
-    jobject uri = (*env)->CallStaticObjectMethod(env, uri_class, parse, url_string);
-    jobject intent = (*env)->NewObject(env, intent_class, constructor, action, uri);
-    if (intent && start_activity) (*env)->CallVoidMethod(env, activity->clazz, start_activity, intent);
-    const bool okay = !(*env)->ExceptionCheck(env);
-    clear_exception(env);
-    if (intent) (*env)->DeleteLocalRef(env, intent);
-    if (uri) (*env)->DeleteLocalRef(env, uri);
-    (*env)->DeleteLocalRef(env, url_string);
-    (*env)->DeleteLocalRef(env, action);
-    (*env)->DeleteLocalRef(env, intent_class);
-    (*env)->DeleteLocalRef(env, uri_class);
-    return okay;
+    return open_url(activity, url);
 }
 
 bool ds_explore_open_wikidata(ANativeActivity *activity, const char *wikidata_id) {
     if (!activity || !wikidata_id || wikidata_id[0] != 'Q' || !wikidata_id[1]) return false;
     for (const char *p = wikidata_id + 1; *p; ++p) if (!isdigit((unsigned char)*p)) return false;
-    JNIEnv *env = activity->env;
-    jclass uri_class = (*env)->FindClass(env, "android/net/Uri");
-    jclass intent_class = (*env)->FindClass(env, "android/content/Intent");
-    if (!uri_class || !intent_class) { clear_exception(env); return false; }
-    jmethodID parse = (*env)->GetStaticMethodID(env, uri_class, "parse", "(Ljava/lang/String;)Landroid/net/Uri;");
-    jmethodID constructor = (*env)->GetMethodID(env, intent_class, "<init>", "(Ljava/lang/String;Landroid/net/Uri;)V");
-    jclass activity_class = (*env)->GetObjectClass(env, activity->clazz);
-    jmethodID start_activity = (*env)->GetMethodID(env, activity_class, "startActivity", "(Landroid/content/Intent;)V");
     char url[96];
     snprintf(url, sizeof(url), "https://www.wikidata.org/wiki/%s", wikidata_id);
-    jstring action = (*env)->NewStringUTF(env, "android.intent.action.VIEW");
-    jstring url_string = (*env)->NewStringUTF(env, url);
-    jobject uri = (*env)->CallStaticObjectMethod(env, uri_class, parse, url_string);
-    jobject intent = (*env)->NewObject(env, intent_class, constructor, action, uri);
-    if (intent && start_activity) (*env)->CallVoidMethod(env, activity->clazz, start_activity, intent);
-    const bool okay = !(*env)->ExceptionCheck(env);
-    clear_exception(env);
-    if (intent) (*env)->DeleteLocalRef(env, intent);
-    if (uri) (*env)->DeleteLocalRef(env, uri);
-    (*env)->DeleteLocalRef(env, url_string);
-    (*env)->DeleteLocalRef(env, action);
-    (*env)->DeleteLocalRef(env, activity_class);
-    (*env)->DeleteLocalRef(env, intent_class);
-    (*env)->DeleteLocalRef(env, uri_class);
-    return okay;
+    return open_url(activity, url);
 }

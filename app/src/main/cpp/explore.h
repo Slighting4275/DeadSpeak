@@ -40,7 +40,7 @@ void ds_explore_start(DSExplore *explore, ANativeActivity *activity, const char 
 void ds_explore_refresh(DSExplore *explore, ANativeActivity *activity, const char *cache_path);
 void ds_explore_stop(DSExplore *explore);
 void ds_explore_destroy(DSExplore *explore);
-size_t ds_explore_page(DSExplore *explore, const char *query, size_t page,
+size_t ds_explore_page(DSExplore *explore, const char *query, size_t page, size_t page_size,
                        DSExplorePlace out[DS_EXPLORE_PAGE_SIZE], size_t *match_count);
 bool ds_explore_open_article(ANativeActivity *activity, int64_t page_id);
 bool ds_explore_open_wikidata(ANativeActivity *activity, const char *wikidata_id);
