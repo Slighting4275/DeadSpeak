@@ -10,9 +10,16 @@ DeadSpeak is a native Android fieldwork and evidence-recording app for paranorma
   - `CLASSIC`: Resonant vocal tract glottal impulse filtering.
   - `WHISPER`: Unvoiced spectral noise shaped through resonant oral cavities.
   - `SPIRIT BOX`: Swept formant modulation combined with burst radio static.
+- **3D Adaptive Baseline & Environmental Drift Tracking**: Continuously monitors ambient geomagnetic flux across all 3 spatial axes ($B_x, B_y, B_z$) using an exponential moving average (EWMA, $\alpha = 0.015, \tau \approx 7\,\text{s}$). Naturally absorbs slow room drift, building settling, and temperature fluctuations without requiring constant manual calibration.
+- **Event-Driven Transient Anomaly Trigger**: Completely silent in calm ambient environments (no random or periodic timer-based word spitting). Anomalies require a sustained transient flux deviation ($\ge 200\,\text{ms}$) exceeding the threshold. Fires exactly once at the peak of the anomaly, then disarms until the field returns below reset threshold ($0.5\times\text{Threshold}$) and a $2.5\,\text{s}$ cooldown window elapses, preventing repetitive loops near stationary metal or electrical fixtures.
+- **Deterministic 3D Magnetic Vector Dictionary Mapping**: Maps spatial perturbation vectors $(\Delta B_x, \Delta B_y, \Delta B_z)$ deterministically to the dictionary using 64-bit spatial FNV-1a hashing across quantized spherical coordinates (horizontal azimuth $\theta$, vertical elevation $\phi$, and flux magnitude $\Delta||\vec{B}||$). Zero clock-based RNG or sample counters; identical physical field perturbations yield identical dictionary words.
+- **Adjustable Sensitivity Presets**: Cycle live in the sensor details overlay:
+  - `SENS: HI` ($4.0\,\mu\text{T}$ threshold): Maximum sensitivity for magnetically quiet, remote fieldwork locations.
+  - `SENS: MED` ($8.0\,\mu\text{T}$ threshold, default): Balanced signal-to-noise ratio for standard paranormal investigations.
+  - `SENS: LO` ($15.0\,\mu\text{T}$ threshold): Robust filtering for locations with high background electromagnetic interference (EMI).
 - **Acoustic EMF Geiger Ticks**: Scaled live click telemetry through `AAudio` when magnetic field deviations occur above baseline, accelerating dynamically with anomaly intensity ($\Delta\text{EMF}$) for hands-free audible tracking.
 - **DSP Schroeder Reverb & Multi-Tap Echo**: Atmospheric spatial resonance, 3-tap parallel comb delay lines, and all-pass diffusion for decaying ghost echoes on synthesized words.
-- **6-DOF IMU Motion Rejection Filter**: Low-pass filtered angular velocity ($\text{rad/s}$) and linear acceleration deviation from $1g$ ($9.80665\,\text{m/s}^2$). Rejects false magnetic anomalies caused by user hand movement and enforces a 1.2-second settling hold before re-enabling baseline triggers.
+- **6-DOF IMU Motion Rejection Filter**: Low-pass filtered angular velocity ($\text{rad/s}$) and linear acceleration deviation from $1g$ ($9.80665\,\text{m/s}^2$). Rejects false magnetic anomalies caused by user hand movement, instantly flushes partial transient accumulation, and enforces a 1.2-second settling hold before re-enabling baseline triggers.
 - **Multi-Mode OpenGL ES 2 Camera Shaders**: Universal GPU-accelerated video filtering across six selectable modes:
   - `NIGHT`: Phosphor green night-vision amplification.
   - `THERMAL`: Ironbow false-color heatmap LUT.
@@ -91,7 +98,7 @@ Run native signing regressions (no phone or JVM needed):
 sh tests/signing_test.sh
 ```
 
-For the full three-ABI build plus signing-identity permissions, path and ELF-architecture guards, sensor-state validation, camera UI layout geometry, custom words binary storage, baseline deviation word triggers, formant voice synthesis, IMU motion filtering, and signing regressions:
+For the full three-ABI build plus signing-identity permissions, path and ELF-architecture guards, sensor-state validation, camera UI layout geometry, custom words binary storage, 3D adaptive baseline and event-driven word triggers, deterministic vector dictionary mapping, formant voice synthesis, IMU motion filtering, and signing regressions:
 
 ```sh
 sh tools/test-build.sh

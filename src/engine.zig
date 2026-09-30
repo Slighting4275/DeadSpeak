@@ -62,8 +62,10 @@ fn read_u32(bytes: [*]const u8, offset: usize) u32 {
         (@as(u32, bytes[offset + 3]) << 24);
 }
 
-export fn ds_engine_next_word(magnetic_field: f32, sample: u32, dictionary: ?[*]const u8,
-                              dictionary_size: usize, out: [*]u8, capacity: usize) usize {
+export fn ds_engine_vector_word(bx: f32, by: f32, bz: f32,
+                                base_x: f32, base_y: f32, base_z: f32,
+                                dictionary: ?[*]const u8, dictionary_size: usize,
+                                out: [*]u8, capacity: usize) usize {
     if (capacity == 0) return 0;
     out[0] = 0;
     const bytes = dictionary orelse return 0;
@@ -72,12 +74,42 @@ export fn ds_engine_next_word(magnetic_field: f32, sample: u32, dictionary: ?[*]
     const word_count = read_u32(bytes, 8);
     if (word_count == 0) return 0;
 
-    // Reject invalid/out-of-range fields before float-to-integer conversion.
-    // A malformed reading must never panic the native engine or select a word.
-    if (!@import("std").math.isFinite(magnetic_field) or magnitude(magnetic_field) > 1000000.0) return 0;
+    if (!@import("std").math.isFinite(bx) or !@import("std").math.isFinite(by) or !@import("std").math.isFinite(bz)) return 0;
+    if (!@import("std").math.isFinite(base_x) or !@import("std").math.isFinite(base_y) or !@import("std").math.isFinite(base_z)) return 0;
 
-    const quantized: u64 = @intFromFloat(magnitude(magnetic_field) * 10.0);
-    const index: usize = @intCast((quantized + @as(u64, sample)) % @as(u64, word_count));
+    const dx: f64 = @as(f64, bx) - @as(f64, base_x);
+    const dy: f64 = @as(f64, by) - @as(f64, base_y);
+    const dz: f64 = @as(f64, bz) - @as(f64, base_z);
+    const delta_mag = @sqrt(dx * dx + dy * dy + dz * dz);
+    if (delta_mag < 0.0001 or delta_mag > 1000000.0) return 0;
+
+    // Azimuth in horizontal plane [0.0, 360.0) degrees
+    var azimuth_rad = @import("std").math.atan2(dy, dx);
+    if (azimuth_rad < 0.0) azimuth_rad += 6.283185307179586;
+    const azimuth_deg = azimuth_rad * 57.29577951308232;
+
+    // Elevation in vertical plane [-90.0, +90.0] degrees
+    const z_ratio = if (dz / delta_mag > 1.0) 1.0 else if (dz / delta_mag < -1.0) -1.0 else dz / delta_mag;
+    const elevation_deg = @import("std").math.asin(z_ratio) * 57.29577951308232;
+
+    // High resolution spatial quantization:
+    // 0.25-degree azimuth resolution = 1440 bins
+    const az_val = @mod(azimuth_deg * 4.0, 1440.0);
+    const az_bin: u64 = @intFromFloat(@min(@max(0.0, az_val), 1439.0));
+    // 0.5-degree elevation resolution = 360 bins
+    const el_val = (elevation_deg + 90.0) * 2.0;
+    const el_bin: u64 = @intFromFloat(@min(@max(0.0, el_val), 360.0));
+    // 0.1 uT magnitude resolution
+    const mag_bin: u64 = @intFromFloat(@min(@max(0.0, delta_mag * 10.0), 100000.0));
+
+    // Deterministic 64-bit spatial FNV-1a hash across the 3D spherical coordinates
+    var h: u64 = 0xcbf29ce484222325;
+    const prime: u64 = 0x100000001b3;
+    h = (h ^ az_bin) *% prime;
+    h = (h ^ el_bin) *% prime;
+    h = (h ^ mag_bin) *% prime;
+
+    const index: usize = @intCast(h % @as(u64, word_count));
     var offset: usize = 12;
     for (0..index + 1) |word_index| {
         if (offset + 2 > dictionary_size) return 0;
@@ -93,4 +125,10 @@ export fn ds_engine_next_word(magnetic_field: f32, sample: u32, dictionary: ?[*]
         offset += word_length;
     }
     return 0;
+}
+
+export fn ds_engine_next_word(magnetic_field: f32, sample: u32, dictionary: ?[*]const u8,
+                              dictionary_size: usize, out: [*]u8, capacity: usize) usize {
+    _ = sample;
+    return ds_engine_vector_word(magnetic_field, 0.0, 0.0, 0.0, 0.0, 0.0, dictionary, dictionary_size, out, capacity);
 }

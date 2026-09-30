@@ -543,7 +543,7 @@ static const char *camera_fragment_shader =
     "    }\n"
     "}";
 
-static const uint8_t font[39][7] = {
+static const uint8_t font[43][7] = {
     {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}, {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E},
     {0x0F,0x10,0x10,0x10,0x10,0x10,0x0F}, {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E},
     {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}, {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10},
@@ -563,7 +563,9 @@ static const uint8_t font[39][7] = {
     {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
     {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},
     {0x00,0x00,0x04,0x00,0x00,0x04,0x00}, {0x00,0x00,0x00,0x1F,0x00,0x00,0x00},
-    {0x00,0x00,0x00,0x00,0x00,0x06,0x06},
+    {0x00,0x00,0x00,0x00,0x00,0x06,0x06}, {0x00,0x04,0x04,0x1F,0x04,0x04,0x00},
+    {0x02,0x04,0x08,0x08,0x08,0x04,0x02}, {0x08,0x04,0x02,0x02,0x02,0x04,0x08},
+    {0x19,0x19,0x02,0x04,0x08,0x13,0x13},
 };
 
 static uint64_t now_millis(void) {
@@ -761,6 +763,10 @@ static int glyph_index(char c) {
     if (c == ':') return 36;
     if (c == '-') return 37;
     if (c == '.') return 38;
+    if (c == '+') return 39;
+    if (c == '(') return 40;
+    if (c == ')') return 41;
+    if (c == '%') return 42;
     return -1;
 }
 
@@ -1143,9 +1149,11 @@ static void draw_camera(DeadSpeak *state) {
         snprintf(details, sizeof(details), "ACCEL %s  GYRO %s", ds_sensor_status_name(state->readings[1].status), ds_sensor_status_name(state->readings[2].status));
         text(state, details, 20, top + 57, fit_text_scale(details, 1.0f, state->width - 108), 0.8f, 0.95f, 0.86f, 1);
         custom_button(state, (DSRect){20, top + 84, 112, 40}, "CALIBRATE", false);
-        if (state->baseline.ready) snprintf(details, sizeof(details), "BASE %.1f UT", state->baseline.field);
+        const char *sens_names[] = {"SENS: HI", "SENS: MED", "SENS: LO"};
+        custom_button(state, (DSRect){138, top + 84, 96, 40}, sens_names[state->baseline.sensitivity % 3], false);
+        if (state->baseline.ready) snprintf(details, sizeof(details), "BASE %.1f UT (%.1f)", state->baseline.field, ds_baseline_threshold(state->baseline.sensitivity));
         else snprintf(details, sizeof(details), "SAMPLES %u OF 20", state->baseline.count);
-        text(state, details, 142, top + 98, fit_text_scale(details, 1.0f, state->width - 238), 0.8f, 0.95f, 0.86f, 1);
+        text(state, details, 242, top + 98, fit_text_scale(details, 1.0f, state->width - 250), 0.8f, 0.95f, 0.86f, 1);
     }
     
     /* 1. SOUND SPECTRUM & LIVE OSCILLOSCOPE ANALYZER HUD */
@@ -1677,9 +1685,17 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
             else if (i == 4) state->sensor_details = !state->sensor_details;
             return 1;
         }
-        if (state->sensor_details && ds_rect_contains((DSRect){20, (state->height < 650 ? 76 : 142) + 84, 112, 40}, x, y)) {
+        if (state->sensor_details && !state->minimal_hud && ds_rect_contains((DSRect){20, (state->height < 650 ? 76 : 142) + 84, 112, 40}, x, y)) {
             ds_baseline_reset(&state->baseline);
             state->word[0] = 0;
+            return 1;
+        }
+        if (state->sensor_details && !state->minimal_hud && ds_rect_contains((DSRect){138, (state->height < 650 ? 76 : 142) + 84, 96, 40}, x, y)) {
+            state->baseline.sensitivity = (DSSensitivity)((state->baseline.sensitivity + 1) % 3);
+            const char *sens_names[] = {"SENS: HI", "SENS: MED", "SENS: LO"};
+            __android_log_print(ANDROID_LOG_INFO, LOG_TAG, "SENSITIVITY set to %s (threshold=%.1f uT)",
+                                sens_names[state->baseline.sensitivity % 3],
+                                ds_baseline_threshold(state->baseline.sensitivity));
             return 1;
         }
         if (ds_rect_contains(state->camera_ui.record, x, y)) {
@@ -1799,7 +1815,8 @@ static void poll_sensor(DeadSpeak *state) {
         state->magnetic_field = reading->magnitude;
         state->smoothed_field = sample == DS_SAMPLE_FIRST ? reading->magnitude :
             ds_engine_smooth(state->smoothed_field, reading->magnitude, 0.15f);
-        ds_baseline_sample(&state->baseline, reading->magnitude);
+        const bool moving = ds_motion_is_moving(&state->motion_filter, received);
+        ds_baseline_sample_3d(&state->baseline, reading->xyz[0], reading->xyz[1], reading->xyz[2], moving, reading->timestamp_ns);
         state->signal = state->baseline.ready ? ds_engine_signal(state->smoothed_field, state->baseline.field) : 0;
         if (state->sample_count == UINT32_MAX) state->sample_count = 0;
         ++state->sample_count;
@@ -1823,15 +1840,19 @@ static void poll_sensor(DeadSpeak *state) {
                 "MAGNETOMETER LIVE samples=%u field=%.3f uT xyz=%.3f,%.3f,%.3f accuracy=%d",
                 state->sample_count, state->magnetic_field, reading->xyz[0], reading->xyz[1], reading->xyz[2], reading->accuracy);
         }
-        if (state->scanning && state->sample_count % 10U == 0U &&
-            !ds_motion_is_moving(&state->motion_filter, received) &&
-            ds_baseline_word_trigger(&state->baseline, state->smoothed_field, reading->timestamp_ns)) {
+        if (state->scanning && !moving &&
+            ds_baseline_word_trigger_3d(&state->baseline, reading->xyz[0], reading->xyz[1], reading->xyz[2], moving, reading->timestamp_ns)) {
             const uint8_t *bank = state->custom_selected ? state->custom_blob : state->dictionary;
             const size_t bank_size = state->custom_selected ? state->custom_blob_size : state->dictionary_size;
-            ds_engine_next_word(state->smoothed_field, state->sample_count, bank,
-                                bank_size, state->word, sizeof(state->word));
+            ds_engine_vector_word(state->baseline.triggered_x, state->baseline.triggered_y, state->baseline.triggered_z,
+                                  state->baseline.base_x, state->baseline.base_y, state->baseline.base_z,
+                                  bank, bank_size, state->word, sizeof(state->word));
             if (state->word[0]) {
                 append_word_log(state, state->word);
+                __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+                    "WORD TRIGGERED: %s (field=%.2f uT delta=%.2f uT vector=%.1f,%.1f,%.1f)",
+                    state->word, state->smoothed_field, state->baseline.triggered_delta,
+                    state->baseline.triggered_x, state->baseline.triggered_y, state->baseline.triggered_z);
                 if (state->voice_player && state->voice_config.enabled) {
                     ds_voice_player_speak(state->voice_player, state->word, &state->voice_config);
                 }
