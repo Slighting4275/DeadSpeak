@@ -356,9 +356,9 @@ int main(int argc, char **argv) {
     RUN(aapt, "link", "-x", "--allow-reserved-package-id", "--no-compile-sdk-metadata", "--manifest", "tools/platform/AndroidManifest.xml",
         "--min-sdk-version", DS_MIN_API, "--target-sdk-version", "37", "-o", "build/native-platform/framework-res.apk",
         "build/native-platform/public-resources.zip");
-    RUN("zig", "cc", "-std=c23", "-O2", "-Wall", "-Wextra", "-Werror", "tools/make_words.c", "-o", "build/host/make-words");
+    RUN("zig", "cc", "-std=c23", "-O2", "-Wall", "-Wextra", "-Werror", "-fPIE", "-pie", "-fstack-protector-strong", "tools/make_words.c", "-o", "build/host/make-words");
     RUN("build/host/make-words");
-    RUN("zig", "cc", "-std=c23", "-O2", "-Wall", "-Wextra", "-Werror", "tools/apk_sign.c", "-lcrypto", "-o", "build/host/apk-sign");
+    RUN("zig", "cc", "-std=c23", "-O2", "-Wall", "-Wextra", "-Werror", "-fPIE", "-pie", "-fstack-protector-strong", "tools/apk_sign.c", "-lcrypto", "-o", "build/host/apk-sign");
     for (size_t i = 0; i < abi_count; ++i) {
         char output[PATH_MAX], toolchain[PATH_MAX], abi[PATH_MAX], android_ndk[PATH_MAX], library[PATH_MAX];
         path(output, "build/native/%s", abis[i]);

@@ -112,7 +112,7 @@ int main(void) {
         }
         if (!duplicate) snprintf(entries[count++], WORD_BYTES, "%s", normalized);
     }
-    fclose(source);
+    (void)fclose(source);
 
     FILE *file = fopen("app/src/main/assets/words.bin", "wb");
     if (!file) return 1;
@@ -123,7 +123,7 @@ int main(void) {
         const size_t length = strlen(entries[i]);
         ok = write_u16(file, (uint16_t)length) && fwrite(entries[i], 1, length, file) == length;
     }
-    fclose(file);
+    if (fclose(file) != 0) ok = 0;
     if (ok) fprintf(stderr, "Wrote %u unique dictionary entries\n", count);
     return ok ? 0 : 1;
 }

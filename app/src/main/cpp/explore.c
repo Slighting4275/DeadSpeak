@@ -14,7 +14,7 @@
 
 #define DS_EXPLORE_LOG "DeadSpeakExplore"
 #define DS_EXPLORE_LIMIT 8192
-#define DS_EXPLORE_CACHE_SECONDS (30 * 24 * 60 * 60)
+#define DS_EXPLORE_CACHE_SECONDS ((time_t)30 * 24 * 60 * 60)
 #define DS_WIKI_ROOT "https://en.wikipedia.org/w/api.php?action=query&list=categorymembers&cmtitle=Category%3AReportedly_haunted_locations_by_country&cmtype=subcat&cmlimit=100&format=json&maxlag=5"
 
 typedef struct {
@@ -166,7 +166,7 @@ static jobject request_json(DSJni *jni, const char *url_text) {
     chunk = (*env)->NewByteArray(env, 4096);
     if (!output || !chunk) goto cleanup;
     size_t total = 0;
-    while (total < 2U * 1024U * 1024U) {
+    while (total < (size_t)2 * 1024 * 1024) {
         const jint received = (*env)->CallIntMethod(env, input, jni->stream_read, chunk);
         if ((*env)->ExceptionCheck(env) || received <= 0) break;
         (*env)->CallVoidMethod(env, output, jni->byte_stream_write, chunk, 0, received);
@@ -308,7 +308,7 @@ static size_t load_cache(DSExplore *explore, time_t *modified) {
         char *end = strpbrk(field[6], "\r\n");
         if (end) *end = '\0';
         if (add_place(explore, strtoll(field[0], NULL, 10), field[1], field[2], field[3],
-                      atoi(field[4]) != 0, strtod(field[5], NULL), strtod(field[6], NULL))) ++count;
+                      strtol(field[4], NULL, 10) != 0, strtod(field[5], NULL), strtod(field[6], NULL))) ++count;
     }
     fclose(file);
     if (modified) *modified = file_stat.st_mtime;

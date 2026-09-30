@@ -1,6 +1,6 @@
 #!/bin/sh
 # Bootstrap the C build driver. No JVM, Gradle, Java compiler, DEX, or JARs.
-project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || exit 1
+project_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd) || exit 1
 cd "$project_dir" || exit 1
 zig_library_dir=${ZIG_LIB_DIR:-$(sed -n 's/^deadspeak.zigLibDir=//p' local.properties 2>/dev/null)}
 if [ -n "$zig_library_dir" ]; then
@@ -16,6 +16,7 @@ if [ -n "$zig_library_dir" ]; then
     fi
 fi
 mkdir -p build/host || exit 1
-zig cc -std=c23 -O2 -Wall -Wextra -Werror tools/build.c \
+# shellcheck disable=SC2046
+zig cc -std=c23 -O2 -Wall -Wextra -Werror -fPIE -pie -fstack-protector-strong tools/build.c \
     $(pkg-config --cflags --libs libarchive openssl libxml-2.0) -o build/host/deadspeak-build || exit 1
 exec build/host/deadspeak-build "$@"

@@ -78,7 +78,7 @@ static void *voice_player_thread(void *arg) {
         if (p->has_work) {
             char text[64] = {0};
             DSVoiceConfig config = p->pending_config;
-            strncpy(text, p->pending_text, sizeof(text) - 1);
+            snprintf(text, sizeof(text), "%s", p->pending_text);
             p->has_work = false;
             pthread_mutex_unlock(&p->mutex);
 
@@ -179,7 +179,7 @@ static void *voice_player_thread(void *arg) {
         }
         if (!p->stream) {
             /* Throttle thread to real-time chunk interval if audio output is unavailable */
-            usleep(16000);
+            nanosleep(&(struct timespec){.tv_sec = 0, .tv_nsec = 16000000L}, NULL);
         }
     }
 
@@ -230,8 +230,7 @@ void ds_voice_player_destroy(DSVoicePlayer *p) {
 void ds_voice_player_speak(DSVoicePlayer *p, const char *text, const DSVoiceConfig *config) {
     if (!p || !text || !text[0]) return;
     pthread_mutex_lock(&p->mutex);
-    strncpy(p->pending_text, text, sizeof(p->pending_text) - 1);
-    p->pending_text[sizeof(p->pending_text) - 1] = '\0';
+    snprintf(p->pending_text, sizeof(p->pending_text), "%s", text);
     p->pending_config = config ? *config : (DSVoiceConfig){.enabled = true, .mode = DS_VOICE_MODE_CLASSIC, .pitch_hz = 115.0f, .speed = 1.0f};
     p->has_work = true;
     pthread_cond_signal(&p->cond);
@@ -268,7 +267,7 @@ bool ds_voice_player_play_wav(DSVoicePlayer *p, const char *wav_path) {
     if (fread(header, 1, 44, f) != 44 || memcmp(header, "RIFF", 4) != 0 ||
         memcmp(header + 8, "WAVE", 4) != 0 || memcmp(header + 12, "fmt ", 4) != 0 ||
         memcmp(header + 36, "data", 4) != 0) {
-        fclose(f);
+        (void)fclose(f);
         return false;
     }
 
@@ -276,28 +275,28 @@ bool ds_voice_player_play_wav(DSVoicePlayer *p, const char *wav_path) {
     memcpy(&sample_rate, header + 24, sizeof(sample_rate));
     memcpy(&data_bytes, header + 40, sizeof(data_bytes));
     if (sample_rate == 0 || data_bytes == 0 || data_bytes > 30 * 1024 * 1024) {
-        fclose(f);
+        (void)fclose(f);
         return false;
     }
 
     const size_t num_samples = data_bytes / sizeof(int16_t);
     int16_t *buf = malloc(num_samples * sizeof(int16_t));
     if (!buf) {
-        fclose(f);
+        (void)fclose(f);
         return false;
     }
 
     if (fread(buf, sizeof(int16_t), num_samples, f) != num_samples) {
         free(buf);
-        fclose(f);
+        (void)fclose(f);
         return false;
     }
-    fclose(f);
+    (void)fclose(f);
 
     /* If original WAV is 48kHz and playback is 16kHz, downsample 3:1 */
     int16_t *final_buf = buf;
     size_t final_samples = num_samples;
-    if (sample_rate == 48000) {
+    if (sample_rate == 48000 && num_samples >= 3) {
         const size_t downsampled = num_samples / 3;
         int16_t *resampled = malloc(downsampled * sizeof(int16_t));
         if (resampled) {
@@ -317,8 +316,7 @@ bool ds_voice_player_play_wav(DSVoicePlayer *p, const char *wav_path) {
     p->wav_current_sample = 0;
     p->wav_sample_rate = sample_rate;
     p->wav_playing = true;
-    strncpy(p->wav_path, wav_path, sizeof(p->wav_path) - 1);
-    p->wav_path[sizeof(p->wav_path) - 1] = '\0';
+    snprintf(p->wav_path, sizeof(p->wav_path), "%s", wav_path);
     pthread_cond_signal(&p->cond);
     pthread_mutex_unlock(&p->mutex);
 
@@ -341,8 +339,7 @@ bool ds_voice_player_is_playing_wav(const DSVoicePlayer *p, char *out_name, size
     if (out_name && max_name > 0) {
         const char *slash = strrchr(mutable_p->wav_path, '/');
         const char *name = slash ? slash + 1 : mutable_p->wav_path;
-        strncpy(out_name, name, max_name - 1);
-        out_name[max_name - 1] = '\0';
+        snprintf(out_name, max_name, "%s", name);
     }
     if (out_progress) {
         *out_progress = (mutable_p->wav_total_samples > 0)

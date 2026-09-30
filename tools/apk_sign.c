@@ -319,7 +319,8 @@ static bool rsa_key(EVP_PKEY *key) {
     EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(key, NULL);
     const bool ok = ctx && EVP_PKEY_public_check(ctx) == 1;
     EVP_PKEY_CTX_free(ctx);
-    return ok || fail("invalid RSA public key");
+    if (!ok) return fail("invalid RSA public key");
+    return true;
 }
 static bool public_der(EVP_PKEY *key, Buffer *out) {
     const int length = i2d_PUBKEY(key, NULL);
@@ -327,7 +328,8 @@ static bool public_der(EVP_PKEY *key, Buffer *out) {
     out->p = malloc((size_t)length); out->n = (size_t)length;
     if (!out->p) return fail("out of memory encoding key");
     unsigned char *position = out->p;
-    return i2d_PUBKEY(key, &position) == length || fail("cannot encode RSA public key");
+    if (i2d_PUBKEY(key, &position) != length) return fail("cannot encode RSA public key");
+    return true;
 }
 static bool rsa_signature(EVP_PKEY *key, Slice data, Buffer *signature, bool signing) {
     EVP_MD_CTX *ctx = EVP_MD_CTX_new(); EVP_PKEY_CTX *pctx = NULL;
@@ -345,7 +347,8 @@ static bool rsa_signature(EVP_PKEY *key, Slice data, Buffer *signature, bool sig
     } else ok = EVP_DigestVerify(ctx, signature->p, signature->n, data.p, data.n) == 1;
 done:
     EVP_MD_CTX_free(ctx);
-    return ok || fail(signing ? "RSA signing failed" : "RSA signature verification failed");
+    if (!ok) return fail(signing ? "RSA signing failed" : "RSA signature verification failed");
+    return true;
 }
 static bool verify_apk(Apk *apk) {
     Slice block = apk->v2, signers, signer, signed_data, signatures, public_key, record, signature, id;

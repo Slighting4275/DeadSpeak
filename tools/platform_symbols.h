@@ -18,8 +18,8 @@ static void ds_symbol_add(const char *type, const char *name) {
         if (!strcmp(ds_symbols[i].type, type) && !strcmp(ds_symbols[i].name, name)) return;
     if (ds_symbol_count == sizeof(ds_symbols) / sizeof(ds_symbols[0])) fail("too many framework symbols");
     DSSymbol *symbol = &ds_symbols[ds_symbol_count++];
-    strcpy(symbol->type, type);
-    strcpy(symbol->name, name);
+    snprintf(symbol->type, sizeof(symbol->type), "%s", type);
+    snprintf(symbol->name, sizeof(symbol->name), "%s", name);
 }
 
 static void ds_symbol_reference(const char *value) {
@@ -134,7 +134,7 @@ static void ds_platform_symbols(const char *sdk) {
             if (name && type && !strcmp((const char *)name, symbol->name) && !strcmp((const char *)type, symbol->type)) {
                 xmlChar *id = xmlGetProp(node, BAD_CAST "id");
                 if (!id || strlen((const char *)id) >= sizeof(symbol->id)) fail("invalid public resource ID");
-                strcpy(symbol->id, (const char *)id);
+                snprintf(symbol->id, sizeof(symbol->id), "%s", (const char *)id);
                 xmlFree(id);
             }
             xmlFree(name);

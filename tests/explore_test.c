@@ -92,7 +92,7 @@ static void test_refresh(const char *directory) {
     assert(ds_explore_init(&live) && ds_explore_init(&fresh) && ds_explore_init(&disk));
     assert(add_place(&live, 10, "OLD", "Old name", "Q10", true, 1.0, 2.0));
     assert(add_place(&live, 20, "OLD", "Removed page", "", false, 0.0, 0.0));
-    snprintf(live.cache_path, sizeof(live.cache_path), "%s/cache.tsv", directory);
+    (void)snprintf(live.cache_path, sizeof(live.cache_path), "%s/cache.tsv", directory);
     save_cache(&live);
     assert(add_place(&fresh, 10, "NEW", "Updated name", "Q99", true, 3.0, 4.0));
     assert(add_place(&fresh, 30, "NEW", "New page", "", false, 0.0, 0.0));
@@ -121,7 +121,7 @@ static void test_refresh(const char *directory) {
     assert(ds_explore_page(&live, "", 0, 6, places, &count) == 0 && count == 0);
 
     save_cache(&live);
-    snprintf(disk.cache_path, sizeof(disk.cache_path), "%s", live.cache_path);
+    (void)snprintf(disk.cache_path, sizeof(disk.cache_path), "%s", live.cache_path);
     time_t modified = 0;
     assert(load_cache(&disk, &modified) == 2 && modified > 0);
     assert(ds_explore_page(&disk, "updated", 0, 5, places, &count) == 1);
@@ -144,7 +144,10 @@ static void test_responsive_pagination(void) {
             size_t matches;
             const size_t count = ds_explore_page(&index, "", page, page_size, places, &matches);
             assert(matches == 13 && count <= page_size);
-            for (size_t i = 0; i < count; ++i) assert(places[i].page_id == expected++);
+            for (size_t i = 0; i < count; ++i) {
+                assert(places[i].page_id == expected);
+                expected++;
+            }
         }
         assert(expected == 14);
     }

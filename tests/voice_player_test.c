@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 static void write_test_wav(const char *path, uint32_t sample_rate, uint32_t num_samples) {
@@ -31,7 +32,7 @@ static void write_test_wav(const char *path, uint32_t sample_rate, uint32_t num_
         int16_t sample = (int16_t)(8000.0 * sin(6.2831853 * 440.0 * (double)i / (double)sample_rate));
         assert(fwrite(&sample, sizeof(int16_t), 1, f) == 1);
     }
-    fclose(f);
+    assert(fclose(f) == 0);
 }
 
 int main(void) {
@@ -56,7 +57,7 @@ int main(void) {
         .enabled = true
     };
     ds_voice_player_speak(p, "HELLO", &config);
-    usleep(50000); /* 50ms */
+    nanosleep(&(struct timespec){.tv_sec = 0, .tv_nsec = 50000000L}, NULL); /* 50ms */
     ds_voice_player_stop(p);
 
     /* 3. WAV playback */

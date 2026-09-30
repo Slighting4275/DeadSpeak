@@ -7,7 +7,7 @@ int main(void) {
     unsigned layouts = 0;
     for (int width = 320; width <= 1600; width += 32) {
         for (int height = 400; height <= 1600; height += 32) {
-            const DSCameraUI ui = ds_camera_ui(width, height);
+            const DSCameraUI ui = ds_camera_ui((float)width, (float)height);
             const DSRect overlays[] = {ui.audio, ui.magnetic, ui.word, ui.record, ui.navigation};
             for (unsigned i = 0; i < sizeof(overlays) / sizeof(overlays[0]); ++i) {
                 const DSRect r = overlays[i];

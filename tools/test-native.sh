@@ -1,6 +1,6 @@
 #!/bin/sh
 # Run the C regression tests on an attached arm64 Android device.
-project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd) || exit 1
+project_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd) || exit 1
 sdk_dir=$(sed -n 's/^sdk.dir=//p' "$project_dir/local.properties")
 zig_library_dir=${ZIG_LIB_DIR:-$(sed -n 's/^deadspeak.zigLibDir=//p' "$project_dir/local.properties")}
 if [ -n "$zig_library_dir" ]; then

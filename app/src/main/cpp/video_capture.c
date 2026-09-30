@@ -153,7 +153,7 @@ static bool select_camera(DSVideoWorker *w, char id[128]) {
             if (pw && score < best_score && strlen(ids->cameraIds[i]) < 128U) {
                 if (w->metadata) ACameraMetadata_free(w->metadata);
                 w->metadata = metadata; metadata = NULL;
-                strcpy(id, ids->cameraIds[i]);
+                snprintf(id, 128, "%s", ids->cameraIds[i]);
                 w->preview_width = pw; w->preview_height = ph; w->full_hd = full_hd;
                 best_score = score; selected = true;
             }
@@ -596,7 +596,7 @@ void ds_video_start(DSVideoCapture *capture, const char *evidence_dir, DSVideoFi
     if (!w || !atomic_load(&capture->preview_running)) return;
     pthread_mutex_lock(&w->mutex);
     if (!w->worker_finished && !w->camera_error) {
-        strcpy(capture->evidence_dir, evidence_dir);
+        snprintf(capture->evidence_dir, sizeof(capture->evidence_dir), "%s", evidence_dir);
         w->record_requested = true; atomic_store(&capture->active, true); pthread_cond_broadcast(&w->condition);
     }
     pthread_mutex_unlock(&w->mutex);

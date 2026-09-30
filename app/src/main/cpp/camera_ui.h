@@ -15,7 +15,7 @@ static inline DSCameraUI ds_camera_ui(float width, float height) {
     const float left = 16, right = width - 76;
     const float tool_height = fminf(44, fmaxf(28, (height - nav_height - 80) / 5 - 6));
     for (unsigned i = 0; i < 5; ++i)
-        ui.tools[i] = (DSRect){width - 60, 66 + i * (tool_height + 6), 44, tool_height};
+        ui.tools[i] = (DSRect){width - 60.0f, 66.0f + (float)i * (tool_height + 6.0f), 44.0f, tool_height};
     const float bottom = ui.navigation.y - 10;
     ui.record = (DSRect){width * 0.5f - 30, bottom - 60, 60, 60};
     ui.word = (DSRect){left, bottom - 112, right - left, 40};
@@ -38,7 +38,7 @@ static inline bool ds_preview_uv(int source_width, int source_height, int rotati
     const float span_u = image_aspect > view_aspect ? view_aspect / image_aspect : 1;
     const float span_v = image_aspect > view_aspect ? 1 : image_aspect / view_aspect;
     const float corners[12] = {0,0, 1,0, 0,1, 0,1, 1,0, 1,1};
-    for (unsigned i = 0; i < 6; ++i) {
+    for (size_t i = 0; i < 6; ++i) {
         const float u = (1 - span_u) * 0.5f + corners[i * 2] * span_u;
         const float v = (1 - span_v) * 0.5f + corners[i * 2 + 1] * span_v;
         uv[i * 2] = rotation == 90 ? v : rotation == 180 ? 1 - u : rotation == 270 ? 1 - v : u;

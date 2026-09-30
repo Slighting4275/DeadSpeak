@@ -23,7 +23,7 @@ typedef struct {
 } DSVoiceConfig;
 
 #define DS_VOICE_SAMPLE_RATE 16000
-#define DS_VOICE_MAX_SAMPLES (DS_VOICE_SAMPLE_RATE * 5) /* Up to 5 seconds */
+#define DS_VOICE_MAX_SAMPLES ((size_t)DS_VOICE_SAMPLE_RATE * 5UL) /* Up to 5 seconds */
 
 /* Synthesize a text word into 16-bit mono 16 kHz PCM audio buffer.
  * Returns the number of samples generated (0 if failed or disabled). */
