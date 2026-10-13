@@ -3,36 +3,38 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <stdbool.h>
 #include <string.h>
+#include "font_atlas.h"
 
 /* Font family & style variants */
-typedef enum {
+typedef enum : uint8_t {
     DS_FONT_STANDARD = 0,    /* Proportional clean sans-serif */
     DS_FONT_BOLD = 1,        /* Display bold stroke weight */
     DS_FONT_MONO = 2,        /* Fixed-pitch telemetry & coordinates */
     DS_FONT_CONDENSED = 3,   /* Compact condensed for long words */
 } DSFontType;
 
-/* Standard typographic hierarchy (sp units) */
-#define DS_FONT_SIZE_DISPLAY_XL 48.0f /* Hero announcer: 48sp */
-#define DS_FONT_SIZE_DISPLAY_LG 34.0f /* Primary triggered word: 34sp */
-#define DS_FONT_SIZE_TITLE_LG   24.0f /* Screen title / card header: 24sp */
-#define DS_FONT_SIZE_TITLE_MD   20.0f /* Section title / modal title: 20sp */
-#define DS_FONT_SIZE_BODY_LG    16.0f /* Subtitle / prominent button: 16sp */
-#define DS_FONT_SIZE_BODY_MD    14.0f /* Standard button / navigation: 14sp */
-#define DS_FONT_SIZE_CAPTION    12.0f /* Caption / sensor status label: 12sp */
-#define DS_FONT_SIZE_BADGE      10.0f /* Badge / meter marker: 10sp */
-#define DS_FONT_SIZE_MICRO       8.0f /* Micro indicator / sub-metric: 8sp */
+/* Standard typographic hierarchy (sp units) defined as C23 constexpr */
+[[maybe_unused]] static constexpr float DS_FONT_SIZE_DISPLAY_XL = 48.0f; /* Hero announcer: 48sp */
+[[maybe_unused]] static constexpr float DS_FONT_SIZE_DISPLAY_LG = 34.0f; /* Primary triggered word: 34sp */
+[[maybe_unused]] static constexpr float DS_FONT_SIZE_TITLE_LG   = 24.0f; /* Screen title / card header: 24sp */
+[[maybe_unused]] static constexpr float DS_FONT_SIZE_TITLE_MD   = 20.0f; /* Section title / modal title: 20sp */
+[[maybe_unused]] static constexpr float DS_FONT_SIZE_BODY_LG    = 16.0f; /* Subtitle / prominent button: 16sp */
+[[maybe_unused]] static constexpr float DS_FONT_SIZE_BODY_MD    = 14.0f; /* Standard button / navigation: 14sp */
+[[maybe_unused]] static constexpr float DS_FONT_SIZE_CAPTION    = 12.0f; /* Caption / sensor status label: 12sp */
+[[maybe_unused]] static constexpr float DS_FONT_SIZE_BADGE      = 10.0f; /* Badge / meter marker: 10sp */
+[[maybe_unused]] static constexpr float DS_FONT_SIZE_MICRO       = 8.0f; /* Micro indicator / sub-metric: 8sp */
+
+[[maybe_unused]] static constexpr size_t DS_FONT_GLYPH_COUNT = 60;
+[[maybe_unused]] static constexpr size_t DS_FONT_GLYPH_ROWS = 7;
+[[maybe_unused]] static constexpr size_t DS_FONT_GLYPH_COLS = 5;
 
 /* Convert sp font size to DeadSpeak native coordinate scale */
-static inline float ds_sp_to_scale(float sp) {
+[[nodiscard]] static inline float ds_sp_to_scale(float sp) {
     return sp / 7.0f;
 }
 
-#define DS_FONT_GLYPH_COUNT 60
-
-static const uint8_t ds_font_bitmap[DS_FONT_GLYPH_COUNT][7] = {
+[[maybe_unused]] static const uint8_t ds_font_bitmap[DS_FONT_GLYPH_COUNT][DS_FONT_GLYPH_ROWS] = {
     {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}, /* A: 0 */
     {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}, /* B: 1 */
     {0x0F,0x10,0x10,0x10,0x10,0x10,0x0F}, /* C: 2 */
@@ -95,7 +97,10 @@ static const uint8_t ds_font_bitmap[DS_FONT_GLYPH_COUNT][7] = {
     {0x00,0x08,0x15,0x02,0x00,0x00,0x00}, /* ~ 59 */
 };
 
-static inline int ds_glyph_index(char c) {
+static_assert(DS_FONT_GLYPH_COUNT == 60);
+static_assert(sizeof(ds_font_bitmap) == DS_FONT_GLYPH_COUNT * DS_FONT_GLYPH_ROWS);
+
+[[nodiscard]] static inline int ds_glyph_index(char c) {
     if (c >= 'a' && c <= 'z') c -= ('a' - 'A');
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= '0' && c <= '9') return 26 + (c - '0');
@@ -128,19 +133,21 @@ static inline int ds_glyph_index(char c) {
     }
 }
 
-static inline float ds_text_char_advance(char ch, float scale, DSFontType font_type) {
-    (void)ch;
-    switch (font_type) {
-        case DS_FONT_CONDENSED: return 5.0f * scale;
-        case DS_FONT_BOLD:      return 6.2f * scale;
-        case DS_FONT_MONO:      return 6.0f * scale;
-        case DS_FONT_STANDARD:
-        default:                return 6.0f * scale;
+[[nodiscard]] static inline float ds_text_char_advance(char ch, float scale, DSFontType font_type) {
+    if (scale <= 0.0f) return 0.0f;
+    const float screen_scale = scale * (7.0f / DS_FONT_CAP_HEIGHT);
+    if (font_type == DS_FONT_MONO) {
+        return 15.734f * screen_scale;
     }
+    const size_t idx = (ch >= 32 && ch <= 126) ? (size_t)(ch - 32) : (size_t)('?' - 32);
+    const size_t style_idx = (font_type == DS_FONT_BOLD) ? 1 : 0;
+    float adv = ds_font_glyphs[style_idx][idx].adv * screen_scale;
+    if (font_type == DS_FONT_CONDENSED) adv *= 0.85f;
+    return adv;
 }
 
-static inline float ds_text_width(const char *value, float scale, DSFontType font_type) {
-    if (!value) return 0.0f;
+[[nodiscard]] static inline float ds_text_width(const char *value, float scale, DSFontType font_type) {
+    if (value == nullptr || scale <= 0.0f) return 0.0f;
     float width = 0.0f;
     for (size_t i = 0; value[i] != '\0'; ++i) {
         width += ds_text_char_advance(value[i], scale, font_type);
@@ -148,12 +155,11 @@ static inline float ds_text_width(const char *value, float scale, DSFontType fon
     return width;
 }
 
-static inline float ds_fit_text_scale_styled(const char *value, float preferred, float available_width, DSFontType font_type) {
-    const size_t length = value ? strlen(value) : 0;
-    if (length == 0 || available_width <= 0.0f) return preferred;
-    const float unit_adv = ds_text_char_advance('A', 1.0f, font_type);
-    const float fit = available_width / ((float)length * unit_adv);
-    return fit < preferred ? fit : preferred;
+[[nodiscard]] static inline float ds_fit_text_scale_styled(const char *value, float preferred, float available_width, DSFontType font_type) {
+    if (value == nullptr || available_width <= 0.0f || preferred <= 0.0f) return preferred;
+    const float current_w = ds_text_width(value, preferred, font_type);
+    if (current_w <= available_width || current_w <= 0.0f) return preferred;
+    return preferred * (available_width / current_w);
 }
 
 #endif

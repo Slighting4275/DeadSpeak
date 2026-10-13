@@ -144,6 +144,9 @@ typedef struct {
     GLint color;
     GLuint camera_program, camera_texture;
     GLint camera_filter_loc, camera_image_loc;
+    GLuint text_program, text_texture;
+    GLint text_pos_loc, text_uv_loc, text_color_loc, text_sampler_loc;
+    bool text_engine_ready;
     uint8_t *preview_rgba;
     int preview_width, preview_height;
     int64_t preview_timestamp;
@@ -994,6 +997,25 @@ static const char *fragment_shader_source =
     "uniform vec4 u_color;"
     "void main(){gl_FragColor=u_color;}";
 
+static const char *text_vertex_shader_source =
+    "attribute vec2 a_position;\n"
+    "attribute vec2 a_uv;\n"
+    "varying vec2 v_uv;\n"
+    "void main() {\n"
+    "    v_uv = a_uv;\n"
+    "    gl_Position = vec4(a_position, 0.0, 1.0);\n"
+    "}\n";
+
+static const char *text_fragment_shader_source =
+    "precision mediump float;\n"
+    "varying vec2 v_uv;\n"
+    "uniform vec4 u_color;\n"
+    "uniform sampler2D u_atlas;\n"
+    "void main() {\n"
+    "    float a = texture2D(u_atlas, v_uv).a;\n"
+    "    gl_FragColor = vec4(u_color.rgb, u_color.a * a);\n"
+    "}\n";
+
 static const char *camera_vertex_shader =
     "attribute vec2 a_position;attribute vec2 a_uv;varying vec2 v_uv;"
     "void main(){v_uv=a_uv;gl_Position=vec4(a_position,0.0,1.0);}";
@@ -1177,6 +1199,36 @@ static bool setup_display(DeadSpeak *state) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    /* Text engine shader and font atlas texture */
+    vertex = compile_shader(GL_VERTEX_SHADER, text_vertex_shader_source);
+    fragment = compile_shader(GL_FRAGMENT_SHADER, text_fragment_shader_source);
+    state->text_program = glCreateProgram();
+    glAttachShader(state->text_program, vertex);
+    glAttachShader(state->text_program, fragment);
+    glBindAttribLocation(state->text_program, 0, "a_position");
+    glBindAttribLocation(state->text_program, 1, "a_uv");
+    glLinkProgram(state->text_program);
+    glDeleteShader(vertex);
+    glDeleteShader(fragment);
+    state->text_pos_loc = 0;
+    state->text_uv_loc = 1;
+    state->text_color_loc = glGetUniformLocation(state->text_program, "u_color");
+    state->text_sampler_loc = glGetUniformLocation(state->text_program, "u_atlas");
+    glGenTextures(1, &state->text_texture);
+    glBindTexture(GL_TEXTURE_2D, state->text_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    uint8_t *atlas_raw = (uint8_t *)malloc(DS_FONT_ATLAS_RAW_SIZE);
+    if (atlas_raw != nullptr) {
+        ds_font_unpack_atlas(atlas_raw, DS_FONT_ATLAS_RAW_SIZE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_ALPHA, (GLsizei)DS_FONT_ATLAS_WIDTH, (GLsizei)DS_FONT_ATLAS_HEIGHT, 0, GL_ALPHA, GL_UNSIGNED_BYTE, atlas_raw);
+        free(atlas_raw);
+        state->text_engine_ready = true;
+    }
+
     state->preview_received_ms = 0;
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -1198,6 +1250,9 @@ static void teardown_display(DeadSpeak *state) {
     state->camera_texture = 0;
     state->camera_program = 0;
     state->program = 0;
+    state->text_texture = 0;
+    state->text_program = 0;
+    state->text_engine_ready = false;
 }
 
 static void emit_vertices(DeadSpeak *state, const GLfloat *vertices, size_t count, float r, float g, float b, float a) {
@@ -1233,20 +1288,125 @@ static void line(DeadSpeak *state, float x1, float y1, float x2, float y2, float
 }
 
 static void text_styled(DeadSpeak *state, const char *value, float x, float y, float scale, DSFontType font_type, float r, float g, float b, float a) {
-    if (!value || scale <= 0.0f) return;
-    float cursor = x;
-    const float pixel_w = (font_type == DS_FONT_BOLD) ? (scale * 1.35f) : scale;
-    const float pixel_h = scale;
+    if (value == nullptr || scale <= 0.0f || state == nullptr) return;
+
+    if (state->text_engine_ready && state->text_texture != 0 && state->text_program != 0) {
+        float draw_y = y;
+        if (state->body_drawing) draw_y -= state->scroll[state->tab];
+
+        const float screen_scale = scale * (7.0f / DS_FONT_CAP_HEIGHT);
+        const size_t style_idx = (font_type == DS_FONT_BOLD) ? 1 : 0;
+        const float inv_w = 1.0f / (float)DS_FONT_ATLAS_WIDTH;
+        const float inv_h = 1.0f / (float)DS_FONT_ATLAS_HEIGHT;
+        const float sw = (float)state->width;
+        const float sh = (float)state->height;
+
+        float cursor_x = x;
+        float cur_y = draw_y;
+
+        constexpr size_t BATCH_CAPACITY = 256;
+        GLfloat vbuf[BATCH_CAPACITY * 24];
+        size_t batched_count = 0;
+
+        for (size_t i = 0; value[i] != '\0'; ++i) {
+            char ch = value[i];
+            if (ch == '\n') {
+                cursor_x = x;
+                cur_y += 24.0f * screen_scale;
+                continue;
+            }
+            if (ch == ' ') {
+                cursor_x += ds_text_char_advance(' ', scale, font_type);
+                continue;
+            }
+
+            size_t glyph_idx = (ch >= 32 && ch <= 126) ? (size_t)(ch - 32) : (size_t)('?' - 32);
+            const DSFontGlyph *glyph = &ds_font_glyphs[style_idx][glyph_idx];
+
+            if (glyph->w > 0 && glyph->h > 0) {
+                float qx1 = cursor_x + (float)glyph->ox * screen_scale;
+                float qy1 = cur_y + (float)glyph->oy * screen_scale;
+                float qx2 = qx1 + (float)glyph->w * screen_scale;
+                float qy2 = qy1 + (float)glyph->h * screen_scale;
+
+                float ndc_x1 = (qx1 / sw) * 2.0f - 1.0f;
+                float ndc_x2 = (qx2 / sw) * 2.0f - 1.0f;
+                float ndc_y1 = 1.0f - (qy1 / sh) * 2.0f;
+                float ndc_y2 = 1.0f - (qy2 / sh) * 2.0f;
+
+                float u1 = (float)glyph->x * inv_w;
+                float v1 = (float)glyph->y * inv_h;
+                float u2 = (float)(glyph->x + glyph->w) * inv_w;
+                float v2 = (float)(glyph->y + glyph->h) * inv_h;
+
+                size_t offset = batched_count * 24;
+                /* Quad vertex 1: (ndc_x1, ndc_y1, u1, v1) */
+                vbuf[offset + 0]  = ndc_x1; vbuf[offset + 1]  = ndc_y1; vbuf[offset + 2]  = u1; vbuf[offset + 3]  = v1;
+                /* Quad vertex 2: (ndc_x2, ndc_y1, u2, v1) */
+                vbuf[offset + 4]  = ndc_x2; vbuf[offset + 5]  = ndc_y1; vbuf[offset + 6]  = u2; vbuf[offset + 7]  = v1;
+                /* Quad vertex 3: (ndc_x1, ndc_y2, u1, v2) */
+                vbuf[offset + 8]  = ndc_x1; vbuf[offset + 9]  = ndc_y2; vbuf[offset + 10] = u1; vbuf[offset + 11] = v2;
+                /* Quad vertex 4: (ndc_x1, ndc_y2, u1, v2) */
+                vbuf[offset + 12] = ndc_x1; vbuf[offset + 13] = ndc_y2; vbuf[offset + 14] = u1; vbuf[offset + 15] = v2;
+                /* Quad vertex 5: (ndc_x2, ndc_y1, u2, v1) */
+                vbuf[offset + 16] = ndc_x2; vbuf[offset + 17] = ndc_y1; vbuf[offset + 18] = u2; vbuf[offset + 19] = v1;
+                /* Quad vertex 6: (ndc_x2, ndc_y2, u2, v2) */
+                vbuf[offset + 20] = ndc_x2; vbuf[offset + 21] = ndc_y2; vbuf[offset + 22] = u2; vbuf[offset + 23] = v2;
+
+                batched_count++;
+
+                if (batched_count >= BATCH_CAPACITY) {
+                    glUseProgram(state->text_program);
+                    glUniform4f(state->text_color_loc, r, g, b, a);
+                    glActiveTexture(GL_TEXTURE0);
+                    glBindTexture(GL_TEXTURE_2D, state->text_texture);
+                    glUniform1i(state->text_sampler_loc, 0);
+                    glEnable(GL_BLEND);
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+                    glBindBuffer(GL_ARRAY_BUFFER, 0);
+                    glVertexAttribPointer((GLuint)state->text_pos_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), vbuf);
+                    glEnableVertexAttribArray((GLuint)state->text_pos_loc);
+                    glVertexAttribPointer((GLuint)state->text_uv_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), vbuf + 2);
+                    glEnableVertexAttribArray((GLuint)state->text_uv_loc);
+                    glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(batched_count * 6));
+                    batched_count = 0;
+                }
+            }
+
+            cursor_x += ds_text_char_advance(ch, scale, font_type);
+        }
+
+        if (batched_count > 0) {
+            glUseProgram(state->text_program);
+            glUniform4f(state->text_color_loc, r, g, b, a);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, state->text_texture);
+            glUniform1i(state->text_sampler_loc, 0);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            glVertexAttribPointer((GLuint)state->text_pos_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), vbuf);
+            glEnableVertexAttribArray((GLuint)state->text_pos_loc);
+            glVertexAttribPointer((GLuint)state->text_uv_loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), vbuf + 2);
+            glEnableVertexAttribArray((GLuint)state->text_uv_loc);
+            glDrawArrays(GL_TRIANGLES, 0, (GLsizei)(batched_count * 6));
+        }
+        return;
+    }
+
+    auto cursor = x;
+    const auto pixel_w = (font_type == DS_FONT_BOLD) ? (scale * 1.35f) : scale;
+    const auto pixel_h = scale;
 
     for (size_t i = 0; value[i] != '\0'; ++i) {
         const char ch = value[i];
-        const float adv = ds_text_char_advance(ch, scale, font_type);
+        const auto adv = ds_text_char_advance(ch, scale, font_type);
         if (ch == ' ') { cursor += adv; continue; }
         const int index = ds_glyph_index(ch);
         if (index < 0) { cursor += adv; continue; }
-        for (int row = 0; row < 7; ++row) {
+        for (size_t row = 0; row < DS_FONT_GLYPH_ROWS; ++row) {
             const uint8_t row_bits = ds_font_bitmap[index][row];
-            for (int col = 0; col < 5; ++col) {
+            for (size_t col = 0; col < DS_FONT_GLYPH_COLS; ++col) {
                 if ((row_bits >> (4 - col)) & 1) {
                     rect(state, cursor + (float)col * scale, y + (float)row * scale, pixel_w, pixel_h, r, g, b, a);
                 }
@@ -1260,15 +1420,15 @@ static void text(DeadSpeak *state, const char *value, float x, float y, float sc
     text_styled(state, value, x, y, scale, DS_FONT_STANDARD, r, g, b, a);
 }
 
-static float fit_text_scale_styled(const char *value, float preferred, float available_width, DSFontType font_type) {
+[[nodiscard]] static inline float fit_text_scale_styled(const char *value, float preferred, float available_width, DSFontType font_type) {
     return ds_fit_text_scale_styled(value, preferred, available_width, font_type);
 }
 
-static float fit_text_scale(const char *value, float preferred, float available_width) {
+[[nodiscard]] static inline float fit_text_scale(const char *value, float preferred, float available_width) {
     return ds_fit_text_scale_styled(value, preferred, available_width, DS_FONT_STANDARD);
 }
 
-static float text_width(const char *value, float scale, DSFontType font_type) {
+[[nodiscard]] static inline float text_width(const char *value, float scale, DSFontType font_type) {
     return ds_text_width(value, scale, font_type);
 }
 

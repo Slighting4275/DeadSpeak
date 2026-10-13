@@ -13,23 +13,23 @@ static void check(bool condition, const char *msg) {
 int main(void) {
     /* 1. Verify glyph indexing for alphabets */
     for (char c = 'A'; c <= 'Z'; ++c) {
-        int idx_upper = ds_glyph_index(c);
-        int idx_lower = ds_glyph_index((char)(c + 32));
+        auto idx_upper = ds_glyph_index(c);
+        auto idx_lower = ds_glyph_index((char)(c + 32));
         check(idx_upper == c - 'A', "uppercase glyph match");
         check(idx_lower == idx_upper, "lowercase glyph match");
     }
 
     /* 2. Verify glyph indexing for numeric digits */
     for (char c = '0'; c <= '9'; ++c) {
-        int idx = ds_glyph_index(c);
+        auto idx = ds_glyph_index(c);
         check(idx == 26 + (c - '0'), "digit glyph match");
     }
 
     /* 3. Verify glyph indexing for punctuation symbols */
-    const char puncts[] = ":-.+()%!?/'\"_#&*[]<>=;~";
+    constexpr char puncts[] = ":-.+()%!?/'\"_#&*[]<>=;~";
     for (size_t i = 0; puncts[i] != '\0'; ++i) {
-        int idx = ds_glyph_index(puncts[i]);
-        check(idx >= 36 && idx < DS_FONT_GLYPH_COUNT, "punctuation in range");
+        auto idx = ds_glyph_index(puncts[i]);
+        check(idx >= 36 && idx < (int)DS_FONT_GLYPH_COUNT, "punctuation in range");
     }
 
     /* 4. Verify invalid / out-of-range characters return -1 */
@@ -41,35 +41,60 @@ int main(void) {
     check(ds_glyph_index('}') == -1, "brace has no glyph");
 
     /* 5. Verify all glyph rows conform to 5-bit bounds */
-    for (int g = 0; g < DS_FONT_GLYPH_COUNT; ++g) {
-        for (int r = 0; r < 7; ++r) {
+    for (size_t g = 0; g < DS_FONT_GLYPH_COUNT; ++g) {
+        for (size_t r = 0; r < DS_FONT_GLYPH_ROWS; ++r) {
             check(ds_font_bitmap[g][r] <= 0x1F, "glyph row width <= 5 bits");
         }
     }
 
-    /* 6. Verify font advances across styles */
-    const float scale = 2.0f;
-    check(fabsf(ds_text_char_advance('A', scale, DS_FONT_STANDARD) - 12.0f) < 1e-4f, "standard advance");
-    check(fabsf(ds_text_char_advance('A', scale, DS_FONT_MONO) - 12.0f) < 1e-4f, "mono advance");
-    check(fabsf(ds_text_char_advance('A', scale, DS_FONT_BOLD) - 12.4f) < 1e-4f, "bold advance");
-    check(fabsf(ds_text_char_advance('A', scale, DS_FONT_CONDENSED) - 10.0f) < 1e-4f, "condensed advance");
+    /* 6. Verify font atlas unpacking */
+    uint8_t *unpacked = malloc(DS_FONT_ATLAS_RAW_SIZE);
+    check(unpacked != nullptr, "atlas memory allocation");
+    ds_font_unpack_atlas(unpacked, DS_FONT_ATLAS_RAW_SIZE);
+    bool has_non_zero = false;
+    for (size_t i = 0; i < DS_FONT_ATLAS_RAW_SIZE; ++i) {
+        if (unpacked[i] > 0) { has_non_zero = true; break; }
+    }
+    check(has_non_zero, "unpacked atlas contains font data");
+    free(unpacked);
 
-    /* 7. Verify text width calculation */
+    /* 7. Verify font advances across styles */
+    constexpr float scale = 2.0f;
+    const auto adv_std = ds_text_char_advance('A', scale, DS_FONT_STANDARD);
+    const auto adv_bold = ds_text_char_advance('A', scale, DS_FONT_BOLD);
+    const auto adv_cond = ds_text_char_advance('A', scale, DS_FONT_CONDENSED);
+    const auto adv_mono = ds_text_char_advance('A', scale, DS_FONT_MONO);
+    check(adv_std > 0.0f, "standard advance positive");
+    check(adv_bold > adv_std, "bold advance > standard advance");
+    check(adv_cond < adv_std, "condensed advance < standard advance");
+    check(adv_mono > 0.0f, "mono advance positive");
+
+    /* 8. Verify monospace and proportional properties */
+    const auto adv_digit_0 = ds_text_char_advance('0', scale, DS_FONT_MONO);
+    const auto adv_digit_9 = ds_text_char_advance('9', scale, DS_FONT_MONO);
+    check(fabsf(adv_digit_0 - adv_digit_9) < 1e-4f, "mono digits have identical advance");
+
+    const auto adv_W = ds_text_char_advance('W', scale, DS_FONT_STANDARD);
+    const auto adv_I = ds_text_char_advance('I', scale, DS_FONT_STANDARD);
+    check(adv_W > adv_I, "proportional W > I advance");
+
+    /* 9. Verify text width calculation */
     const char *sample = "DEADSPEAK";
-    size_t len = strlen(sample);
-    check(fabsf(ds_text_width(sample, 1.0f, DS_FONT_STANDARD) - (float)len * 6.0f) < 1e-4f, "standard width");
-    check(fabsf(ds_text_width(sample, 1.0f, DS_FONT_CONDENSED) - (float)len * 5.0f) < 1e-4f, "condensed width");
-    check(fabsf(ds_text_width(NULL, 1.0f, DS_FONT_STANDARD)) < 1e-4f, "null string width");
+    const auto width_std = ds_text_width(sample, 1.0f, DS_FONT_STANDARD);
+    const auto width_cond = ds_text_width(sample, 1.0f, DS_FONT_CONDENSED);
+    check(width_std > 0.0f, "standard width positive");
+    check(width_cond < width_std, "condensed width < standard width");
+    check(fabsf(ds_text_width(nullptr, 1.0f, DS_FONT_STANDARD)) < 1e-4f, "nullptr string width");
 
-    /* 8. Verify fit scale behavior */
-    float fit_unconstrained = ds_fit_text_scale_styled("TEST", 2.0f, 500.0f, DS_FONT_STANDARD);
+    /* 10. Verify fit scale behavior */
+    auto fit_unconstrained = ds_fit_text_scale_styled("TEST", 2.0f, 500.0f, DS_FONT_STANDARD);
     check(fabsf(fit_unconstrained - 2.0f) < 1e-4f, "unconstrained fit");
 
-    float fit_constrained = ds_fit_text_scale_styled("TEST", 2.0f, 12.0f, DS_FONT_STANDARD);
-    /* 4 chars * 6.0f = 24.0f unit width; available is 12.0f; fit = 12 / 24 = 0.5f */
-    check(fabsf(fit_constrained - 0.5f) < 1e-4f, "constrained fit");
+    auto fit_constrained = ds_fit_text_scale_styled("TEST", 2.0f, 10.0f, DS_FONT_STANDARD);
+    check(fit_constrained < 2.0f && fit_constrained > 0.0f, "constrained fit scales down");
+    check(fabsf(ds_fit_text_scale_styled(nullptr, 2.0f, 100.0f, DS_FONT_STANDARD) - 2.0f) < 1e-4f, "nullptr fit scale");
 
-    /* 9. Verify typographic hierarchy scales */
+    /* 11. Verify typographic hierarchy scales */
     check(fabsf(ds_sp_to_scale(DS_FONT_SIZE_DISPLAY_XL) - (48.0f / 7.0f)) < 1e-4f, "display xl scale");
     check(fabsf(ds_sp_to_scale(DS_FONT_SIZE_DISPLAY_LG) - (34.0f / 7.0f)) < 1e-4f, "display lg scale");
     check(fabsf(ds_sp_to_scale(DS_FONT_SIZE_TITLE_LG) - (24.0f / 7.0f)) < 1e-4f, "title lg scale");
@@ -80,6 +105,6 @@ int main(void) {
     check(fabsf(ds_sp_to_scale(DS_FONT_SIZE_BADGE) - (10.0f / 7.0f)) < 1e-4f, "badge scale");
     check(fabsf(ds_sp_to_scale(DS_FONT_SIZE_MICRO) - (8.0f / 7.0f)) < 1e-4f, "micro scale");
 
-    printf("PASS: typography glyph index, punctuation set, font variants, advances, and typographic scale\n");
+    printf("PASS: C23 typography font atlas, constexpr scale, nullptr guards, attributes, and font engine\n");
     return 0;
 }
