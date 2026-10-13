@@ -2,6 +2,7 @@
 #include <android/log.h>
 #include <android/native_window.h>
 #include <android/sensor.h>
+#include <android/window.h>
 #include <aaudio/AAudio.h>
 #include <android_native_app_glue.h>
 #include <EGL/egl.h>
@@ -1124,6 +1125,42 @@ done:
     return ds_jni_scope_end(&scope) && found;
 }
 
+static void set_keep_screen_on(DeadSpeak *state, bool keep_on) {
+    if (!state || !state->app || !state->app->activity) return;
+    ANativeActivity *activity = state->app->activity;
+    if (keep_on) {
+        ANativeActivity_setWindowFlags(activity, AWINDOW_FLAG_KEEP_SCREEN_ON, 0);
+    } else {
+        ANativeActivity_setWindowFlags(activity, 0, AWINDOW_FLAG_KEEP_SCREEN_ON);
+    }
+
+    DSJniScope scope;
+    if (ds_jni_scope_begin(&scope, activity)) {
+        JNIEnv *env = scope.env;
+        jobject activity_obj = activity->clazz;
+        jclass activity_class = (*env)->GetObjectClass(env, activity_obj);
+        if (activity_class) {
+            jmethodID get_window = (*env)->GetMethodID(env, activity_class, "getWindow", "()Landroid/view/Window;");
+            if (get_window) {
+                jobject window = (*env)->CallObjectMethod(env, activity_obj, get_window);
+                if (window && !(*env)->ExceptionCheck(env)) {
+                    jclass window_class = (*env)->GetObjectClass(env, window);
+                    if (window_class) {
+                        constexpr jint FLAG_KEEP_SCREEN_ON = 128;
+                        const char *method_name = keep_on ? "addFlags" : "clearFlags";
+                        jmethodID flag_method = (*env)->GetMethodID(env, window_class, method_name, "(I)V");
+                        if (flag_method) {
+                            (*env)->CallVoidMethod(env, window, flag_method, FLAG_KEEP_SCREEN_ON);
+                            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+                        }
+                    }
+                }
+            }
+        }
+        ds_jni_scope_end(&scope);
+    }
+}
+
 static bool update_display_geometry(DeadSpeak *state) {
     if (state->display == EGL_NO_DISPLAY || state->surface == EGL_NO_SURFACE) return false;
     EGLint width = 0, height = 0;
@@ -1170,6 +1207,7 @@ static bool setup_display(DeadSpeak *state) {
     if (eglMakeCurrent(state->display, state->surface, state->surface, state->context) == EGL_FALSE) return false;
 
     if (!update_display_geometry(state)) return false;
+    set_keep_screen_on(state, true);
     GLuint vertex = compile_shader(GL_VERTEX_SHADER, vertex_shader_source);
     GLuint fragment = compile_shader(GL_FRAGMENT_SHADER, fragment_shader_source);
     state->program = glCreateProgram();
@@ -2433,15 +2471,23 @@ navigation:
 
 static void handle_cmd(struct android_app *app, int32_t cmd) {
     DeadSpeak *state = (DeadSpeak *)app->userData;
-    if (cmd == APP_CMD_INIT_WINDOW && app->window != NULL) setup_display(state);
-    else if (cmd == APP_CMD_TERM_WINDOW) teardown_display(state);
+    if (cmd == APP_CMD_INIT_WINDOW && app->window != NULL) {
+        setup_display(state);
+        set_keep_screen_on(state, true);
+    }
+    else if (cmd == APP_CMD_TERM_WINDOW) {
+        set_keep_screen_on(state, false);
+        teardown_display(state);
+    }
     else if (cmd == APP_CMD_CONFIG_CHANGED || cmd == APP_CMD_WINDOW_RESIZED || cmd == APP_CMD_CONTENT_RECT_CHANGED)
         update_display_geometry(state);
     else if (cmd == APP_CMD_RESUME) {
+        set_keep_screen_on(state, true);
         state->sensors_resumed = true;
         start_sensors(state);
     }
     else if (cmd == APP_CMD_PAUSE) {
+        set_keep_screen_on(state, false);
         state->sensors_resumed = false;
         stop_sensors(state, DS_SENSOR_PAUSED);
         state->capture_requested = false;
@@ -2449,6 +2495,12 @@ static void handle_cmd(struct android_app *app, int32_t cmd) {
         stop_audio_capture(state);
         ds_video_preview_stop(&state->video);
         state->preview_received_ms = 0;
+    }
+    else if (cmd == APP_CMD_GAINED_FOCUS) {
+        set_keep_screen_on(state, true);
+    }
+    else if (cmd == APP_CMD_LOST_FOCUS) {
+        set_keep_screen_on(state, false);
     }
 }
 
@@ -3119,6 +3171,7 @@ void android_main(struct android_app *app) {
     DeadSpeak *state = calloc(1, sizeof(DeadSpeak));
     if (!state) return;
     state->app = app;
+    set_keep_screen_on(state, true);
     state->display = EGL_NO_DISPLAY;
     state->surface = EGL_NO_SURFACE;
     state->context = EGL_NO_CONTEXT;
