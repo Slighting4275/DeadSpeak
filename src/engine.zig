@@ -1,3 +1,5 @@
+pub fn panic(msg: []const u8, error_return_trace: ?*anyopaque, return_address: ?usize) noreturn { _ = msg; _ = error_return_trace; _ = return_address; while (true) {} }
+
 fn magnitude(value: f32) f32 {
     return if (value < 0.0) -value else value;
 }
@@ -62,10 +64,11 @@ fn read_u32(bytes: [*]const u8, offset: usize) u32 {
         (@as(u32, bytes[offset + 3]) << 24);
 }
 
-export fn ds_engine_vector_word(bx: f32, by: f32, bz: f32,
-                                base_x: f32, base_y: f32, base_z: f32,
-                                dictionary: ?[*]const u8, dictionary_size: usize,
-                                out: [*]u8, capacity: usize) usize {
+export fn ds_engine_vector_word_entropy(bx: f32, by: f32, bz: f32,
+                                        base_x: f32, base_y: f32, base_z: f32,
+                                        kinetic_seed: u64,
+                                        dictionary: ?[*]const u8, dictionary_size: usize,
+                                        out: [*]u8, capacity: usize) usize {
     if (capacity == 0) return 0;
     out[0] = 0;
     const bytes = dictionary orelse return 0;
@@ -102,12 +105,19 @@ export fn ds_engine_vector_word(bx: f32, by: f32, bz: f32,
     // 0.1 uT magnitude resolution
     const mag_bin: u64 = @intFromFloat(@min(@max(0.0, delta_mag * 10.0), 100000.0));
 
-    // Deterministic 64-bit spatial FNV-1a hash across the 3D spherical coordinates
+    // Sub-microtesla fractional fluctuation entropy extraction technique
+    const frac_delta = delta_mag - @floor(delta_mag);
+    const frac_bin: u64 = @intFromFloat(@min(@max(0.0, frac_delta * 100000.0), 99999.0));
+
+    // Deterministic 64-bit spatial FNV-1a hash across the 3D spherical coordinates,
+    // fractional micro-fluctuations, and kinetic motion permutation seed
     var h: u64 = 0xcbf29ce484222325;
     const prime: u64 = 0x100000001b3;
     h = (h ^ az_bin) *% prime;
     h = (h ^ el_bin) *% prime;
     h = (h ^ mag_bin) *% prime;
+    h = (h ^ frac_bin) *% prime;
+    h = (h ^ kinetic_seed) *% prime;
 
     const index: usize = @intCast(h % @as(u64, word_count));
     var offset: usize = 12;
@@ -127,8 +137,15 @@ export fn ds_engine_vector_word(bx: f32, by: f32, bz: f32,
     return 0;
 }
 
+export fn ds_engine_vector_word(bx: f32, by: f32, bz: f32,
+                                base_x: f32, base_y: f32, base_z: f32,
+                                dictionary: ?[*]const u8, dictionary_size: usize,
+                                out: [*]u8, capacity: usize) usize {
+    return ds_engine_vector_word_entropy(bx, by, bz, base_x, base_y, base_z, 0, dictionary, dictionary_size, out, capacity);
+}
+
 export fn ds_engine_next_word(magnetic_field: f32, sample: u32, dictionary: ?[*]const u8,
                               dictionary_size: usize, out: [*]u8, capacity: usize) usize {
     _ = sample;
-    return ds_engine_vector_word(magnetic_field, 0.0, 0.0, 0.0, 0.0, 0.0, dictionary, dictionary_size, out, capacity);
+    return ds_engine_vector_word_entropy(magnetic_field, 0.0, 0.0, 0.0, 0.0, 0.0, 0, dictionary, dictionary_size, out, capacity);
 }

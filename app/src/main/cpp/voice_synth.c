@@ -254,10 +254,18 @@ size_t ds_voice_synthesize(const char *text, const DSVoiceConfig *config,
     if (config && !config->enabled) return 0;
 
     const DSVoiceMode mode = config ? config->mode : DS_VOICE_MODE_CLASSIC;
-    const float base_pitch = (config && config->pitch_hz >= 60.0f && config->pitch_hz <= 300.0f)
+    float base_pitch = (config && config->pitch_hz >= 60.0f && config->pitch_hz <= 300.0f)
                              ? config->pitch_hz : 115.0f;
-    const float speed_mult = (config && config->speed >= 0.5f && config->speed <= 2.5f)
+    float speed_mult = (config && config->speed >= 0.5f && config->speed <= 2.5f)
                              ? config->speed : 1.0f;
+
+    /* Dynamic Voice Mode: per-word stochastic perturbation of playback speed [0.80, 1.10] and pitch [0.50, 1.30] */
+    if (mode == DS_VOICE_MODE_DYNAMIC) {
+        const float rnd_speed = ((float)(rand() % 1000) / 1000.0f) * 0.30f + 0.80f;
+        const float rnd_pitch = ((float)(rand() % 1000) / 1000.0f) * 0.80f + 0.50f;
+        speed_mult *= rnd_speed;
+        base_pitch *= rnd_pitch;
+    }
 
     size_t out_index = 0;
     float phase = 0.0f;
@@ -288,13 +296,17 @@ size_t ds_voice_synthesize(const char *text, const DSVoiceConfig *config,
             continue;
         }
 
-        /* Adjust phoneme parameters for Whisper / Spirit Box */
+        /* Adjust phoneme parameters for Whisper / Spirit Box / Dynamic */
         if (mode == DS_VOICE_MODE_WHISPER) {
             phoneme.voiced = false;
             phoneme.noise_mix = 1.0f;
             phoneme.gain1 *= 0.5f;
             phoneme.gain2 *= 1.2f;
             phoneme.gain3 *= 1.4f;
+        } else if (mode == DS_VOICE_MODE_DYNAMIC) {
+            phoneme.gain2 *= 1.15f;
+            phoneme.gain3 *= 1.25f;
+            phoneme.noise_mix = fmaxf(phoneme.noise_mix, 0.08f);
         }
 
         DSResonator r1, r2, r3;
@@ -303,7 +315,6 @@ size_t ds_voice_synthesize(const char *text, const DSVoiceConfig *config,
         resonator_init(&r3, phoneme.f3, phoneme.bw3, sample_rate);
 
         const size_t num_samples = (size_t)(phoneme.duration_sec / speed_mult * sample_rate);
-        const float pitch_step = 2.0f * (float)M_PI * base_pitch / sample_rate;
 
         for (size_t s = 0; s < num_samples && out_index < max_samples; ++s) {
             const float progress = (float)s / (float)num_samples;
@@ -312,6 +323,14 @@ size_t ds_voice_synthesize(const char *text, const DSVoiceConfig *config,
             float env = 1.0f;
             if (progress < 0.15f) env = progress / 0.15f;
             else if (progress > 0.85f) env = (1.0f - progress) / 0.15f;
+
+            /* Dynamic microtonal vibrato */
+            float eff_pitch = base_pitch;
+            if (mode == DS_VOICE_MODE_DYNAMIC) {
+                const float vibrato = sinf(2.0f * (float)M_PI * 5.2f * (float)s / sample_rate);
+                eff_pitch = base_pitch * (1.0f + 0.035f * vibrato);
+            }
+            const float pitch_step = 2.0f * (float)M_PI * eff_pitch / sample_rate;
 
             /* Excitation signal */
             float excitation = 0.0f;
@@ -355,7 +374,8 @@ size_t ds_voice_synthesize(const char *text, const DSVoiceConfig *config,
 
     /* Atmospheric spatial reverberation */
     const float wet = (mode == DS_VOICE_MODE_SPIRIT_BOX) ? 0.48f :
-                      (mode == DS_VOICE_MODE_WHISPER) ? 0.35f : 0.22f;
+                      (mode == DS_VOICE_MODE_WHISPER) ? 0.35f :
+                      (mode == DS_VOICE_MODE_DYNAMIC) ? 0.32f : 0.22f;
     ds_voice_synth_reverb(pcm_out, out_index, wet);
 
     return out_index;

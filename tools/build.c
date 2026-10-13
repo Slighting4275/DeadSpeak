@@ -22,7 +22,7 @@
 #include <unistd.h>
 
 /* Native-only orchestrator. Tools are executed directly, never via a shell. */
-static void fail(const char *format, ...) {
+[[noreturn]] static void fail(const char *format, ...) {
     va_list args;
     va_start(args, format);
     fputs("DeadSpeak build: ", stderr);

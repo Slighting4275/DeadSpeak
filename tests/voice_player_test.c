@@ -15,24 +15,28 @@ static void write_test_wav(const char *path, uint32_t sample_rate, uint32_t num_
     const uint32_t riff_size = data_bytes + 36U;
     const uint16_t format = 1, channels = 1, bits = 16, block_align = 2;
     const uint32_t byte_rate = sample_rate * 2U, fmt_size = 16;
-    assert(fwrite("RIFF", 1, 4, f) == 4);
-    assert(fwrite(&riff_size, 4, 1, f) == 1);
-    assert(fwrite("WAVE", 1, 4, f) == 4);
-    assert(fwrite("fmt ", 1, 4, f) == 4);
-    assert(fwrite(&fmt_size, 4, 1, f) == 1);
-    assert(fwrite(&format, 2, 1, f) == 1);
-    assert(fwrite(&channels, 2, 1, f) == 1);
-    assert(fwrite(&sample_rate, 4, 1, f) == 1);
-    assert(fwrite(&byte_rate, 4, 1, f) == 1);
-    assert(fwrite(&block_align, 2, 1, f) == 1);
-    assert(fwrite(&bits, 2, 1, f) == 1);
-    assert(fwrite("data", 1, 4, f) == 4);
-    assert(fwrite(&data_bytes, 4, 1, f) == 1);
+    size_t w = 0;
+    w += fwrite("RIFF", 1, 4, f);
+    w += fwrite(&riff_size, 4, 1, f) * 4;
+    w += fwrite("WAVE", 1, 4, f);
+    w += fwrite("fmt ", 1, 4, f);
+    w += fwrite(&fmt_size, 4, 1, f) * 4;
+    w += fwrite(&format, 2, 1, f) * 2;
+    w += fwrite(&channels, 2, 1, f) * 2;
+    w += fwrite(&sample_rate, 4, 1, f) * 4;
+    w += fwrite(&byte_rate, 4, 1, f) * 4;
+    w += fwrite(&block_align, 2, 1, f) * 2;
+    w += fwrite(&bits, 2, 1, f) * 2;
+    w += fwrite("data", 1, 4, f);
+    w += fwrite(&data_bytes, 4, 1, f) * 4;
+    assert(w == 44);
     for (uint32_t i = 0; i < num_samples; ++i) {
         int16_t sample = (int16_t)(8000.0 * sin(6.2831853 * 440.0 * (double)i / (double)sample_rate));
-        assert(fwrite(&sample, sizeof(int16_t), 1, f) == 1);
+        size_t sw = fwrite(&sample, sizeof(int16_t), 1, f);
+        assert(sw == 1);
     }
-    assert(fclose(f) == 0);
+    int rc = fclose(f);
+    assert(rc == 0);
 }
 
 int main(void) {
@@ -70,6 +74,9 @@ int main(void) {
     assert(ds_voice_player_is_playing_wav(p, name, sizeof(name), &progress));
     assert(strstr(name, "test_48k.wav") != NULL);
     assert(progress >= 0.0f && progress <= 1.0f);
+    assert(ds_voice_player_get_wav_duration_ms(p) >= 90); /* ~100ms */
+    ds_voice_player_seek_wav_ms(p, 50);
+    assert(ds_voice_player_get_wav_position_ms(p) >= 40);
 
     ds_voice_player_stop_wav(p);
     assert(!ds_voice_player_is_playing_wav(p, NULL, 0, NULL));

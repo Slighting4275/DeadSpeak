@@ -103,6 +103,19 @@ int main(void) {
     /* Legacy wrapper test */
     assert(ds_engine_next_word(60, 999, dictionary, sizeof(dictionary), word3, sizeof(word3)) > 0);
 
+    /* 8. Kinetic entropy seeding & fractional whisper modulation tests */
+    assert(ds_baseline_cooldown_ns(DS_SENSITIVITY_HIGH) == INT64_C(1500000000));
+    assert(ds_baseline_cooldown_ns(DS_SENSITIVITY_MEDIUM) == INT64_C(2500000000));
+    assert(ds_baseline_cooldown_ns(DS_SENSITIVITY_LOW) == INT64_C(4000000000));
+
+    char word_k1[32], word_k2[32];
+    size_t len_k1 = ds_engine_vector_word_entropy(15.2f, -8.3f, 4.1f, 0, 0, 0, UINT64_C(123456789),
+                                                  dictionary, sizeof(dictionary), word_k1, sizeof(word_k1));
+    size_t len_k2 = ds_engine_vector_word_entropy(15.2f, -8.3f, 4.1f, 0, 0, 0, UINT64_C(123456789),
+                                                  dictionary, sizeof(dictionary), word_k2, sizeof(word_k2));
+    assert(len_k1 > 0 && len_k1 == len_k2);
+    assert(strcmp(word_k1, word_k2) == 0);
+
     puts("PASS: measured calibration, deviation-only word triggers, debounce, real spectrum bins and invalid-field guards");
     return 0;
 }

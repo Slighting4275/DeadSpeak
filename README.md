@@ -6,9 +6,10 @@ DeadSpeak is a native Android fieldwork and evidence-recording app for paranorma
 
 - Native C23 Android UI using OpenGL ES 2, built with Zig's `zig cc` frontend with zero Java/Kotlin/JVM dependencies.
 - Adaptive portrait, landscape, and resizable-window layouts with shared drawing/touch geometry, scrollable evidence logs and field notes, and viewport-sized Explore pagination.
-- **Formant Voice Synthesizer & Audio Player**: Pure C23 formant resonator synthesizer outputting through low-latency native `AAudio`. Features three acoustic voicing profiles:
+- **Formant Voice Synthesizer & Audio Player**: Pure C23 formant resonator synthesizer outputting through low-latency native `AAudio`. Features four acoustic voicing profiles:
   - `CLASSIC`: Resonant vocal tract glottal impulse filtering.
   - `WHISPER`: Unvoiced spectral noise shaped through resonant oral cavities.
+  - `DYNAMIC`: Reactive acoustic modulation dynamically shifting pitch and playback rate according to real-time magnetic anomaly intensity ($|\Delta\mu\text{T}|$).
   - `SPIRIT BOX`: Swept formant modulation combined with burst radio static.
 - **3D Adaptive Baseline & Environmental Drift Tracking**: Continuously monitors ambient geomagnetic flux across all 3 spatial axes ($B_x, B_y, B_z$) using an exponential moving average (EWMA, $\alpha = 0.015, \tau \approx 7\,\text{s}$). Naturally absorbs slow room drift, building settling, and temperature fluctuations without requiring constant manual calibration.
 - **Event-Driven Transient Anomaly Trigger**: Completely silent in calm ambient environments (no random or periodic timer-based word spitting). Anomalies require a sustained transient flux deviation ($\ge 200\,\text{ms}$) exceeding the threshold. Fires exactly once at the peak of the anomaly, then disarms until the field returns below reset threshold ($0.5\times\text{Threshold}$) and a $2.5\,\text{s}$ cooldown window elapses, preventing repetitive loops near stationary metal or electrical fixtures.
@@ -30,12 +31,35 @@ DeadSpeak is a native Android fieldwork and evidence-recording app for paranorma
 - **Viewfinder Gestures & Minimal HUD**:
   - Horizontal swipe across camera viewfinder to cycle through all 6 video shader filters.
   - Single tap on camera viewport toggles Minimal HUD mode to maximize viewfinder area.
-- **Dual-Tier Audio & Signal Visualizer**:
-  - Real-time 24-band Goertzel FFT spectrum analyzer bars.
-  - Live phosphor-green rolling microphone oscilloscope waveform trace.
-  - Graduated EMF meter with $500\,\text{ms}$ peak-hold dropoff and real-time polarity deflection (`[+PULL]` vs `[-PUSH]`).
-- **In-App Evidence Log WAV Audio Player**: Tap any recorded `.wav` file in the Log tab to play it back directly with real-time scrub bar and stop controls.
-- **Synchronized `.srt` Telemetry Subtitles**: Generates companion `.srt` subtitle files alongside audio recordings (`EVP_*.srt`) with 1-second timestamped telemetry cue points tracking $\mu\text{T}$, baseline delta, IMU stability, and triggered words.
+- **HUD Theme Modes & 7-Color Gradient Tint**:
+  - `#ORIGINAL`: Classic 12-segment stacked hardware LED equalizer blocks with authentic tri-zone hardware color grading (Rows 0..7 Mint Green, Rows 8..9 Amber Warning, Rows 10..11 Red Peak) and live rolling phosphor-green oscilloscope trace.
+  - `ABDUCTION`: Neon bio-luminescent alien curved waveform visualizer.
+  - `AI`: 16-node digital matrix waveform visualizer.
+  - `TINT`: Piecewise linear 7-color gradient hue interpolation (`ds_interpolate_hud_accent`) across White, Red, Yellow, Green, Cyan, Blue, and Magenta stops for universal HUD tinting.
+- **Sub-Bass EVP Anomaly Evaluator (80–300 Hz)**:
+  - 6-bin Goertzel FFT filter bank monitoring sub-bass acoustic power (80, 120, 160, 200, 250, 300 Hz) against running acoustic baselines.
+  - Latches a 2000 ms `[SUB-BASS EVP BURST 80-300Hz]` alert banner and automatically emits Tag 2 into the session companion tags file.
+- **Hardware Proximity Radar**:
+  - Concentric radar ripple pulse animations during proximity triggers (`< 4.0 cm`).
+  - Strict hardware sensor validation rejecting virtual, software, and vendor-emulated gesture devices.
+- **Dual-Tier DictionaryView Word Announcer & 10-Second Hold**:
+  - High-visibility primary detected word card with secondary real-time telemetry subtitle ($\mu\text{T}$, baseline delta, coordinates, and whisper indicator).
+  - 10-second hold display window with graceful automatic reversion to "LISTENING..." and 3-second pulsing cyan anomaly border during active spikes.
+- **Companion File Triad & Interactive Scrubbable Tag Timeline**:
+  - During recording, automatically generates 3 synchronized companion files alongside media:
+    - `<recording>.txt`: Chronological list of words triggered during the session.
+    - `<recording>_tags.txt`: Anomaly event CSV (`<timestamp_ms>,<tag_id>`) with Tag 1 (Word trigger, Green), Tag 2 (Anomaly alert: EMF spike, Sub-bass EVP burst, Proximity trigger, Orange), and Tag 3 (Manual bookmark via `[+TAG]` HUD button, Purple).
+    - `<recording>_waveform.txt`: RMS audio amplitude telemetry sampled every 250 ms.
+    - `<recording>.srt`: 1-second timestamped subtitle telemetry cue points tracking $\mu\text{T}$, baseline delta, IMU stability, and triggered words.
+  - In-app Log gallery displays companion status badges (`[TXT] [TAGS] [WAVE] [SRT]`) and atomic delete (`[DEL]`) unlinking the primary recording and all 4 companion files synchronously.
+  - Interactive scrubbable player with real-time waveform progress bar, tag marker dots along the timeline, `[<< TAG]` / `[TAG >>]` instantaneous tag seeking with 1000 ms debounce, and active tag proximity identification.
+- **Dynamic Voice Modulation**:
+  - Dynamically modulates voice pitch multiplier $[0.50, 1.30]$ and speed $[0.80, 1.10]$ per triggered word, combined with microtonal vibrato and Schroeder comb-filter atmospheric reverb.
+- **HUD Live Controls & Bookmarking**:
+  - `+TAG` one-tap manual bookmarking button during active recording to tag anomalous investigation events.
+  - Transient toast status banners for export and bookmark confirmation.
+- **External Session Log Export**:
+  - One-tap `EXPORT LOGS` in the Log tab creating pipe-delimited session exports (`DeadSpeakWordHistory.txt`, `log.txt` circular 100-entry buffer, and `DeadSpeakSessionExport.txt`) in external `Movies/` storage.
 - **Custom Word Bank (`.dswb`)**: Local binary word bank manager supporting on-device phrase authoring via an on-screen keyboard, numbered list pagination, and atomic persistence.
 - **Bundled Word Bank**: Binary `words.bin` asset containing over 5,000 unique entries across English and 22 transliterated language groups.
 - Real magnetometer, accelerometer, and gyroscope readings. Sensor registration errors and absent, blocked, waiting, paused, invalid, and stale readings are reported distinctly; missing data never produces a substitute reading. Sensors stop on pause and re-enable on resume.
@@ -49,7 +73,7 @@ Audio and video are saved as separate files. Explore operates entirely locally o
 
 DeadSpeak and its build contain no Java/Kotlin code, bytecode, DEX, JARs, or JVM-based tools. Application logic is C23 and Zig; binary assets contain data, not disguised bytecode. Android's operating-system framework remains a platform dependency: C uses JNI for system permissions, window APIs, and platform network/JSON services. No app-defined Java classes are compiled or packaged. The manifest explicitly sets `android:hasCode="false"`.
 
-- Linux build host with Zig, CMake, Ninja, pkg-config, libarchive, libxml2, and OpenSSL 3 development headers.
+- Linux build host with Zig, CMake 3.25+, Ninja, pkg-config, libarchive, libxml2, and OpenSSL 3 development headers.
 - Installed Android NDK 30.0.16248370, SDK platform 37.2 (including its raw `data/res` directory), and native build tools 37.0.0. Versions are pinned in `tools/build_config.h`.
 - The latest installed Zig and its matching standard library. All project C tools and Android C sources are compiled through `zig cc`; the signal engine stays Zig. Native NDK tools link against Android system libraries. There is no alternate compiler or signal-engine fallback.
 - Android 11 or newer, with camera/microphone for recording; magnetometer optional.
@@ -90,7 +114,7 @@ sh tools/build.sh
 sh tools/build.sh --abi arm64-v8a
 ```
 
-The output is `build/deadspeak-debug.apk`. The native C signer implements Android's [APK Signature Scheme v2](https://source.android.com/docs/security/features/apksigning/v2) using OpenSSL, with no v1 fallback. The build verifies the signature, checks 16 KiB native-library alignment, and rejects packaged Java/DEX/JAR files or disguised bytecode. It is a debug build, not a release publishing pipeline. Native C compilation rejects deprecated declarations.
+The output is `build/deadspeak-debug.apk`. The native C signer implements Android's [APK Signature Scheme v2](https://source.android.com/docs/security/features/apksigning/v2) using OpenSSL, with no v1 fallback. The build verifies the signature, checks 16 KiB native-library alignment, and rejects packaged Java/DEX/JAR files or disguised bytecode. All native libraries and host tools are hardened with stack canaries (`-fstack-protector-strong`), position-independent execution (`-fPIE -pie`), Full RELRO (`-Wl,-z,relro -Wl,-z,now`), non-executable stacks (`NX`), and strict bounded string copies. Native C compilation rejects deprecated declarations.
 
 Run native signing regressions (no phone or JVM needed):
 
@@ -117,6 +141,15 @@ sh tools/test-native.sh
 These exercise on-device native integration across two test suites:
 - `explore_test`: JNI thread ownership and local-reference cleanup, complete index replacement (including updated and removed pages), concurrent readers, cache persistence, responsive geometry across 900 window sizes, pagination at every supported page size, and all sixteen sensor/display orientation combinations.
 - `voice_player_test`: Native `AAudio` stream lifecycle, dynamic Geiger click rate scaling, synthesized speech audio queueing, recorded 48 kHz WAV playback downsampling, and immediate pause/stop cancellation.
+
+## Security audit and code quality
+
+The DeadSpeak codebase is continuously verified using local security and analysis tools:
+
+- **Binary Hardening (`checksec`)**: Verified Full RELRO, Stack Canary protection (`-fstack-protector-strong`), non-executable stack (`NX`), Position-Independent Executables (`PIE`), and W^X memory segment protection across `libdeadspeak.so` and all host binaries.
+- **Static Analysis**: Verified clean with `cppcheck --enable=all --inconclusive`, `flawfinder`, `semgrep`, and `clang-tidy` under standard C23.
+- **Dynamic Memory Analysis & Sanitizers**: Zero memory leaks and zero invalid reads/writes validated under `valgrind` memcheck; host test suites verified clean with AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) (`-fsanitize=address,undefined`).
+- **Shell Script Validation**: All build orchestrators and test harnesses pass `shellcheck` with zero warnings.
 
 ## Install
 

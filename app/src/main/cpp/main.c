@@ -37,18 +37,90 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 #define LOOPER_ID_SENSOR 3
 #define DS_LOG_CAPACITY 32
+#define DS_MEDIA_CAPACITY 16
 #define DS_AUDIO_RATE 48000
 #define DS_EXPLORE_ROW_HEIGHT 62.0f
 #define DS_EXPLORE_ROW_SOURCE 27.0f
-#define DS_SENSOR_COUNT 3
+#define DS_SENSOR_COUNT 4
 #define DS_SPECTRUM_BINS 24
 #define DS_PREVIEW_CAPACITY ((size_t)640 * 480 * 4)
 static const int sensor_types[DS_SENSOR_COUNT] = {
-    ASENSOR_TYPE_MAGNETIC_FIELD, ASENSOR_TYPE_ACCELEROMETER, ASENSOR_TYPE_GYROSCOPE
+    ASENSOR_TYPE_MAGNETIC_FIELD, ASENSOR_TYPE_ACCELEROMETER, ASENSOR_TYPE_GYROSCOPE, ASENSOR_TYPE_PROXIMITY
 };
-static const char *const sensor_names[DS_SENSOR_COUNT] = {"MAGNETIC", "ACCEL", "GYRO"};
+static const int sensor_fallback_types[DS_SENSOR_COUNT] = {
+    ASENSOR_TYPE_MAGNETIC_FIELD_UNCALIBRATED,
+    ASENSOR_TYPE_ACCELEROMETER_UNCALIBRATED,
+    ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED,
+    ASENSOR_TYPE_PROXIMITY
+};
+static const char *const sensor_names[DS_SENSOR_COUNT] = {"MAGNETIC", "ACCEL", "GYRO", "PROXIMITY"};
 
 #define DS_OSCILLOSCOPE_SAMPLES 64
+#define DS_MAX_LOADED_TAGS 256
+
+typedef struct {
+    uint64_t timestamp_ms;
+    uint8_t tag_id;
+} DSTagEntry;
+
+typedef struct {
+    float r, g, b;
+} DSColorStop;
+
+/* 7-stop ColorSlider interpolator */
+static const DSColorStop ds_color_stops[7] = {
+    {1.0f, 1.0f, 1.0f}, /* Stop 0: White */
+    {1.0f, 0.0f, 0.0f}, /* Stop 1: Red */
+    {1.0f, 1.0f, 0.0f}, /* Stop 2: Yellow */
+    {0.0f, 1.0f, 0.0f}, /* Stop 3: Green */
+    {0.0f, 1.0f, 1.0f}, /* Stop 4: Cyan */
+    {0.0f, 0.0f, 1.0f}, /* Stop 5: Blue */
+    {1.0f, 0.0f, 1.0f}  /* Stop 6: Magenta */
+};
+
+static void ds_interpolate_hud_accent(float progress, float *out_r, float *out_g, float *out_b) {
+    if (progress <= 0.0f) {
+        *out_r = ds_color_stops[0].r; *out_g = ds_color_stops[0].g; *out_b = ds_color_stops[0].b;
+        return;
+    }
+    if (progress >= 1.0f) {
+        *out_r = ds_color_stops[6].r; *out_g = ds_color_stops[6].g; *out_b = ds_color_stops[6].b;
+        return;
+    }
+    const float scaled = progress * 6.0f;
+    const int idx = (int)scaled;
+    const float f = scaled - (float)idx;
+    const int next_idx = idx < 6 ? idx + 1 : 6;
+    *out_r = ds_color_stops[idx].r + (ds_color_stops[next_idx].r - ds_color_stops[idx].r) * f;
+    *out_g = ds_color_stops[idx].g + (ds_color_stops[next_idx].g - ds_color_stops[idx].g) * f;
+    *out_b = ds_color_stops[idx].b + (ds_color_stops[next_idx].b - ds_color_stops[idx].b) * f;
+}
+
+/* 80-300 Hz sub-bass EVP FFT power evaluator */
+static float calculate_sub_bass_energy(const int16_t *samples, size_t count, uint32_t sample_rate) {
+    if (!samples || count == 0 || sample_rate == 0) return 0.0f;
+    static const float sub_bass_freqs[] = {80.0f, 120.0f, 160.0f, 200.0f, 250.0f, 300.0f};
+    const size_t num_freqs = sizeof(sub_bass_freqs) / sizeof(sub_bass_freqs[0]);
+    float total_amp = 0.0f;
+    for (size_t f = 0; f < num_freqs; ++f) {
+        const float target = sub_bass_freqs[f];
+        if (target >= (float)sample_rate * 0.5f) continue;
+        const float omega = 2.0f * 3.141592653589793f * target / (float)sample_rate;
+        const float coeff = 2.0f * cosf(omega);
+        float s_prev = 0.0f, s_prev2 = 0.0f;
+        for (size_t i = 0; i < count; ++i) {
+            const float sample = (float)samples[i] / 32768.0f;
+            const float s = sample + coeff * s_prev - s_prev2;
+            s_prev2 = s_prev;
+            s_prev = s;
+        }
+        const float power = s_prev * s_prev + s_prev2 * s_prev2 - coeff * s_prev * s_prev2;
+        if (power > 0.0f) {
+            total_amp += sqrtf(power) / (float)count;
+        }
+    }
+    return (total_amp / (float)num_freqs) * 1000.0f;
+}
 
 typedef struct {
     struct android_app *app;
@@ -95,6 +167,8 @@ typedef struct {
     uint32_t sample_count;
     char word[32];
     bool scanning;
+    bool proximity_active;
+    float proximity_distance;
     bool capture_requested;
     bool permission_requested;
     uint64_t permission_deadline;
@@ -119,11 +193,29 @@ typedef struct {
     bool explore_search_active;
     char evidence_dir[512];
     char word_log_path[512];
+    char active_words_path[512];
+    char active_tags_path[512];
+    char active_waveform_path[512];
+    uint64_t recording_start_ms;
+    uint64_t last_anomaly_tag_ms;
+    _Atomic bool sub_bass_anomaly;
+    uint64_t sub_bass_anomaly_expiry_ms;
+    float sub_bass_level;
+    int theme_mode;
+    float hud_hue;
+    DSTagEntry loaded_tags[DS_MAX_LOADED_TAGS];
+    size_t loaded_tags_count;
+    char loaded_tags_filename[96];
+    char export_status_message[128];
+    uint64_t export_status_expiry_ms;
     char words[DS_LOG_CAPACITY][32];
     unsigned word_samples[DS_LOG_CAPACITY];
     float word_fields[DS_LOG_CAPACITY];
-    char media_files[8][96];
-    time_t media_mtimes[8];
+    float word_deltas[DS_LOG_CAPACITY];
+    uint64_t word_times[DS_LOG_CAPACITY];
+    bool word_whispers[DS_LOG_CAPACITY];
+    char media_files[DS_MEDIA_CAPACITY][96];
+    time_t media_mtimes[DS_MEDIA_CAPACITY];
     unsigned media_count;
     uint64_t next_media_refresh;
     uint8_t *dictionary;
@@ -149,19 +241,214 @@ static int64_t sensor_now_ns(void) {
     return (int64_t)ts.tv_sec * INT64_C(1000000000) + ts.tv_nsec;
 }
 
+/* Companion tag emitter (tag triad: 1=Word, 2=Anomaly, 3=Bookmark) */
+static void emit_companion_tag(DeadSpeak *state, uint8_t tag_id) {
+    if (!state || !state->active_tags_path[0]) return;
+    const uint64_t now = now_millis();
+    /* Debounce anomaly events (tag_id == 2) by 1000ms */
+    if (tag_id == 2) {
+        if (state->last_anomaly_tag_ms && now < state->last_anomaly_tag_ms + 1000U) return;
+        state->last_anomaly_tag_ms = now;
+    }
+    const uint64_t rel_ms = now >= state->recording_start_ms ? (now - state->recording_start_ms) : 0U;
+    FILE *tf = fopen(state->active_tags_path, "a");
+    if (tf) {
+        fprintf(tf, "%llu,%u\n", (unsigned long long)rel_ms, (unsigned)tag_id);
+        fclose(tf);
+    }
+}
+
 static void append_word_log(DeadSpeak *state, const char *word) {
     if (!word || !word[0]) return;
     const unsigned slot = state->log_next;
     snprintf(state->words[slot], sizeof(state->words[slot]), "%s", word);
     state->word_samples[slot] = state->sample_count;
     state->word_fields[slot] = state->smoothed_field;
+    state->word_deltas[slot] = state->baseline.triggered_delta;
+    state->word_times[slot] = now_millis();
+    state->word_whispers[slot] = state->baseline.whisper_modulation;
     state->log_next = (slot + 1U) % DS_LOG_CAPACITY;
     if (state->log_count < DS_LOG_CAPACITY) ++state->log_count;
+
+    /* 1. Standard CSV log */
     FILE *file = fopen(state->word_log_path, "a");
     if (file) {
         fprintf(file, "%u,%.2f,%s\n", state->sample_count, state->smoothed_field, word);
         fclose(file);
     }
+
+    time_t now_sec = time(NULL);
+    struct tm lt;
+    localtime_r(&now_sec, &lt);
+    char date_buf[32], time_buf[32];
+    strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", &lt);
+    strftime(time_buf, sizeof(time_buf), "%H:%M:%S", &lt);
+
+    /* 2. 100-entry bounded circular log history (log.txt) */
+    char gt_log_path[640];
+    snprintf(gt_log_path, sizeof(gt_log_path), "%s/log.txt", state->evidence_dir);
+    char lines[101][128];
+    size_t line_count = 0;
+    FILE *rlog = fopen(gt_log_path, "r");
+    if (rlog) {
+        while (line_count < 100 && fgets(lines[line_count], sizeof(lines[line_count]), rlog)) {
+            size_t llen = strlen(lines[line_count]);
+            if (llen > 0 && lines[line_count][llen - 1] == '\n') lines[line_count][llen - 1] = '\0';
+            if (lines[line_count][0]) ++line_count;
+        }
+        fclose(rlog);
+    }
+    char new_entry[128];
+    snprintf(new_entry, sizeof(new_entry), "%s|%s|%s|%s", date_buf, time_buf, word, word);
+    if (line_count >= 100) {
+        for (size_t l = 0; l < 99; ++l) {
+            strncpy(lines[l], lines[l + 1], sizeof(lines[l]) - 1);
+            lines[l][sizeof(lines[l]) - 1] = '\0';
+        }
+        strncpy(lines[99], new_entry, sizeof(lines[99]) - 1);
+        lines[99][sizeof(lines[99]) - 1] = '\0';
+        line_count = 100;
+    } else {
+        strncpy(lines[line_count], new_entry, sizeof(lines[line_count]) - 1);
+        lines[line_count][sizeof(lines[line_count]) - 1] = '\0';
+        ++line_count;
+    }
+    FILE *wlog = fopen(gt_log_path, "w");
+    if (wlog) {
+        for (size_t l = 0; l < line_count; ++l) {
+            fprintf(wlog, "%s\n", lines[l]);
+        }
+        fclose(wlog);
+    }
+
+    /* 3. Session word history export */
+    char wh_path[640];
+    snprintf(wh_path, sizeof(wh_path), "%s/DeadSpeakWordHistory.txt", state->evidence_dir);
+    const bool wh_new = (access(wh_path, F_OK) != 0);
+    FILE *wh_file = fopen(wh_path, "a");
+    if (wh_file) {
+        if (wh_new) {
+            fprintf(wh_file, "DeadSpeak session word history export\n\nDate|Time|Generated word(s)|Translated\n");
+        }
+        fprintf(wh_file, "%s|%s|%s|%s\n", date_buf, time_buf, word, word);
+        fclose(wh_file);
+    }
+
+    /* 4. DeadSpeak Session Export */
+    char ds_path[640];
+    snprintf(ds_path, sizeof(ds_path), "%s/DeadSpeakSessionExport.txt", state->evidence_dir);
+    const bool ds_new = (access(ds_path, F_OK) != 0);
+    FILE *ds_file = fopen(ds_path, "a");
+    if (ds_file) {
+        if (ds_new) {
+            fprintf(ds_file, "DeadSpeak Anomaly Detection Session Export\n\nDate|Time|Word|Field_uT|Delta_uT|Vector|Mode\n");
+        }
+        fprintf(ds_file, "%s|%s|%s|%.1f|%+.1f|X:%.1f,Y:%.1f,Z:%.1f|%s\n",
+                date_buf, time_buf, word, state->smoothed_field, state->baseline.triggered_delta,
+                state->baseline.triggered_x, state->baseline.triggered_y, state->baseline.triggered_z,
+                state->baseline.whisper_modulation ? "WHISPER" : "CLASSIC");
+        fclose(ds_file);
+    }
+
+    /* 5. Active recording companion word list (<recording>.txt) */
+    if (state->active_words_path[0]) {
+        FILE *wf = fopen(state->active_words_path, "a");
+        if (wf) {
+            fprintf(wf, "%s\n", word);
+            fclose(wf);
+        }
+    }
+
+    /* 6. Active recording companion tags file (<recording>_tags.txt) - Tag 1 (Word) */
+    emit_companion_tag(state, 1);
+}
+
+static void copy_file_data(const char *src, const char *dst) {
+    if (!src || !dst || strcmp(src, dst) == 0) return;
+    FILE *in = fopen(src, "rb");
+    if (!in) return;
+    FILE *out = fopen(dst, "wb");
+    if (!out) { fclose(in); return; }
+    char buf[1024];
+    size_t n;
+    while (!feof(in) && (n = fread(buf, 1, sizeof(buf), in)) > 0) fwrite(buf, 1, n, out);
+    fflush(out);
+    fsync(fileno(out));
+    fclose(in);
+    fclose(out);
+}
+
+static void refresh_media_files(DeadSpeak *state);
+
+static void export_session_files(DeadSpeak *state) {
+    if (!state) return;
+    char ext_dir[512] = {0};
+    const char *target_dir = NULL;
+    if (state->app && state->app->activity && state->app->activity->externalDataPath) {
+        snprintf(ext_dir, sizeof(ext_dir), "%s/Movies", state->app->activity->externalDataPath);
+        mkdir(ext_dir, 0755);
+        target_dir = ext_dir;
+    } else {
+        target_dir = state->evidence_dir;
+    }
+
+    char wh_src[640], wh_dst[640];
+    snprintf(wh_src, sizeof(wh_src), "%s/DeadSpeakWordHistory.txt", state->evidence_dir);
+    snprintf(wh_dst, sizeof(wh_dst), "%s/DeadSpeakWordHistory.txt", target_dir);
+
+    char ds_src[640], ds_dst[640];
+    snprintf(ds_src, sizeof(ds_src), "%s/DeadSpeakSessionExport.txt", state->evidence_dir);
+    snprintf(ds_dst, sizeof(ds_dst), "%s/DeadSpeakSessionExport.txt", target_dir);
+
+    if (access(wh_src, F_OK) != 0 && state->log_count > 0) {
+        FILE *src_f = fopen(wh_src, "w");
+        if (src_f) {
+            fprintf(src_f, "DeadSpeak session word history export\n\nDate|Time|Generated word(s)|Translated\n");
+            time_t now_sec = time(NULL);
+            struct tm lt;
+            localtime_r(&now_sec, &lt);
+            char date_buf[32], time_buf[32];
+            strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", &lt);
+            strftime(time_buf, sizeof(time_buf), "%H:%M:%S", &lt);
+            for (unsigned i = 0; i < state->log_count; ++i) {
+                const unsigned slot = (state->log_next + DS_LOG_CAPACITY - state->log_count + i) % DS_LOG_CAPACITY;
+                if (state->words[slot][0]) {
+                    fprintf(src_f, "%s|%s|%s|%s\n", date_buf, time_buf, state->words[slot], state->words[slot]);
+                }
+            }
+            fclose(src_f);
+        }
+    }
+    if (access(ds_src, F_OK) != 0 && state->log_count > 0) {
+        FILE *ds_f = fopen(ds_src, "w");
+        if (ds_f) {
+            fprintf(ds_f, "DeadSpeak Anomaly Detection Session Export\n\nDate|Time|Word|Field_uT|Delta_uT|Mode\n");
+            time_t now_sec = time(NULL);
+            struct tm lt;
+            localtime_r(&now_sec, &lt);
+            char date_buf[32], time_buf[32];
+            strftime(date_buf, sizeof(date_buf), "%Y-%m-%d", &lt);
+            strftime(time_buf, sizeof(time_buf), "%H:%M:%S", &lt);
+            for (unsigned i = 0; i < state->log_count; ++i) {
+                const unsigned slot = (state->log_next + DS_LOG_CAPACITY - state->log_count + i) % DS_LOG_CAPACITY;
+                if (state->words[slot][0]) {
+                    fprintf(ds_f, "%s|%s|%s|%.1f|%+.1f|%s\n",
+                        date_buf, time_buf, state->words[slot],
+                        state->word_fields[slot], state->word_deltas[slot],
+                        state->word_whispers[slot] ? "WHISPER" : "CLASSIC");
+                }
+            }
+            fclose(ds_f);
+        }
+    }
+
+    if (strcmp(wh_src, wh_dst) != 0) copy_file_data(wh_src, wh_dst);
+    if (strcmp(ds_src, ds_dst) != 0) copy_file_data(ds_src, ds_dst);
+
+    snprintf(state->export_status_message, sizeof(state->export_status_message),
+        "EXPORTED SESSIONS TO %s", target_dir == ext_dir ? "MOVIES/" : "EVIDENCE/");
+    state->export_status_expiry_ms = now_millis() + 4000U;
+    refresh_media_files(state);
 }
 
 static void load_word_log(DeadSpeak *state) {
@@ -177,6 +464,9 @@ static void load_word_log(DeadSpeak *state) {
         snprintf(state->words[slot], sizeof(state->words[slot]), "%s", word);
         state->word_samples[slot] = sample;
         state->word_fields[slot] = field;
+        state->word_deltas[slot] = 0.0f;
+        state->word_times[slot] = now_millis();
+        state->word_whispers[slot] = false;
         state->log_next = (slot + 1U) % DS_LOG_CAPACITY;
         if (state->log_count < DS_LOG_CAPACITY) ++state->log_count;
     }
@@ -199,26 +489,50 @@ static void load_dictionary(DeadSpeak *state) {
     AAsset_close(asset);
 }
 
-static void refresh_media_files(DeadSpeak *state) {
-    DIR *directory = opendir(state->evidence_dir);
+static void scan_directory_for_media(DeadSpeak *state, const char *dir_path) {
+    if (!dir_path) return;
+    DIR *directory = opendir(dir_path);
     if (!directory) return;
-    state->media_count = 0;
     struct dirent *entry;
     while ((entry = readdir(directory)) != NULL) {
         const size_t name_length = strlen(entry->d_name);
-        const bool is_wav = name_length > 4 && strcmp(entry->d_name + name_length - 4, ".wav") == 0;
-        const bool is_mp4 = name_length > 4 && strcmp(entry->d_name + name_length - 4, ".mp4") == 0;
-        if (!is_wav && !is_mp4) continue;
+        if (name_length < 5) continue;
+        const bool is_wav = strcmp(entry->d_name + name_length - 4, ".wav") == 0;
+        const bool is_mp4 = strcmp(entry->d_name + name_length - 4, ".mp4") == 0;
+        const bool is_txt = strcmp(entry->d_name + name_length - 4, ".txt") == 0;
+        if (!is_wav && !is_mp4 && !is_txt) continue;
+
+        /* Companion file exclusion: do not show tags or waveform logs separately */
+        if (strstr(entry->d_name, "_tags.txt") || strstr(entry->d_name, "_waveform.txt")) continue;
+        if (is_txt) {
+            char base_prefix[640];
+            snprintf(base_prefix, sizeof(base_prefix), "%s/%.*s", dir_path, (int)(name_length - 4), entry->d_name);
+            char check_wav[648], check_mp4[648];
+            snprintf(check_wav, sizeof(check_wav), "%s.wav", base_prefix);
+            snprintf(check_mp4, sizeof(check_mp4), "%s.mp4", base_prefix);
+            if (access(check_wav, F_OK) == 0 || access(check_mp4, F_OK) == 0) continue;
+        }
+
         char path[640];
-        snprintf(path, sizeof(path), "%s/%s", state->evidence_dir, entry->d_name);
+        snprintf(path, sizeof(path), "%s/%s", dir_path, entry->d_name);
         struct stat file_status;
         if (stat(path, &file_status) != 0) continue;
+
+        bool already_present = false;
+        for (unsigned k = 0; k < state->media_count; ++k) {
+            if (strcmp(state->media_files[k], entry->d_name) == 0) {
+                already_present = true;
+                break;
+            }
+        }
+        if (already_present) continue;
+
         unsigned slot = state->media_count;
-        if (slot == 8U && file_status.st_mtime <= state->media_mtimes[7]) continue;
-        if (slot > 7U) slot = 7U;
+        if (slot == DS_MEDIA_CAPACITY && file_status.st_mtime <= state->media_mtimes[DS_MEDIA_CAPACITY - 1]) continue;
+        if (slot >= DS_MEDIA_CAPACITY) slot = DS_MEDIA_CAPACITY - 1;
         else ++state->media_count;
         while (slot > 0U && file_status.st_mtime > state->media_mtimes[slot - 1U]) {
-            if (slot < 8U) {
+            if (slot < DS_MEDIA_CAPACITY) {
                 memcpy(state->media_files[slot], state->media_files[slot - 1U], sizeof(state->media_files[slot]));
                 state->media_mtimes[slot] = state->media_mtimes[slot - 1U];
             }
@@ -228,6 +542,138 @@ static void refresh_media_files(DeadSpeak *state) {
         state->media_mtimes[slot] = file_status.st_mtime;
     }
     closedir(directory);
+}
+
+static void refresh_media_files(DeadSpeak *state) {
+    state->media_count = 0;
+    scan_directory_for_media(state, state->evidence_dir);
+    if (state->app && state->app->activity && state->app->activity->externalDataPath) {
+        char ext_dir[512];
+        snprintf(ext_dir, sizeof(ext_dir), "%s/Movies", state->app->activity->externalDataPath);
+        scan_directory_for_media(state, ext_dir);
+    }
+}
+
+static void delete_recording_and_companions(DeadSpeak *state, const char *filename) {
+    if (!state || !filename || !filename[0]) return;
+    char curr_playing[96] = {0};
+    float prog = 0.0f;
+    if (ds_voice_player_is_playing_wav(state->voice_player, curr_playing, sizeof(curr_playing), &prog) &&
+        strcmp(curr_playing, filename) == 0) {
+        ds_voice_player_stop_wav(state->voice_player);
+    }
+    char primary_path[640];
+    snprintf(primary_path, sizeof(primary_path), "%s/%s", state->evidence_dir, filename);
+    unlink(primary_path);
+
+    if (state->app && state->app->activity && state->app->activity->externalDataPath) {
+        char ext_path[640];
+        snprintf(ext_path, sizeof(ext_path), "%s/Movies/%s", state->app->activity->externalDataPath, filename);
+        unlink(ext_path);
+    }
+
+    const size_t len = strlen(filename);
+    if (len > 4 && (strcmp(filename + len - 4, ".wav") == 0 || strcmp(filename + len - 4, ".mp4") == 0 || strcmp(filename + len - 4, ".txt") == 0)) {
+        char stem[96];
+        snprintf(stem, sizeof(stem), "%.*s", (int)(len - 4), filename);
+
+        char c_path[640];
+        snprintf(c_path, sizeof(c_path), "%s/%s.txt", state->evidence_dir, stem);
+        unlink(c_path);
+        snprintf(c_path, sizeof(c_path), "%s/%s_tags.txt", state->evidence_dir, stem);
+        unlink(c_path);
+        snprintf(c_path, sizeof(c_path), "%s/%s_waveform.txt", state->evidence_dir, stem);
+        unlink(c_path);
+        snprintf(c_path, sizeof(c_path), "%s/%s.srt", state->evidence_dir, stem);
+        unlink(c_path);
+
+        if (state->app && state->app->activity && state->app->activity->externalDataPath) {
+            snprintf(c_path, sizeof(c_path), "%s/Movies/%s.txt", state->app->activity->externalDataPath, stem);
+            unlink(c_path);
+            snprintf(c_path, sizeof(c_path), "%s/Movies/%s_tags.txt", state->app->activity->externalDataPath, stem);
+            unlink(c_path);
+            snprintf(c_path, sizeof(c_path), "%s/Movies/%s_waveform.txt", state->app->activity->externalDataPath, stem);
+            unlink(c_path);
+            snprintf(c_path, sizeof(c_path), "%s/Movies/%s.srt", state->app->activity->externalDataPath, stem);
+            unlink(c_path);
+        }
+    }
+
+    if (strcmp(state->loaded_tags_filename, filename) == 0) {
+        state->loaded_tags_count = 0;
+        state->loaded_tags_filename[0] = '\0';
+    }
+    refresh_media_files(state);
+}
+
+static void load_recording_tags(DeadSpeak *state, const char *filename) {
+    if (!state || !filename || !filename[0]) return;
+    if (strcmp(state->loaded_tags_filename, filename) == 0) return;
+    state->loaded_tags_count = 0;
+    snprintf(state->loaded_tags_filename, sizeof(state->loaded_tags_filename), "%s", filename);
+
+    const size_t len = strlen(filename);
+    char tags_path[640];
+    if (len > 4 && (strcmp(filename + len - 4, ".wav") == 0 || strcmp(filename + len - 4, ".mp4") == 0)) {
+        snprintf(tags_path, sizeof(tags_path), "%s/%.*s_tags.txt", state->evidence_dir, (int)(len - 4), filename);
+    } else {
+        snprintf(tags_path, sizeof(tags_path), "%s/%s_tags.txt", state->evidence_dir, filename);
+    }
+
+    FILE *f = fopen(tags_path, "r");
+    if (!f && state->app && state->app->activity && state->app->activity->externalDataPath) {
+        if (len > 4 && (strcmp(filename + len - 4, ".wav") == 0 || strcmp(filename + len - 4, ".mp4") == 0)) {
+            snprintf(tags_path, sizeof(tags_path), "%s/Movies/%.*s_tags.txt", state->app->activity->externalDataPath, (int)(len - 4), filename);
+        }
+        f = fopen(tags_path, "r");
+    }
+    if (!f) return;
+
+    char line[128];
+    while (state->loaded_tags_count < DS_MAX_LOADED_TAGS && fgets(line, sizeof(line), f)) {
+        char *comma = strchr(line, ',');
+        if (comma) {
+            *comma = '\0';
+            const uint64_t ms = (uint64_t)strtoull(line, NULL, 10);
+            const uint8_t id = (uint8_t)atoi(comma + 1);
+            state->loaded_tags[state->loaded_tags_count++] = (DSTagEntry){
+                .timestamp_ms = ms,
+                .tag_id = id
+            };
+        }
+    }
+    fclose(f);
+}
+
+static void jump_to_tag(DeadSpeak *state, bool forward) {
+    if (!state || !state->voice_player || state->loaded_tags_count == 0) return;
+    const uint64_t cur_ms = ds_voice_player_get_wav_position_ms(state->voice_player);
+    const uint64_t dur_ms = ds_voice_player_get_wav_duration_ms(state->voice_player);
+
+    if (forward) {
+        for (size_t i = 0; i < state->loaded_tags_count; ++i) {
+            if (state->loaded_tags[i].timestamp_ms >= cur_ms + 50ULL) {
+                ds_voice_player_seek_wav_ms(state->voice_player, state->loaded_tags[i].timestamp_ms);
+                return;
+            }
+        }
+        if (dur_ms > 0) ds_voice_player_seek_wav_ms(state->voice_player, dur_ms);
+    } else {
+        const uint64_t target_cur = cur_ms > 1000ULL ? (cur_ms - 1000ULL) : 0ULL;
+        int found_idx = -1;
+        for (size_t i = 0; i < state->loaded_tags_count; ++i) {
+            if (state->loaded_tags[i].timestamp_ms <= target_cur) {
+                found_idx = (int)i;
+            } else {
+                break;
+            }
+        }
+        if (found_idx >= 0) {
+            ds_voice_player_seek_wav_ms(state->voice_player, state->loaded_tags[found_idx].timestamp_ms);
+        } else {
+            ds_voice_player_seek_wav_ms(state->voice_player, 0ULL);
+        }
+    }
 }
 
 static bool has_capture_permissions(DeadSpeak *state) {
@@ -336,6 +782,7 @@ static void *audio_capture_thread(void *user_data) {
     AAudioStream *stream = NULL;
     FILE *file = NULL;
     FILE *srt_file = NULL;
+    FILE *waveform_file = NULL;
     uint32_t bytes_written = 0;
     uint32_t sample_rate = 0;
     bool capture_ok = false;
@@ -351,7 +798,7 @@ static void *audio_capture_thread(void *user_data) {
     sample_rate = (uint32_t)AAudioStream_getSampleRate(stream);
     if (sample_rate == 0U || AAudioStream_getChannelCount(stream) != 1 || AAudioStream_getFormat(stream) != AAUDIO_FORMAT_PCM_I16) goto done;
 
-    char path[640], srt_path[640];
+    char path[640], srt_path[640], tags_path[640], waveform_path[640], words_path[640];
     const time_t now = time(NULL);
     struct tm local_time;
     localtime_r(&now, &local_time);
@@ -361,9 +808,21 @@ static void *audio_capture_thread(void *user_data) {
     strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &local_time);
     snprintf(path, sizeof(path), "%s/EVP_%s_%03ld.wav", state->evidence_dir, stamp, wall_time.tv_nsec / 1000000L);
     snprintf(srt_path, sizeof(srt_path), "%s/EVP_%s_%03ld.srt", state->evidence_dir, stamp, wall_time.tv_nsec / 1000000L);
+    snprintf(tags_path, sizeof(tags_path), "%s/EVP_%s_%03ld_tags.txt", state->evidence_dir, stamp, wall_time.tv_nsec / 1000000L);
+    snprintf(waveform_path, sizeof(waveform_path), "%s/EVP_%s_%03ld_waveform.txt", state->evidence_dir, stamp, wall_time.tv_nsec / 1000000L);
+    snprintf(words_path, sizeof(words_path), "%s/EVP_%s_%03ld.txt", state->evidence_dir, stamp, wall_time.tv_nsec / 1000000L);
+    snprintf(state->active_words_path, sizeof(state->active_words_path), "%s", words_path);
+    snprintf(state->active_tags_path, sizeof(state->active_tags_path), "%s", tags_path);
+    snprintf(state->active_waveform_path, sizeof(state->active_waveform_path), "%s", waveform_path);
+    state->recording_start_ms = now_millis();
     file = fopen(path, "wb");
     srt_file = fopen(srt_path, "w");
-    if (!file) { if (srt_file) fclose(srt_file); goto done; }
+    waveform_file = fopen(waveform_path, "w");
+    if (!file) {
+        if (srt_file) { fclose(srt_file); srt_file = NULL; }
+        if (waveform_file) { fclose(waveform_file); waveform_file = NULL; }
+        goto done;
+    }
     uint8_t empty_header[44] = {0};
     fwrite(empty_header, sizeof(empty_header), 1, file);
     if (AAudioStream_requestStart(stream) != AAUDIO_OK) {
@@ -371,12 +830,13 @@ static void *audio_capture_thread(void *user_data) {
         file = NULL;
         unlink(path);
         if (srt_file) { fclose(srt_file); unlink(srt_path); srt_file = NULL; }
+        if (waveform_file) { fclose(waveform_file); unlink(waveform_path); waveform_file = NULL; }
         goto done;
     }
     capture_ok = true;
 
     int16_t samples[480];
-    uint32_t last_srt_sec = UINT32_MAX, srt_cue_index = 0;
+    uint32_t last_srt_sec = UINT32_MAX, srt_cue_index = 0, last_wf_ms = 0;
 
     while (atomic_load(&state->audio_active)) {
         const aaudio_result_t frames = AAudioStream_read(stream, samples, 480, 100000000LL);
@@ -409,6 +869,23 @@ static void *audio_capture_thread(void *user_data) {
         ds_engine_spectrum_bins(samples, (size_t)frames, sample_rate, bins, DS_SPECTRUM_BINS);
         for (unsigned band = 0; band < DS_SPECTRUM_BINS; ++band)
             atomic_store(&state->spectrum_bins[band], (uint32_t)fminf(1000, bins[band] * 6000));
+
+        /* Sub-Bass EVP Anomaly Evaluator (80-300 Hz) */
+        static float sub_bass_baseline = 15.0f;
+        const float sub_energy = calculate_sub_bass_energy(samples, (size_t)frames, sample_rate);
+        sub_bass_baseline = sub_bass_baseline * 0.98f + sub_energy * 0.02f;
+        state->sub_bass_level = sub_energy;
+
+        const uint64_t cap_now = now_millis();
+        if (sub_energy > 15.0f && sub_energy > sub_bass_baseline * 2.0f) {
+            atomic_store(&state->sub_bass_anomaly, true);
+            state->sub_bass_anomaly_expiry_ms = cap_now + 2000U;
+            /* Emit tag 2 (ORANGE / ANOMALY) to _tags.txt */
+            emit_companion_tag(state, 2);
+        } else if (cap_now >= state->sub_bass_anomaly_expiry_ms) {
+            atomic_store(&state->sub_bass_anomaly, false);
+        }
+
         if ((uint64_t)bytes_written + (uint64_t)frames * sizeof(int16_t) > UINT32_MAX - 36U) {
             atomic_store(&state->audio_failed, true);
             break;
@@ -416,6 +893,16 @@ static void *audio_capture_thread(void *user_data) {
         const size_t written = fwrite(samples, sizeof(int16_t), (size_t)frames, file);
         bytes_written += (uint32_t)(written * sizeof(int16_t));
         if (written != (size_t)frames) { atomic_store(&state->audio_failed, true); break; }
+
+        /* _waveform.txt companion: timestamp_ms,amplitude */
+        if (waveform_file && sample_rate > 0) {
+            const uint32_t current_ms = (uint32_t)((uint64_t)bytes_written * 1000U / (sample_rate * sizeof(int16_t)));
+            if (current_ms >= last_wf_ms + 250U) {
+                last_wf_ms = current_ms;
+                fprintf(waveform_file, "%u,%.4f\n", current_ms, rms);
+                fflush(waveform_file);
+            }
+        }
 
         /* Synchronized .srt subtitle entry every 1 second */
         if (srt_file && sample_rate > 0) {
@@ -428,11 +915,12 @@ static void *audio_capture_thread(void *user_data) {
                 m0 %= 60; m1 %= 60; s0 %= 60; s1 %= 60;
                 const float delta = state->baseline.ready ? (state->smoothed_field - state->baseline.field) : 0.0f;
                 const bool moving = ds_motion_is_moving(&state->motion_filter, sensor_now_ns());
-                fprintf(srt_file, "%u\n%02u:%02u:%02u,000 --> %02u:%02u:%02u,000\nEMF: %.1f uT (%+.1f) | %s | %s\n\n",
+                fprintf(srt_file, "%u\n%02u:%02u:%02u,000 --> %02u:%02u:%02u,000\nEMF: %.1f uT (%+.1f) | %s | %s%s\n\n",
                         ++srt_cue_index, h0, m0, s0, h1, m1, s1,
                         state->magnetic_field, delta,
                         moving ? "MOTION - INVALID" : "SENSOR STABLE",
-                        state->word[0] ? state->word : "QUIET");
+                        state->word[0] ? state->word : "QUIET",
+                        state->proximity_active ? " | PROXIMITY ALERT" : "");
                 fflush(srt_file);
             }
         }
@@ -449,12 +937,23 @@ static void *audio_capture_thread(void *user_data) {
         fclose(srt_file);
         srt_file = NULL;
     }
+    if (waveform_file) {
+        fflush(waveform_file);
+        fsync(fileno(waveform_file));
+        fclose(waveform_file);
+        waveform_file = NULL;
+    }
+    state->active_words_path[0] = '\0';
+    state->active_tags_path[0] = '\0';
+    state->active_waveform_path[0] = '\0';
+    state->recording_start_ms = 0;
     if (bytes_written == 0U) atomic_store(&state->audio_failed, true);
 
 done:
     if (!capture_ok) atomic_store(&state->audio_failed, true);
     if (file) fclose(file);
     if (srt_file) fclose(srt_file);
+    if (waveform_file) fclose(waveform_file);
     if (stream) AAudioStream_close(stream);
     if (builder) AAudioStreamBuilder_delete(builder);
     atomic_store(&state->audio_level_milli, 0);
@@ -758,6 +1257,7 @@ static void line(DeadSpeak *state, float x1, float y1, float x2, float y2, float
 }
 
 static int glyph_index(char c) {
+    if (c >= 'a' && c <= 'z') c -= ('a' - 'A');
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= '0' && c <= '9') return 26 + (c - '0');
     if (c == ':') return 36;
@@ -805,6 +1305,18 @@ static void circle(DeadSpeak *state, float cx, float cy, float radius, float r, 
     }
 }
 
+static void filled_circle(DeadSpeak *state, float x, float y, float radius, float r, float g, float b, float a) {
+    for (int i = 0; i < 40; ++i) {
+        const float p = i * 6.2831853f / 40, q = (i + 1) * 6.2831853f / 40;
+        const GLfloat vertices[] = {
+            x / state->width * 2 - 1, 1 - y / state->height * 2,
+            (x + cosf(p) * radius) / state->width * 2 - 1, 1 - (y + sinf(p) * radius) / state->height * 2,
+            (x + cosf(q) * radius) / state->width * 2 - 1, 1 - (y + sinf(q) * radius) / state->height * 2
+        };
+        emit_vertices(state, vertices, 3, r, g, b, a);
+    }
+}
+
 static float body_content_height(const DeadSpeak *state) {
     if (state->tab == 0) return state->ui.scan_height;
     if (state->tab == 2) return state->ui.explore_height;
@@ -814,12 +1326,23 @@ static float body_content_height(const DeadSpeak *state) {
     return state->ui.wide ? fmaxf(words, 22.0f + media) : fmaxf(140.0f, words + 20.0f) + media;
 }
 
+static void custom_button(DeadSpeak *state, DSRect button, const char *label, bool selected) {
+    rect(state, button.x, button.y, button.w, button.h, selected ? 0.10f : 0.14f, selected ? 0.32f : 0.18f, selected ? 0.25f : 0.19f, 0.97f);
+    const float scale = fit_text_scale(label, 1.4f, button.w - 10);
+    text(state, label, button.x + (button.w - strlen(label) * 6 * scale) / 2,
+         button.y + (button.h - 7 * scale) / 2, scale, 0.88f, 0.98f, 0.93f, 1);
+}
+
 static void draw_log(DeadSpeak *state, float panel_r, float panel_g, float panel_b,
                      float mint_r, float mint_g, float mint_b, float muted_r, float muted_g, float muted_b) {
     const DSRect body = state->ui.body;
     const float column_width = state->ui.wide ? (body.w - 16.0f) * 0.5f : body.w;
     const float x = body.x + 16.0f, top = body.y;
     text(state, "RECENT SENSOR WORDS", x, top + 22, fit_text_scale("RECENT SENSOR WORDS", 1.8f, column_width - 32), mint_r, mint_g, mint_b, 1.0f);
+    if (state->export_status_expiry_ms > now_millis() && state->export_status_message[0]) {
+        rect(state, x, top + 42, column_width - 32, 22, 0.12f, 0.42f, 0.28f, 0.95f);
+        text(state, state->export_status_message, x + 6, top + 47, fit_text_scale(state->export_status_message, 1.0f, column_width - 44), 1.0f, 1.0f, 1.0f, 1.0f);
+    }
     if (state->log_count == 0) {
         text(state, "NO WORDS LOGGED YET", x, top + 70, fit_text_scale("NO WORDS LOGGED YET", 1.5f, column_width - 32), muted_r, muted_g, muted_b, 1.0f);
         text(state, "ENABLE SCAN TO COLLECT READINGS", x, top + 100, fit_text_scale("ENABLE SCAN TO COLLECT READINGS", 1.1f, column_width - 32), muted_r, muted_g, muted_b, 1.0f);
@@ -828,7 +1351,9 @@ static void draw_log(DeadSpeak *state, float panel_r, float panel_g, float panel
             const unsigned slot = (state->log_next + DS_LOG_CAPACITY - 1U - i) % DS_LOG_CAPACITY;
             const float y = top + 70.0f + (float)i * 42.0f;
             char details[64];
-            snprintf(details, sizeof(details), "SAMPLE %u  FIELD %.1f UT", state->word_samples[slot], state->word_fields[slot]);
+            snprintf(details, sizeof(details), "SAMPLE %u  FIELD %.1f UT (%+.1f)%s",
+                state->word_samples[slot], state->word_fields[slot],
+                state->word_deltas[slot], state->word_whispers[slot] ? " [W]" : "");
             text(state, state->words[slot], x, y, fit_text_scale(state->words[slot], 2.0f, column_width - 32), mint_r, mint_g, mint_b, 1.0f);
             text(state, details, x, y + 19, fit_text_scale(details, 1.0f, column_width - 32), muted_r, muted_g, muted_b, 1.0f);
             rect(state, x, y + 34, column_width - 32, 1, 0.17f, 0.24f, 0.23f, 1.0f);
@@ -836,34 +1361,132 @@ static void draw_log(DeadSpeak *state, float panel_r, float panel_g, float panel
     }
     const float media_x = state->ui.wide ? x + column_width + 16.0f : x;
     const float media_y = state->ui.wide ? top + 22.0f : top + fmaxf(140.0f, 90.0f + (float)state->log_count * 42.0f);
-    text(state, "SAVED CAPTURES (TAP WAV TO PLAY)", media_x, media_y, fit_text_scale("SAVED CAPTURES (TAP WAV TO PLAY)", 1.4f, column_width - 32), mint_r, mint_g, mint_b, 1.0f);
+    text(state, "SAVED CAPTURES & SESSIONS", media_x, media_y, fit_text_scale("SAVED CAPTURES & SESSIONS", 1.35f, column_width - 146), mint_r, mint_g, mint_b, 1.0f);
+    custom_button(state, (DSRect){media_x + column_width - 138.0f, media_y - 6.0f, 106.0f, 30.0f}, "EXPORT LOGS", false);
     if (state->media_count == 0U) text(state, "NO AUDIO OR VIDEO FILES", media_x, media_y + 34, fit_text_scale("NO AUDIO OR VIDEO FILES", 1.1f, column_width - 32), muted_r, muted_g, muted_b, 1.0f);
     
     char curr_wav[96] = {0};
     float wav_prog = 0.0f;
     const bool is_playing_any = ds_voice_player_is_playing_wav(state->voice_player, curr_wav, sizeof(curr_wav), &wav_prog);
 
+    float cur_item_y = media_y + 36.0f;
     for (unsigned i = 0; i < state->media_count; ++i) {
-        const float item_y = media_y + 36.0f + (float)i * 36.0f;
         const char *filename = state->media_files[i];
         const size_t len = strlen(filename);
         const bool is_wav = len > 4 && strcmp(filename + len - 4, ".wav") == 0;
+        const bool is_mp4 = len > 4 && strcmp(filename + len - 4, ".mp4") == 0;
+        const bool is_txt = len > 4 && strcmp(filename + len - 4, ".txt") == 0;
         const bool is_this_playing = is_playing_any && strcmp(curr_wav, filename) == 0;
 
+        char stem[96] = {0};
+        if (len > 4) snprintf(stem, sizeof(stem), "%.*s", (int)(len - 4), filename);
+        else snprintf(stem, sizeof(stem), "%s", filename);
+
+        char c_check[640];
+        snprintf(c_check, sizeof(c_check), "%s/%s.txt", state->evidence_dir, stem);
+        const bool has_txt = (access(c_check, F_OK) == 0);
+        snprintf(c_check, sizeof(c_check), "%s/%s_tags.txt", state->evidence_dir, stem);
+        const bool has_tags = (access(c_check, F_OK) == 0);
+        snprintf(c_check, sizeof(c_check), "%s/%s_waveform.txt", state->evidence_dir, stem);
+        const bool has_wf = (access(c_check, F_OK) == 0);
+        snprintf(c_check, sizeof(c_check), "%s/%s.srt", state->evidence_dir, stem);
+        const bool has_srt = (access(c_check, F_OK) == 0);
+
         if (is_this_playing) {
-            rect(state, media_x - 4, item_y - 2, column_width - 24, 30, 0.08f, 0.22f, 0.18f, 0.9f);
+            load_recording_tags(state, filename);
+            const uint64_t cur_ms = ds_voice_player_get_wav_position_ms(state->voice_player);
+            const uint64_t dur_ms = ds_voice_player_get_wav_duration_ms(state->voice_player);
+            const unsigned cur_sec = (unsigned)(cur_ms / 1000ULL);
+            const unsigned dur_sec = (unsigned)(dur_ms / 1000ULL);
+
+            /* Interactive scrubbable playback card */
+            rect(state, media_x - 4, cur_item_y - 2, column_width - 24, 76, 0.07f, 0.18f, 0.15f, 0.95f);
+
             char label[128];
-            snprintf(label, sizeof(label), "|| %s (%u%%)", filename, (unsigned)(wav_prog * 100.0f));
-            text(state, label, media_x + 4, item_y + 4, fit_text_scale(label, 1.05f, column_width - 32), 0.95f, 0.98f, 0.94f, 1.0f);
-            /* Progress line */
-            rect(state, media_x + 4, item_y + 24, (column_width - 40) * wav_prog, 2, mint_r, mint_g, mint_b, 1.0f);
+            snprintf(label, sizeof(label), "|| %s  %02u:%02u / %02u:%02u (%u%%)",
+                     filename, cur_sec / 60, cur_sec % 60, dur_sec / 60, dur_sec % 60, (unsigned)(wav_prog * 100.0f));
+            text(state, label, media_x + 4, cur_item_y + 4, fit_text_scale(label, 1.05f, column_width - 32), 0.95f, 0.98f, 0.94f, 1.0f);
+
+            /* Timeline scrubber bar */
+            const float bar_x = media_x + 4.0f;
+            const float bar_w = column_width - 36.0f;
+            const float bar_y = cur_item_y + 24.0f;
+            rect(state, bar_x, bar_y, bar_w, 8, 0.12f, 0.18f, 0.17f, 1.0f);
+            rect(state, bar_x, bar_y, bar_w * wav_prog, 8, mint_r, mint_g, mint_b, 1.0f);
+            filled_circle(state, bar_x + bar_w * wav_prog, bar_y + 4.0f, 6.0f, 1.0f, 1.0f, 1.0f, 1.0f);
+
+            /* Tag dots along timeline */
+            int active_tag_idx = -1;
+            uint8_t active_tag_id = 0;
+            if (dur_ms > 0) {
+                for (size_t t = 0; t < state->loaded_tags_count; ++t) {
+                    const uint64_t t_ms = state->loaded_tags[t].timestamp_ms;
+                    if (t_ms <= dur_ms) {
+                        const float dot_x = bar_x + (float)t_ms / (float)dur_ms * bar_w;
+                        const uint8_t tid = state->loaded_tags[t].tag_id;
+                        const float dr = tid == 1 ? 0.2f : tid == 2 ? 1.0f : 0.85f;
+                        const float dg = tid == 1 ? 0.95f : tid == 2 ? 0.55f : 0.35f;
+                        const float db = tid == 1 ? 0.4f : tid == 2 ? 0.1f : 0.95f;
+                        filled_circle(state, dot_x, bar_y + 4.0f, 3.2f, dr, dg, db, 1.0f);
+                    }
+                    if (t_ms >= (cur_ms > 1200ULL ? cur_ms - 1200ULL : 0ULL) && t_ms <= cur_ms + 1200ULL) {
+                        active_tag_idx = (int)t + 1;
+                        active_tag_id = state->loaded_tags[t].tag_id;
+                    }
+                }
+            }
+
+            /* Tag jump and stop buttons */
+            const DSRect prev_tag_btn = {media_x + 4.0f, cur_item_y + 42.0f, 64.0f, 26.0f};
+            custom_button(state, prev_tag_btn, "<< TAG", false);
+
+            const DSRect next_tag_btn = {media_x + 74.0f, cur_item_y + 42.0f, 64.0f, 26.0f};
+            custom_button(state, next_tag_btn, "TAG >>", false);
+
+            const DSRect stop_btn = {media_x + 144.0f, cur_item_y + 42.0f, 52.0f, 26.0f};
+            custom_button(state, stop_btn, "STOP", false);
+
+            char tag_status[64];
+            if (active_tag_idx > 0) {
+                const char *tname = active_tag_id == 1 ? "WORD" : active_tag_id == 2 ? "ANOMALY" : "BOOKMARK";
+                snprintf(tag_status, sizeof(tag_status), "TAG #%d [%s]", active_tag_idx, tname);
+            } else {
+                snprintf(tag_status, sizeof(tag_status), "TAGS: %zu", state->loaded_tags_count);
+            }
+            text(state, tag_status, media_x + 204.0f, cur_item_y + 49.0f, 1.0f, mint_r, mint_g, mint_b, 1.0f);
+
+            /* Delete Button */
+            const DSRect del_btn = {media_x + column_width - 56.0f, cur_item_y + 42.0f, 44.0f, 26.0f};
+            rect(state, del_btn.x, del_btn.y, del_btn.w, del_btn.h, 0.45f, 0.12f, 0.12f, 0.9f);
+            text(state, "DEL", del_btn.x + 8.0f, del_btn.y + 7.0f, 1.0f, 1.0f, 0.8f, 0.8f, 1.0f);
+
+            cur_item_y += 82.0f;
         } else {
             char label[128];
-            if (is_wav) snprintf(label, sizeof(label), ">  %s", filename);
-            else snprintf(label, sizeof(label), "[] %s", filename);
-            text(state, label, media_x, item_y + 4, fit_text_scale(label, 1.0f, column_width - 32),
-                 is_wav ? mint_r : muted_r, is_wav ? mint_g : muted_g, is_wav ? mint_b : muted_b, 1.0f);
-            rect(state, media_x, item_y + 28, column_width - 32, 1, 0.17f, 0.24f, 0.23f, 0.6f);
+            if (is_wav) snprintf(label, sizeof(label), "> %s", filename);
+            else if (is_mp4) snprintf(label, sizeof(label), "[] %s", filename);
+            else if (is_txt) snprintf(label, sizeof(label), "## %s", filename);
+            else snprintf(label, sizeof(label), "- %s", filename);
+
+            const float lr = is_wav ? mint_r : is_mp4 ? 0.45f : muted_r;
+            const float lg = is_wav ? mint_g : is_mp4 ? 0.85f : muted_g;
+            const float lb = is_wav ? mint_b : is_mp4 ? 0.95f : muted_b;
+            text(state, label, media_x, cur_item_y + 4, fit_text_scale(label, 0.95f, column_width - 150.0f), lr, lg, lb, 1.0f);
+
+            /* Companion badges */
+            float badge_x = media_x + column_width - 152.0f;
+            if (has_txt) { text(state, "TXT", badge_x, cur_item_y + 4, 0.8f, 0.35f, 0.85f, 0.75f, 1.0f); badge_x += 24.0f; }
+            if (has_tags) { text(state, "TAGS", badge_x, cur_item_y + 4, 0.8f, 1.0f, 0.65f, 0.2f, 1.0f); badge_x += 30.0f; }
+            if (has_wf) { text(state, "WF", badge_x, cur_item_y + 4, 0.8f, 0.4f, 0.8f, 1.0f, 1.0f); badge_x += 20.0f; }
+            if (has_srt) text(state, "SRT", badge_x, cur_item_y + 4, 0.8f, 0.8f, 0.8f, 0.8f, 1.0f);
+
+            /* Delete Button */
+            const DSRect del_btn = {media_x + column_width - 48.0f, cur_item_y + 1.0f, 40.0f, 22.0f};
+            rect(state, del_btn.x, del_btn.y, del_btn.w, del_btn.h, 0.35f, 0.12f, 0.12f, 0.85f);
+            text(state, "DEL", del_btn.x + 8.0f, del_btn.y + 4.0f, 0.9f, 1.0f, 0.75f, 0.75f, 1.0f);
+
+            rect(state, media_x, cur_item_y + 28, column_width - 32, 1, 0.17f, 0.24f, 0.23f, 0.6f);
+            cur_item_y += 36.0f;
         }
     }
 }
@@ -983,27 +1606,8 @@ static int32_t ascii_from_key(int32_t key, int32_t meta) {
     return 0;
 }
 
-static void filled_circle(DeadSpeak *state, float x, float y, float radius, float r, float g, float b, float a) {
-    for (int i = 0; i < 40; ++i) {
-        const float p = i * 6.2831853f / 40, q = (i + 1) * 6.2831853f / 40;
-        const GLfloat vertices[] = {
-            x / state->width * 2 - 1, 1 - y / state->height * 2,
-            (x + cosf(p) * radius) / state->width * 2 - 1, 1 - (y + sinf(p) * radius) / state->height * 2,
-            (x + cosf(q) * radius) / state->width * 2 - 1, 1 - (y + sinf(q) * radius) / state->height * 2
-        };
-        emit_vertices(state, vertices, 3, r, g, b, a);
-    }
-}
-
 static DSRect custom_modal(const DeadSpeak *state) {
     return (DSRect){12, 58, state->width - 24, state->height - 114};
-}
-
-static void custom_button(DeadSpeak *state, DSRect button, const char *label, bool selected) {
-    rect(state, button.x, button.y, button.w, button.h, selected ? 0.10f : 0.14f, selected ? 0.32f : 0.18f, selected ? 0.25f : 0.19f, 0.97f);
-    const float scale = fit_text_scale(label, 1.4f, button.w - 10);
-    text(state, label, button.x + (button.w - strlen(label) * 6 * scale) / 2,
-         button.y + (button.h - 7 * scale) / 2, scale, 0.88f, 0.98f, 0.93f, 1);
 }
 
 static void draw_custom_words(DeadSpeak *state) {
@@ -1017,12 +1621,12 @@ static void draw_custom_words(DeadSpeak *state) {
     custom_button(state, (DSRect){modal.x + 10, modal.y + 44, half, 36}, "BUNDLED (5K)", !state->custom_selected);
     custom_button(state, (DSRect){modal.x + 20 + half, modal.y + 44, half, 36}, "CUSTOM ONLY", state->custom_selected);
 
-    /* Voice Mode Selector Bar */
-    const float third = (modal.w - 36) / 3;
-    const char *voice_modes[] = {"CLASSIC", "WHISPER", "SPIRIT BOX"};
-    for (unsigned i = 0; i < 3; ++i) {
+    /* Voice Mode Selector Bar (Classic, Whisper, Dynamic, Spirit Box) */
+    const float quarter = (modal.w - 44) / 4;
+    const char *voice_modes[] = {"CLASSIC", "WHISPER", "DYNAMIC", "SPIRIT BOX"};
+    for (unsigned i = 0; i < 4; ++i) {
         const bool sel = state->voice_config.mode == (DSVoiceMode)i;
-        custom_button(state, (DSRect){modal.x + 10 + i * (third + 8), modal.y + 86, third, 32}, voice_modes[i], sel);
+        custom_button(state, (DSRect){modal.x + 10 + i * (quarter + 8), modal.y + 86, quarter, 32}, voice_modes[i], sel);
     }
 
     if (state->custom_editing) {
@@ -1034,7 +1638,7 @@ static void draw_custom_words(DeadSpeak *state) {
         for (unsigned row = 0; row < 3; ++row) {
             const float key_width = (modal.w - 20) / strlen(rows[row]);
             for (unsigned column = 0; rows[row][column]; ++column) {
-                char key[2] = {rows[row][column], 0};
+                const char key[2] = {rows[row][column], 0};
                 custom_button(state, (DSRect){modal.x + 10 + column * key_width, modal.y + 168 + row * key_height,
                     key_width - 2, key_height - 3}, key, false);
             }
@@ -1103,17 +1707,57 @@ static void draw_camera(DeadSpeak *state) {
         glDisableVertexAttribArray(1);
     }
     /* Top Bar */
+    float accent_r = 0.92f, accent_g = 0.98f, accent_b = 0.95f;
+    if (state->hud_hue > 0.001f) {
+        ds_interpolate_hud_accent(state->hud_hue, &accent_r, &accent_g, &accent_b);
+    }
     if (!state->minimal_hud) {
         rect(state, 0, 0, state->width, 58, 0, 0, 0, 0.6f);
-        text(state, "DEADSPEAK", 16, 18, 2.6f, 0.92f, 0.98f, 0.95f, 1);
+        text(state, "DEADSPEAK", 16, 18, 2.6f, accent_r, accent_g, accent_b, 1);
 
-        /* Top Right Voice Synthesizer & Geiger Buttons */
+        /* Top Right Voice Synthesizer, Geiger, Style and Tint Buttons */
         const DSRect spk_btn = {state->width - 76, 12, 68, 34};
         custom_button(state, spk_btn, state->voice_config.enabled ? "VOX ON" : "VOX OFF", state->voice_config.enabled);
 
         const bool geiger_on = ds_voice_player_get_geiger_enabled(state->voice_player);
         const DSRect geiger_btn = {state->width - 162, 12, 82, 34};
         custom_button(state, geiger_btn, geiger_on ? "GEIGER ON" : "GEIGER OFF", geiger_on);
+
+        static const char *const theme_names[] = {"#ORIGINAL", "ABDUCTION", "AI"};
+        const DSRect style_btn = {state->width - 256, 12, 90, 34};
+        custom_button(state, style_btn, theme_names[state->theme_mode % 3], state->theme_mode != 0);
+
+        char tint_label[32];
+        snprintf(tint_label, sizeof(tint_label), "TINT %u%%", (unsigned)(state->hud_hue * 100.0f));
+        const DSRect tint_btn = {state->width - 336, 12, 76, 34};
+        custom_button(state, tint_btn, tint_label, state->hud_hue > 0.05f);
+
+        if (state->export_status_expiry_ms > now && state->export_status_message[0]) {
+            const float toast_w = fminf(300.0f, state->width - 40.0f);
+            const float toast_x = (state->width - toast_w) * 0.5f;
+            rect(state, toast_x, 60.0f, toast_w, 24.0f, 0.12f, 0.38f, 0.28f, 0.95f);
+            text(state, state->export_status_message, toast_x + 8.0f, 65.0f,
+                 fit_text_scale(state->export_status_message, 1.0f, toast_w - 16.0f),
+                 1.0f, 1.0f, 1.0f, 1.0f);
+        }
+
+        if (state->proximity_active) {
+            const float prox_x = state->width - 430.0f, prox_y = 12.0f;
+            rect(state, prox_x, prox_y, 88, 34, 0.95f, 0.35f, 0.05f, 0.85f);
+            text(state, "PROX NEAR", prox_x + 6, prox_y + 10, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f);
+
+            /* Expanding concentric radar ripple rings */
+            const float rc_x = prox_x + 44.0f, rc_y = prox_y + 17.0f;
+            const uint64_t phase1 = now % 1000U;
+            const float ring_r1 = 18.0f + ((float)phase1 / 1000.0f) * 32.0f;
+            const float ring_a1 = (1.0f - (float)phase1 / 1000.0f) * 0.85f;
+            circle(state, rc_x, rc_y, ring_r1, 1.0f, 0.45f, 0.1f, ring_a1);
+
+            const uint64_t phase2 = (now + 500U) % 1000U;
+            const float ring_r2 = 18.0f + ((float)phase2 / 1000.0f) * 32.0f;
+            const float ring_a2 = (1.0f - (float)phase2 / 1000.0f) * 0.85f;
+            circle(state, rc_x, rc_y, ring_r2, 1.0f, 0.45f, 0.1f, ring_a2);
+        }
 
         char status[80];
         if (recording) snprintf(status, sizeof(status), "REC %02llu:%02llu",
@@ -1146,7 +1790,17 @@ static void draw_camera(DeadSpeak *state) {
             snprintf(details, sizeof(details), "X %.1f  Y %.1f  Z %.1f UT", reading->xyz[0], reading->xyz[1], reading->xyz[2]);
             text(state, details, 20, top + 32, fit_text_scale(details, 1.0f, state->width - 108), 0.8f, 0.95f, 0.86f, 1);
         }
-        snprintf(details, sizeof(details), "ACCEL %s  GYRO %s", ds_sensor_status_name(state->readings[1].status), ds_sensor_status_name(state->readings[2].status));
+        if (state->sensors[3]) {
+            snprintf(details, sizeof(details), "ACCEL %s  GYRO %s  PROX %s (%.0fcm)",
+                ds_sensor_status_name(state->readings[1].status),
+                ds_sensor_status_name(state->readings[2].status),
+                state->proximity_active ? "NEAR" : "FAR",
+                state->proximity_distance);
+        } else {
+            snprintf(details, sizeof(details), "ACCEL %s  GYRO %s  PROX N/A",
+                ds_sensor_status_name(state->readings[1].status),
+                ds_sensor_status_name(state->readings[2].status));
+        }
         text(state, details, 20, top + 57, fit_text_scale(details, 1.0f, state->width - 108), 0.8f, 0.95f, 0.86f, 1);
         custom_button(state, (DSRect){20, top + 84, 112, 40}, "CALIBRATE", false);
         const char *sens_names[] = {"SENS: HI", "SENS: MED", "SENS: LO"};
@@ -1158,29 +1812,94 @@ static void draw_camera(DeadSpeak *state) {
     
     /* 1. SOUND SPECTRUM & LIVE OSCILLOSCOPE ANALYZER HUD */
     if (!state->minimal_hud) {
+        /* Rolling Word History Feed */
+        if (state->log_count > 0 && !state->sensor_details) {
+            const unsigned show_count = state->log_count < 3U ? state->log_count : 3U;
+            const float hist_x = 16.0f;
+            const float hist_w = fminf(360.0f, state->width - 90.0f);
+            const float hist_base_y = ui.audio.y - (float)show_count * 22.0f - 6.0f;
+            if (hist_base_y > 70.0f) {
+                rect(state, hist_x, hist_base_y - 2.0f, hist_w, (float)show_count * 22.0f + 4.0f, 0.0f, 0.0f, 0.0f, 0.50f);
+                for (unsigned h = 0; h < show_count; ++h) {
+                    const unsigned slot = (state->log_next + DS_LOG_CAPACITY - 1U - h) % DS_LOG_CAPACITY;
+                    const uint64_t elapsed_s = state->word_times[slot] ? (now - state->word_times[slot]) / 1000U : 0U;
+                    char item_str[96];
+                    snprintf(item_str, sizeof(item_str), "%llus AGO  %s (%.1f uT%s)",
+                        (unsigned long long)elapsed_s, state->words[slot], state->word_fields[slot],
+                        state->word_whispers[slot] ? " W" : "");
+                    const float alpha = 0.92f - (float)h * 0.24f;
+                    text(state, item_str, hist_x + 8.0f, hist_base_y + (float)h * 22.0f + 4.0f,
+                         fit_text_scale(item_str, 1.0f, hist_w - 16.0f),
+                         0.80f, 0.98f, 0.88f, alpha);
+                }
+            }
+        }
+
+        /* Sub-Bass EVP Anomaly Banner */
+        if (atomic_load(&state->sub_bass_anomaly) && now < state->sub_bass_anomaly_expiry_ms) {
+            if (((now / 250U) % 2U) == 0) {
+                rect(state, ui.audio.x, ui.audio.y - 22.0f, ui.audio.w, 20.0f, 1.0f, 0.45f, 0.05f, 0.95f);
+                text(state, "SUB-BASS EVP BURST 80-300Hz", ui.audio.x + 8.0f, ui.audio.y - 18.0f,
+                     fit_text_scale("SUB-BASS EVP BURST 80-300Hz", 1.0f, ui.audio.w - 16.0f), 1.0f, 1.0f, 1.0f, 1.0f);
+            }
+        }
+
         rect(state, ui.audio.x, ui.audio.y, ui.audio.w, ui.audio.h, 0, 0, 0, 0.65f);
         const bool audio_live = atomic_load(&state->audio_active);
         if (audio_live) {
-            /* Equalizer bars */
-            const float bar_width = (ui.audio.w - 8) / (float)DS_SPECTRUM_BINS;
-            for (unsigned i = 0; i < DS_SPECTRUM_BINS; ++i) {
-                const float level = atomic_load(&state->spectrum_bins[i]) / 1000.0f;
-                const unsigned bars = (unsigned)(level * 9);
-                for (unsigned row = 0; row < bars; ++row) {
-                    const float r = row < 5 ? 0.25f : row < 8 ? 0.95f : 1.0f;
-                    const float g = row < 5 ? 0.95f : row < 8 ? 0.85f : 0.2f;
-                    const float b = row < 5 ? 0.45f : row < 8 ? 0.1f : 0.1f;
-                    rect(state, ui.audio.x + 4 + (float)i * bar_width, ui.audio.y + ui.audio.h - (float)(row + 1) * 3.5f - 2.0f,
-                         fmaxf(1.0f, bar_width - 2.0f), 2.5f, r, g, b, 0.75f);
+            if (state->theme_mode == 1) {
+                /* Abduction Theme: Bio-luminescent alien neon curve */
+                const float osc_mid_y = ui.audio.y + ui.audio.h * 0.50f;
+                const float step_x = (ui.audio.w - 8) / (float)(DS_OSCILLOSCOPE_SAMPLES - 1);
+                for (int s = 0; s < DS_OSCILLOSCOPE_SAMPLES - 1; ++s) {
+                    const float y1 = osc_mid_y - (float)atomic_load(&state->oscilloscope[s]) / 32768.0f * (ui.audio.h * 0.44f);
+                    const float y2 = osc_mid_y - (float)atomic_load(&state->oscilloscope[s + 1]) / 32768.0f * (ui.audio.h * 0.44f);
+                    line(state, ui.audio.x + 4 + (float)s * step_x, y1 - 1.0f, ui.audio.x + 4 + (float)(s + 1) * step_x, y2 - 1.0f, 0.1f, 1.0f, 0.85f, 0.4f);
+                    line(state, ui.audio.x + 4 + (float)s * step_x, y1, ui.audio.x + 4 + (float)(s + 1) * step_x, y2, 0.4f, 1.0f, 0.95f, 0.95f);
                 }
-            }
-            /* Rolling Phosphor Oscilloscope Trace */
-            const float osc_mid_y = ui.audio.y + ui.audio.h * 0.48f;
-            const float step_x = (ui.audio.w - 8) / (float)(DS_OSCILLOSCOPE_SAMPLES - 1);
-            for (int s = 0; s < DS_OSCILLOSCOPE_SAMPLES - 1; ++s) {
-                const float y1 = osc_mid_y - (float)atomic_load(&state->oscilloscope[s]) / 32768.0f * (ui.audio.h * 0.38f);
-                const float y2 = osc_mid_y - (float)atomic_load(&state->oscilloscope[s + 1]) / 32768.0f * (ui.audio.h * 0.38f);
-                line(state, ui.audio.x + 4 + (float)s * step_x, y1, ui.audio.x + 4 + (float)(s + 1) * step_x, y2, 0.2f, 1.0f, 0.5f, 0.9f);
+            } else if (state->theme_mode == 2) {
+                /* Artificial Intelligence Theme: 16-node digital matrix waveform */
+                const float bar_w = (ui.audio.w - 12.0f) / 16.0f;
+                for (unsigned n = 0; n < 16; ++n) {
+                    const unsigned bin_idx = (n * DS_SPECTRUM_BINS) / 16;
+                    const float level = (float)atomic_load(&state->spectrum_bins[bin_idx]) / 1000.0f;
+                    const float node_h = fmaxf(4.0f, level * (ui.audio.h - 10.0f));
+                    const float nx = ui.audio.x + 6.0f + (float)n * bar_w;
+                    const float ny = ui.audio.y + ui.audio.h - 5.0f - node_h;
+                    rect(state, nx, ny, bar_w - 2.0f, node_h, 0.2f, 0.7f, 1.0f, 0.92f);
+                }
+            } else {
+                /* Original Theme: 12-segment segmented LED VU meter + phosphor trace */
+                const float bar_width = (ui.audio.w - 8.0f) / (float)DS_SPECTRUM_BINS;
+                const float cell_w = fmaxf(1.0f, bar_width - 1.5f);
+                const float seg_h = (ui.audio.h - 6.0f) / 12.0f;
+                const float cell_fill_h = fmaxf(1.0f, seg_h - 0.6f);
+
+                for (unsigned i = 0; i < DS_SPECTRUM_BINS; ++i) {
+                    const float level = (float)atomic_load(&state->spectrum_bins[i]) / 1000.0f;
+                    const unsigned lit_segments = (unsigned)fminf(12.0f, level * 12.0f + 0.5f);
+                    const float bx = ui.audio.x + 4.0f + (float)i * bar_width;
+
+                    for (unsigned seg = 0; seg < 12; ++seg) {
+                        const float by = ui.audio.y + ui.audio.h - 3.0f - (float)(seg + 1) * seg_h;
+                        if (seg < lit_segments) {
+                            const float r = seg < 8 ? 0.745f : 1.0f;
+                            const float g = seg < 8 ? 1.0f : seg < 10 ? 0.706f : 0.05f;
+                            const float b = seg < 8 ? 0.274f : seg < 10 ? 0.0f : 0.05f;
+                            rect(state, bx, by, cell_w, cell_fill_h, 0.0f, 0.0f, 0.0f, 0.9f);
+                            rect(state, bx + 0.5f, by + 0.3f, fmaxf(0.5f, cell_w - 1.0f), fmaxf(0.5f, cell_fill_h - 0.6f), r, g, b, 0.95f);
+                        } else {
+                            rect(state, bx, by, cell_w, cell_fill_h, 0.08f, 0.12f, 0.11f, 0.35f);
+                        }
+                    }
+                }
+                const float osc_mid_y = ui.audio.y + ui.audio.h * 0.48f;
+                const float step_x = (ui.audio.w - 8) / (float)(DS_OSCILLOSCOPE_SAMPLES - 1);
+                for (int s = 0; s < DS_OSCILLOSCOPE_SAMPLES - 1; ++s) {
+                    const float y1 = osc_mid_y - (float)atomic_load(&state->oscilloscope[s]) / 32768.0f * (ui.audio.h * 0.38f);
+                    const float y2 = osc_mid_y - (float)atomic_load(&state->oscilloscope[s + 1]) / 32768.0f * (ui.audio.h * 0.38f);
+                    line(state, ui.audio.x + 4 + (float)s * step_x, y1, ui.audio.x + 4 + (float)(s + 1) * step_x, y2, 0.2f, 1.0f, 0.5f, 0.9f);
+                }
             }
         } else {
             text(state, "MIC READY - SOUND ANALYZER", ui.audio.x + 8, ui.audio.y + 14,
@@ -1212,29 +1931,85 @@ static void draw_camera(DeadSpeak *state) {
 
     const float meter_x = ui.magnetic.x + ui.magnetic.w * 0.60f, meter_width = ui.magnetic.w * 0.36f;
     rect(state, meter_x, ui.magnetic.y + 9, meter_width, 14, 0.15f, 0.20f, 0.18f, 1);
+
+    /* Graduated scale tick lines (0%, 25%, 50%, 75%, 100%) */
+    for (unsigned t = 0; t <= 4; ++t) {
+        const float tx = meter_x + (float)t * 0.25f * meter_width;
+        line(state, tx, ui.magnetic.y + 7, tx, ui.magnetic.y + 10, 0.45f, 0.55f, 0.50f, 0.8f);
+    }
+
     if (magnetic_live && state->signal > 0.0f) {
         const float r = state->signal < 0.4f ? 0.3f : state->signal < 0.7f ? 0.95f : 1.0f;
         const float g = state->signal < 0.4f ? 0.95f : state->signal < 0.7f ? 0.85f : 0.2f;
         const float b = state->signal < 0.4f ? 0.3f : 0.1f;
         rect(state, meter_x, ui.magnetic.y + 9, meter_width * state->signal, 14, r, g, b, 1);
+
+        /* Analog needle pointer */
+        const float needle_x = meter_x + fminf(1.0f, fmaxf(0.0f, state->signal)) * meter_width;
+        line(state, needle_x, ui.magnetic.y + 5, needle_x, ui.magnetic.y + 25, 1.0f, 1.0f, 1.0f, 1.0f);
+        filled_circle(state, needle_x, ui.magnetic.y + 16, 2.8f, 1.0f, 0.95f, 0.3f, 1.0f);
+
         /* Peak hold indicator line */
         if (state->emf_peak_signal > 0.05f) {
             rect(state, meter_x + meter_width * state->emf_peak_signal - 1.0f, ui.magnetic.y + 7, 2.0f, 18, 1.0f, 0.95f, 0.3f, 1.0f);
         }
     }
 
-    /* 3. WORD ANNOUNCER PILL CONTAINER */
-    rect(state, ui.word.x, ui.word.y, ui.word.w, ui.word.h, 0.08f, 0.12f, 0.11f, 0.92f);
+    /* 300ms High-EMF Alert Flasher */
+    if (magnetic_live && (delta > 4.0f || delta < -4.0f || state->magnetic_field > 75.0f)) {
+        emit_companion_tag(state, 2);
+        if (((now / 300U) % 2U) == 0) {
+            rect(state, ui.magnetic.x + ui.magnetic.w - 96.0f, ui.magnetic.y - 18.0f, 92.0f, 18.0f, 0.95f, 0.15f, 0.10f, 0.95f);
+            text(state, "EMF ALERT", ui.magnetic.x + ui.magnetic.w - 90.0f, ui.magnetic.y - 14.0f, 0.90f, 1.0f, 1.0f, 1.0f, 1.0f);
+        }
+    }
+
+    /* 3. Dual-Tier Word Announcer */
+    const unsigned latest_slot = (state->log_next + DS_LOG_CAPACITY - 1U) % DS_LOG_CAPACITY;
+    const uint64_t latest_word_time = state->log_count > 0 ? state->word_times[latest_slot] : 0U;
+    /* Holds triggered word on screen for 10,000 ms (10s) before resetting to Listening */
+    const bool word_active = state->word[0] && (latest_word_time > 0 && (now - latest_word_time < 10000U));
+    const bool recent_trigger = state->log_count > 0 && (now - latest_word_time < 3000U);
+    if (recent_trigger) {
+        const float pulse_a = 0.5f + 0.45f * fabsf(sinf((float)now * 0.007f));
+        rect(state, ui.word.x - 2, ui.word.y - 2, ui.word.w + 4, ui.word.h + 4, 0.15f, 0.95f, 0.70f, pulse_a);
+    }
+    const float bg_shade = recent_trigger ? 0.15f : 0.06f;
+    rect(state, ui.word.x, ui.word.y, ui.word.w, ui.word.h, bg_shade, bg_shade + 0.04f, bg_shade + 0.03f, 0.92f);
     const bool is_moving = ds_motion_is_moving(&state->motion_filter, sensor_now_ns());
-    const char *word = !magnetic_live ? "NO SENSOR DATA" : !state->scanning ? "SCAN PAUSED" :
-        is_moving ? "MOTION - STABILIZING..." : !state->baseline.ready ? "CALIBRATING BASELINE..." :
-        state->custom_selected && !ds_custom_words_count(&state->custom_words) ? "CUSTOM BANK EMPTY" :
-        state->word[0] ? state->word : "LISTENING...";
     
+    char sub_text[96] = {0};
+    const char *primary_word = NULL;
+    if (!magnetic_live) {
+        primary_word = "NO SENSOR DATA";
+        snprintf(sub_text, sizeof(sub_text), "MAGNETOMETER UNAVAILABLE");
+    } else if (!state->scanning) {
+        primary_word = "SCAN PAUSED";
+        snprintf(sub_text, sizeof(sub_text), "TAP RESUME TO DETECT SENSOR ANOMALIES");
+    } else if (is_moving) {
+        primary_word = "MOTION DETECTED";
+        snprintf(sub_text, sizeof(sub_text), "STABILIZING SENSOR BASELINE...");
+    } else if (!state->baseline.ready) {
+        primary_word = "CALIBRATING";
+        snprintf(sub_text, sizeof(sub_text), "COLLECTING AMBIENT FIELD READINGS...");
+    } else if (state->custom_selected && !ds_custom_words_count(&state->custom_words)) {
+        primary_word = "CUSTOM BANK EMPTY";
+        snprintf(sub_text, sizeof(sub_text), "ADD WORDS IN WORD BANK MODAL");
+    } else if (word_active) {
+        primary_word = state->word;
+        snprintf(sub_text, sizeof(sub_text), "FIELD %.1f UT  DEL %+.1f UT%s",
+                 state->word_fields[latest_slot], state->word_deltas[latest_slot],
+                 state->word_whispers[latest_slot] ? "  [WHISPER]" : "");
+    } else {
+        primary_word = "LISTENING...";
+        snprintf(sub_text, sizeof(sub_text), "AWAITING SENSOR ANOMALIES");
+    }
+
     const float word_r = is_moving ? 0.96f : 0.95f;
     const float word_g = is_moving ? 0.75f : 0.98f;
     const float word_b = is_moving ? 0.35f : 0.95f;
-    text(state, word, ui.word.x + 12, ui.word.y + 12, fit_text_scale(word, 2.0f, ui.word.w - 24), word_r, word_g, word_b, 1);
+    text(state, primary_word, ui.word.x + 10, ui.word.y + 6, fit_text_scale(primary_word, 1.75f, ui.word.w - 20), word_r, word_g, word_b, 1);
+    text(state, sub_text, ui.word.x + 10, ui.word.y + 24, fit_text_scale(sub_text, 0.95f, ui.word.w - 20), 0.65f, 0.85f, 0.78f, 0.9f);
 
     /* 4. RECORD SHUTTER BUTTON */
     const float cx = ui.record.x + ui.record.w / 2, cy = ui.record.y + ui.record.h / 2;
@@ -1242,6 +2017,12 @@ static void draw_camera(DeadSpeak *state) {
     circle(state, cx, cy, 25, 0.98f, 0.98f, 0.95f, 1);
     if (recording) rect(state, cx - 11, cy - 11, 22, 22, 1, 0.05f, 0.08f, 1);
     else filled_circle(state, cx, cy, 18, 1, 0.05f, 0.08f, 1);
+
+    /* Manual Bookmark Tag Button (+TAG) during recording */
+    if (recording) {
+        const DSRect tag_btn = {cx + 36.0f, cy - 16.0f, 56.0f, 32.0f};
+        custom_button(state, tag_btn, "+TAG", false);
+    }
     
     static const char *const filter_names[] = {"NIGHT", "THERMAL", "EDGE", "MONO", "SEPIA", "RAW"};
     text(state, filter_names[state->video_filter], 16, ui.record.y + 24, 1.2f, 0.9f, 0.95f, 0.92f, 1);
@@ -1258,7 +2039,10 @@ static void draw_camera(DeadSpeak *state) {
 }
 
 static void draw_frame(DeadSpeak *state) {
-    const float mint_r = 0.73f, mint_g = 0.96f, mint_b = 0.86f;
+    float mint_r = 0.73f, mint_g = 0.96f, mint_b = 0.86f;
+    if (state->hud_hue > 0.001f) {
+        ds_interpolate_hud_accent(state->hud_hue, &mint_r, &mint_g, &mint_b);
+    }
     const float muted_r = 0.42f, muted_g = 0.53f, muted_b = 0.52f;
     const float amber_r = 0.96f, amber_g = 0.70f, amber_b = 0.36f;
     const float panel_r = 0.075f, panel_g = 0.105f, panel_b = 0.11f;
@@ -1486,9 +2270,9 @@ static void custom_touch(DeadSpeak *state, float x, float y) {
         state->word[0] = 0;
         return;
     }
-    const float third = (modal.w - 36) / 3;
-    for (unsigned i = 0; i < 3; ++i) {
-        if (ds_rect_contains((DSRect){modal.x + 10 + i * (third + 8), modal.y + 86, third, 32}, x, y)) {
+    const float quarter = (modal.w - 44) / 4;
+    for (unsigned i = 0; i < 4; ++i) {
+        if (ds_rect_contains((DSRect){modal.x + 10 + i * (quarter + 8), modal.y + 86, quarter, 32}, x, y)) {
             state->voice_config.mode = (DSVoiceMode)i;
             return;
         }
@@ -1664,6 +2448,14 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
             ds_voice_player_set_geiger_enabled(state->voice_player, !geiger_on);
             return 1;
         }
+        if (ds_rect_contains((DSRect){state->width - 256, 12, 90, 34}, x, y)) {
+            state->theme_mode = (state->theme_mode + 1) % 3;
+            return 1;
+        }
+        if (ds_rect_contains((DSRect){state->width - 336, 12, 76, 34}, x, y)) {
+            state->hud_hue = fmodf(state->hud_hue + 0.1666f, 1.0f);
+            return 1;
+        }
         for (unsigned i = 0; i < 5; ++i) if (ds_rect_contains(state->camera_ui.tools[i], x, y)) {
             if (i == 0) {
                 if (!has_camera_permission(state)) { state->camera_enabled = true; request_camera_permission(state); }
@@ -1698,6 +2490,15 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
                                 ds_baseline_threshold(state->baseline.sensitivity));
             return 1;
         }
+        const bool recording = ds_video_active(&state->video) || atomic_load(&state->audio_active);
+        const float rc_cx = state->camera_ui.record.x + state->camera_ui.record.w * 0.5f;
+        const float rc_cy = state->camera_ui.record.y + state->camera_ui.record.h * 0.5f;
+        if (recording && ds_rect_contains((DSRect){rc_cx + 36.0f, rc_cy - 16.0f, 56.0f, 32.0f}, x, y)) {
+            emit_companion_tag(state, 3);
+            snprintf(state->export_status_message, sizeof(state->export_status_message), "BOOKMARK TAG #3 MARKED");
+            state->export_status_expiry_ms = now_millis() + 2500U;
+            return 1;
+        }
         if (ds_rect_contains(state->camera_ui.record, x, y)) {
             toggle_capture(state);
             return 1;
@@ -1716,24 +2517,73 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
         const float column_width = state->ui.wide ? (state->ui.body.w - 16.0f) * 0.5f : state->ui.body.w;
         const float media_x = state->ui.wide ? state->ui.body.x + 16.0f + column_width + 16.0f : state->ui.body.x + 16.0f;
         const float media_y = state->ui.wide ? state->ui.body.y + 22.0f : state->ui.body.y + fmaxf(140.0f, 90.0f + (float)state->log_count * 42.0f);
+        const DSRect export_btn = {media_x + column_width - 138.0f, media_y - 6.0f, 106.0f, 30.0f};
+        if (ds_rect_contains(export_btn, x, y)) {
+            export_session_files(state);
+            refresh_media_files(state);
+            return 1;
+        }
+
+        char curr_playing[96] = {0};
+        float cur_prog = 0.0f;
+        const bool is_playing_any = ds_voice_player_is_playing_wav(state->voice_player, curr_playing, sizeof(curr_playing), &cur_prog);
+
+        float cur_item_y = media_y + 36.0f;
         for (unsigned i = 0; i < state->media_count; ++i) {
-            const float item_y = media_y + 36.0f + (float)i * 36.0f;
-            if (x >= media_x && x <= media_x + column_width && y >= item_y - 4.0f && y <= item_y + 32.0f) {
-                const char *filename = state->media_files[i];
-                const size_t len = strlen(filename);
-                if (len > 4 && strcmp(filename + len - 4, ".wav") == 0) {
-                    char full_path[640];
-                    snprintf(full_path, sizeof(full_path), "%s/%s", state->evidence_dir, filename);
-                    char curr_name[96] = {0};
-                    float prog = 0.0f;
-                    if (ds_voice_player_is_playing_wav(state->voice_player, curr_name, sizeof(curr_name), &prog) &&
-                        strcmp(curr_name, filename) == 0) {
-                        ds_voice_player_stop_wav(state->voice_player);
-                    } else {
-                        ds_voice_player_play_wav(state->voice_player, full_path);
+            const char *filename = state->media_files[i];
+            const size_t len = strlen(filename);
+            const bool is_wav = len > 4 && strcmp(filename + len - 4, ".wav") == 0;
+            const bool is_this_playing = is_playing_any && strcmp(curr_playing, filename) == 0;
+
+            if (is_this_playing) {
+                const DSRect prev_tag_btn = {media_x + 4.0f, cur_item_y + 42.0f, 64.0f, 26.0f};
+                const DSRect next_tag_btn = {media_x + 74.0f, cur_item_y + 42.0f, 64.0f, 26.0f};
+                const DSRect stop_btn = {media_x + 144.0f, cur_item_y + 42.0f, 52.0f, 26.0f};
+                const DSRect del_btn = {media_x + column_width - 56.0f, cur_item_y + 42.0f, 44.0f, 26.0f};
+                const DSRect scrubber = {media_x + 4.0f, cur_item_y + 20.0f, column_width - 36.0f, 16.0f};
+
+                if (ds_rect_contains(prev_tag_btn, x, y)) {
+                    jump_to_tag(state, false);
+                    return 1;
+                }
+                if (ds_rect_contains(next_tag_btn, x, y)) {
+                    jump_to_tag(state, true);
+                    return 1;
+                }
+                if (ds_rect_contains(stop_btn, x, y)) {
+                    ds_voice_player_stop_wav(state->voice_player);
+                    return 1;
+                }
+                if (ds_rect_contains(del_btn, x, y)) {
+                    delete_recording_and_companions(state, filename);
+                    return 1;
+                }
+                if (ds_rect_contains(scrubber, x, y)) {
+                    const uint64_t dur_ms = ds_voice_player_get_wav_duration_ms(state->voice_player);
+                    if (dur_ms > 0 && scrubber.w > 0) {
+                        const float pct = fmaxf(0.0f, fminf(1.0f, (x - scrubber.x) / scrubber.w));
+                        const uint64_t target_ms = (uint64_t)(pct * (float)dur_ms);
+                        ds_voice_player_seek_wav_ms(state->voice_player, target_ms);
                     }
                     return 1;
                 }
+                cur_item_y += 82.0f;
+            } else {
+                const DSRect del_btn = {media_x + column_width - 48.0f, cur_item_y + 1.0f, 40.0f, 22.0f};
+                if (ds_rect_contains(del_btn, x, y)) {
+                    delete_recording_and_companions(state, filename);
+                    return 1;
+                }
+                if (x >= media_x && x <= media_x + column_width - 52.0f && y >= cur_item_y - 4.0f && y <= cur_item_y + 32.0f) {
+                    if (is_wav) {
+                        char full_path[640];
+                        snprintf(full_path, sizeof(full_path), "%s/%s", state->evidence_dir, filename);
+                        ds_voice_player_play_wav(state->voice_player, full_path);
+                        load_recording_tags(state, filename);
+                        return 1;
+                    }
+                }
+                cur_item_y += 36.0f;
             }
         }
     }
@@ -1795,10 +2645,29 @@ static void poll_sensor(DeadSpeak *state) {
     ASensorEvent event;
     while (state->sensor_queue && ASensorEventQueue_getEvents(state->sensor_queue, &event, 1) > 0) {
         unsigned index;
-        for (index = 0; index < DS_SENSOR_COUNT; ++index) if (event.type == sensor_types[index]) break;
+        for (index = 0; index < DS_SENSOR_COUNT; ++index)
+            if (event.type == sensor_types[index] || event.type == sensor_fallback_types[index]) break;
         if (index == DS_SENSOR_COUNT || !state->sensors_resumed) continue;
         DSSensorReading *reading = &state->readings[index];
         const int64_t received = sensor_now_ns();
+        if (index == 3) {
+            DSSampleResult sample_prox = ds_sensor_accept(reading, event.timestamp, received, event.distance, 0.0f, 0.0f, 3);
+            if (sample_prox != DS_SAMPLE_REJECTED && state->sensors[3]) {
+                state->proximity_distance = event.distance;
+                const bool was_active = state->proximity_active;
+                /* Standard Android hardware proximity sensors report ~0.0 cm for NEAR, and ~5.0 cm for FAR */
+                state->proximity_active = (event.distance < 4.0f);
+                if (state->proximity_active && !was_active) {
+                    __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+                        "PROXIMITY TRIGGERED: distance=%.1f cm", event.distance);
+                    if (state->scanning) ds_voice_player_set_geiger_rate(state->voice_player, 25.0f);
+                    emit_companion_tag(state, 2);
+                } else if (!state->proximity_active && was_active && state->scanning) {
+                    ds_voice_player_set_geiger_rate(state->voice_player, 0.0f);
+                }
+            }
+            continue;
+        }
         DSSampleResult sample = ds_sensor_accept(reading, event.timestamp, received,
             event.vector.x, event.vector.y, event.vector.z, event.vector.status);
         if (sample == DS_SAMPLE_REJECTED) continue;
@@ -1827,9 +2696,13 @@ static void poll_sensor(DeadSpeak *state) {
             if (delta_val > 1.2f) {
                 const float clicks = fminf(75.0f, (delta_val - 1.2f) * 7.5f);
                 ds_voice_player_set_geiger_rate(state->voice_player, clicks);
+            } else if (state->proximity_active) {
+                ds_voice_player_set_geiger_rate(state->voice_player, 25.0f);
             } else {
                 ds_voice_player_set_geiger_rate(state->voice_player, 0.0f);
             }
+        } else if (state->scanning && state->proximity_active) {
+            ds_voice_player_set_geiger_rate(state->voice_player, 25.0f);
         } else {
             ds_voice_player_set_geiger_rate(state->voice_player, 0.0f);
         }
@@ -1844,17 +2717,32 @@ static void poll_sensor(DeadSpeak *state) {
             ds_baseline_word_trigger_3d(&state->baseline, reading->xyz[0], reading->xyz[1], reading->xyz[2], moving, reading->timestamp_ns)) {
             const uint8_t *bank = state->custom_selected ? state->custom_blob : state->dictionary;
             const size_t bank_size = state->custom_selected ? state->custom_blob_size : state->dictionary_size;
-            ds_engine_vector_word(state->baseline.triggered_x, state->baseline.triggered_y, state->baseline.triggered_z,
-                                  state->baseline.base_x, state->baseline.base_y, state->baseline.base_z,
-                                  bank, bank_size, state->word, sizeof(state->word));
+            ds_engine_vector_word_entropy(state->baseline.triggered_x, state->baseline.triggered_y, state->baseline.triggered_z,
+                                          state->baseline.base_x, state->baseline.base_y, state->baseline.base_z,
+                                          state->baseline.kinetic_entropy,
+                                          bank, bank_size, state->word, sizeof(state->word));
             if (state->word[0]) {
                 append_word_log(state, state->word);
                 __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
-                    "WORD TRIGGERED: %s (field=%.2f uT delta=%.2f uT vector=%.1f,%.1f,%.1f)",
+                    "WORD TRIGGERED: %s (field=%.2f uT delta=%.2f uT vector=%.1f,%.1f,%.1f whisper=%d)",
                     state->word, state->smoothed_field, state->baseline.triggered_delta,
-                    state->baseline.triggered_x, state->baseline.triggered_y, state->baseline.triggered_z);
+                    state->baseline.triggered_x, state->baseline.triggered_y, state->baseline.triggered_z,
+                    state->baseline.whisper_modulation);
                 if (state->voice_player && state->voice_config.enabled) {
-                    ds_voice_player_speak(state->voice_player, state->word, &state->voice_config);
+                    DSVoiceConfig active_voice = state->voice_config;
+                    const float abs_delta = fabsf(state->baseline.triggered_delta);
+                    if (active_voice.mode == DS_VOICE_MODE_DYNAMIC) {
+                        /* Dynamic Voice Mode: modulate pitch and speed dynamically by anomaly delta */
+                        const float delta_factor = fminf(abs_delta / 40.0f, 1.5f);
+                        active_voice.pitch_hz = 115.0f * (1.0f + delta_factor * 0.45f);
+                        active_voice.speed = 1.0f + delta_factor * 0.35f;
+                        if (state->baseline.whisper_modulation && abs_delta > 10.0f) {
+                            active_voice.mode = DS_VOICE_MODE_WHISPER;
+                        }
+                    } else if (state->baseline.whisper_modulation && active_voice.mode == DS_VOICE_MODE_CLASSIC) {
+                        active_voice.mode = DS_VOICE_MODE_WHISPER;
+                    }
+                    ds_voice_player_speak(state->voice_player, state->word, &active_voice);
                 }
             }
         }
@@ -1913,11 +2801,41 @@ static void maintain_sensors(DeadSpeak *state) {
     }
 }
 
+static bool ds_is_hardware_proximity(const ASensor *sensor) {
+    if (!sensor) return false;
+    const char *name = ASensor_getName(sensor);
+    const char *vendor = ASensor_getVendor(sensor);
+    if (!name || !vendor) return false;
+    char n_low[128], v_low[128];
+    for (size_t i = 0; i < sizeof(n_low) - 1 && name[i]; ++i) n_low[i] = (char)tolower((unsigned char)name[i]);
+    n_low[sizeof(n_low) - 1] = '\0';
+    for (size_t i = 0; i < sizeof(v_low) - 1 && vendor[i]; ++i) v_low[i] = (char)tolower((unsigned char)vendor[i]);
+    v_low[sizeof(v_low) - 1] = '\0';
+    if (strstr(n_low, "virtual") || strstr(n_low, "palm") || strstr(n_low, "gesture") ||
+        strstr(n_low, "software") || strstr(v_low, "elliptic") || strstr(v_low, "software")) {
+        return false;
+    }
+    return true;
+}
+
 static void setup_sensors(DeadSpeak *state) {
     state->sensor_manager = ASensorManager_getInstanceForPackage("org.deadspeak");
     if (!state->sensor_manager) return;
     for (unsigned i = 0; i < DS_SENSOR_COUNT; ++i) {
         state->sensors[i] = ASensorManager_getDefaultSensor(state->sensor_manager, sensor_types[i]);
+        if (!state->sensors[i]) {
+            state->sensors[i] = ASensorManager_getDefaultSensor(state->sensor_manager, sensor_fallback_types[i]);
+            if (state->sensors[i]) {
+                __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+                    "Fallback to uncalibrated sensor %d for %s", sensor_fallback_types[i], sensor_names[i]);
+            }
+        }
+        if (i == 3 && state->sensors[3] && !ds_is_hardware_proximity(state->sensors[3])) {
+            __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
+                "Ignoring virtual/emulated proximity sensor: %s (%s)",
+                ASensor_getName(state->sensors[3]), ASensor_getVendor(state->sensors[3]));
+            state->sensors[3] = NULL;
+        }
         ds_sensor_configure(&state->readings[i], state->sensors[i] != NULL, true, -1, -1, sensor_now_ns());
     }
     state->sensor_queue = ASensorManager_createEventQueue(state->sensor_manager, ALooper_forThread(), LOOPER_ID_SENSOR, NULL, NULL);
@@ -1942,94 +2860,97 @@ static void maintain_camera(DeadSpeak *state) {
 }
 
 void android_main(struct android_app *app) {
-    DeadSpeak state = {0};
-    state.app = app;
-    state.display = EGL_NO_DISPLAY;
-    state.surface = EGL_NO_SURFACE;
-    state.context = EGL_NO_CONTEXT;
-    state.ui_scale = 1.0f;
-    state.scanning = true;
-    state.camera_enabled = true;
-    state.preview_rgba = malloc(DS_PREVIEW_CAPACITY);
-    state.video_filter = DS_VIDEO_FILTER_RAW;
-    state.word[0] = 0;
-    state.voice_config = (DSVoiceConfig){
+    DeadSpeak *state = calloc(1, sizeof(DeadSpeak));
+    if (!state) return;
+    state->app = app;
+    state->display = EGL_NO_DISPLAY;
+    state->surface = EGL_NO_SURFACE;
+    state->context = EGL_NO_CONTEXT;
+    state->ui_scale = 1.0f;
+    state->scanning = true;
+    state->camera_enabled = true;
+    state->preview_rgba = malloc(DS_PREVIEW_CAPACITY);
+    state->video_filter = DS_VIDEO_FILTER_RAW;
+    state->word[0] = 0;
+    state->voice_config = (DSVoiceConfig){
         .enabled = true,
         .mode = DS_VOICE_MODE_CLASSIC,
         .pitch_hz = 115.0f,
         .speed = 1.0f
     };
-    state.voice_player = ds_voice_player_create();
-    ds_motion_filter_init(&state.motion_filter);
-    ds_explore_init(&state.explore);
-    load_dictionary(&state);
-    snprintf(state.evidence_dir, sizeof(state.evidence_dir), "%s/evidence", app->activity->internalDataPath);
-    snprintf(state.word_log_path, sizeof(state.word_log_path), "%s/word-log.csv", state.evidence_dir);
-    snprintf(state.explore_cache_path, sizeof(state.explore_cache_path), "%s/wikipedia-places-v2.tsv", state.evidence_dir);
-    mkdir(state.evidence_dir, 0700);
-    snprintf(state.custom_path, sizeof(state.custom_path), "%s/custom-words.dswb", state.evidence_dir);
-    ds_custom_words_init(&state.custom_words);
-    if (!ds_custom_words_load(&state.custom_words, state.custom_path))
-        LOGE("Custom word bank could not be loaded: %s", ds_custom_words_error_message(&state.custom_words));
-    update_custom_blob(&state);
-    load_word_log(&state);
-    refresh_media_files(&state);
-    app->userData = &state;
+    state->voice_player = ds_voice_player_create();
+    ds_motion_filter_init(&state->motion_filter);
+    ds_explore_init(&state->explore);
+    load_dictionary(state);
+    snprintf(state->evidence_dir, sizeof(state->evidence_dir), "%s/evidence", app->activity->internalDataPath);
+    snprintf(state->word_log_path, sizeof(state->word_log_path), "%s/word-log.csv", state->evidence_dir);
+    snprintf(state->explore_cache_path, sizeof(state->explore_cache_path), "%s/wikipedia-places-v2.tsv", state->evidence_dir);
+    mkdir(state->evidence_dir, 0700);
+    snprintf(state->custom_path, sizeof(state->custom_path), "%s/custom-words.dswb", state->evidence_dir);
+    ds_custom_words_init(&state->custom_words);
+    if (!ds_custom_words_load(&state->custom_words, state->custom_path))
+        LOGE("Custom word bank could not be loaded: %s", ds_custom_words_error_message(&state->custom_words));
+    update_custom_blob(state);
+    load_word_log(state);
+    refresh_media_files(state);
+    app->userData = state;
     app->onAppCmd = handle_cmd;
     app->onInputEvent = handle_input;
-    setup_sensors(&state);
+    setup_sensors(state);
 
     while (true) {
         static uint64_t next_permission_check = 0;
         const uint64_t loop_time = now_millis();
-        maintain_sensors(&state);
-        maintain_camera(&state);
-        if (loop_time >= state.next_media_refresh) {
-            state.next_media_refresh = loop_time + 1000U;
-            refresh_media_files(&state);
+        maintain_sensors(state);
+        maintain_camera(state);
+        if (loop_time >= state->next_media_refresh) {
+            state->next_media_refresh = loop_time + 1000U;
+            refresh_media_files(state);
         }
-        if (state.capture_requested && loop_time >= next_permission_check) {
+        if (state->capture_requested && loop_time >= next_permission_check) {
             next_permission_check = loop_time + 250U;
-            if (has_capture_permissions(&state)) {
-                state.capture_requested = false;
-                state.permission_requested = false;
-                state.camera_enabled = true;
-                state.capture_started_ms = now_millis();
-                start_audio_capture(&state);
-                ds_video_start(&state.video, state.evidence_dir, state.video_filter, state.display_rotation);
-            } else if (loop_time >= state.permission_deadline) {
-                state.capture_requested = false;
-                state.permission_requested = false;
-                atomic_store(&state.audio_failed, true);
+            if (has_capture_permissions(state)) {
+                state->capture_requested = false;
+                state->permission_requested = false;
+                state->camera_enabled = true;
+                state->capture_started_ms = now_millis();
+                start_audio_capture(state);
+                ds_video_start(&state->video, state->evidence_dir, state->video_filter, state->display_rotation);
+            } else if (loop_time >= state->permission_deadline) {
+                state->capture_requested = false;
+                state->permission_requested = false;
+                atomic_store(&state->audio_failed, true);
             }
         }
-        if (state.audio_thread_created && !atomic_load(&state.audio_active)) {
-            pthread_join(state.audio_thread, NULL);
-            state.audio_thread_created = false;
+        if (state->audio_thread_created && !atomic_load(&state->audio_active)) {
+            pthread_join(state->audio_thread, NULL);
+            state->audio_thread_created = false;
         }
         int ident;
         int events;
         struct android_poll_source *source;
-        while ((ident = ALooper_pollOnce(state.display == EGL_NO_DISPLAY ? -1 : 0, NULL, &events, (void **)&source)) >= 0) {
+        while ((ident = ALooper_pollOnce(state->display == EGL_NO_DISPLAY ? -1 : 0, NULL, &events, (void **)&source)) >= 0) {
             if (source) source->process(app, source);
-            if (ident == LOOPER_ID_SENSOR) poll_sensor(&state);
+            if (ident == LOOPER_ID_SENSOR) poll_sensor(state);
             if (app->destroyRequested) {
-                if (state.voice_player) {
-                    ds_voice_player_destroy(state.voice_player);
-                    state.voice_player = NULL;
+                if (state->voice_player) {
+                    ds_voice_player_destroy(state->voice_player);
+                    state->voice_player = NULL;
                 }
-                stop_audio_capture(&state);
-                ds_video_preview_stop(&state.video);
-                stop_sensors(&state, DS_SENSOR_PAUSED);
-                if (state.sensor_manager && state.sensor_queue)
-                    ASensorManager_destroyEventQueue(state.sensor_manager, state.sensor_queue);
-                free(state.dictionary);
-                free(state.preview_rgba);
-                ds_explore_destroy(&state.explore);
-                teardown_display(&state);
+                stop_audio_capture(state);
+                ds_video_preview_stop(&state->video);
+                stop_sensors(state, DS_SENSOR_PAUSED);
+                if (state->sensor_manager && state->sensor_queue)
+                    ASensorManager_destroyEventQueue(state->sensor_manager, state->sensor_queue);
+                free(state->dictionary);
+                free(state->preview_rgba);
+                ds_explore_destroy(&state->explore);
+                teardown_display(state);
+                app->userData = NULL;
+                free(state);
                 return;
             }
         }
-        if (state.display != EGL_NO_DISPLAY && state.surface != EGL_NO_SURFACE && state.width > 0 && state.height > 0) draw_frame(&state);
+        if (state->display != EGL_NO_DISPLAY && state->surface != EGL_NO_SURFACE && state->width > 0 && state->height > 0) draw_frame(state);
     }
 }

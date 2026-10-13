@@ -350,6 +350,41 @@ bool ds_voice_player_is_playing_wav(const DSVoicePlayer *p, char *out_name, size
     return playing;
 }
 
+uint64_t ds_voice_player_get_wav_position_ms(const DSVoicePlayer *p) {
+    if (!p) return 0;
+    DSVoicePlayer *mutable_p = (DSVoicePlayer *)p;
+    pthread_mutex_lock(&mutable_p->mutex);
+    uint64_t pos_ms = 0;
+    if (mutable_p->wav_total_samples > 0) {
+        pos_ms = (uint64_t)mutable_p->wav_current_sample * 1000ULL / DS_VOICE_SAMPLE_RATE;
+    }
+    pthread_mutex_unlock(&mutable_p->mutex);
+    return pos_ms;
+}
+
+uint64_t ds_voice_player_get_wav_duration_ms(const DSVoicePlayer *p) {
+    if (!p) return 0;
+    DSVoicePlayer *mutable_p = (DSVoicePlayer *)p;
+    pthread_mutex_lock(&mutable_p->mutex);
+    uint64_t dur_ms = 0;
+    if (mutable_p->wav_total_samples > 0) {
+        dur_ms = (uint64_t)mutable_p->wav_total_samples * 1000ULL / DS_VOICE_SAMPLE_RATE;
+    }
+    pthread_mutex_unlock(&mutable_p->mutex);
+    return dur_ms;
+}
+
+void ds_voice_player_seek_wav_ms(DSVoicePlayer *p, uint64_t position_ms) {
+    if (!p) return;
+    pthread_mutex_lock(&p->mutex);
+    if (p->wav_total_samples > 0) {
+        size_t target_sample = (size_t)(position_ms * (uint64_t)DS_VOICE_SAMPLE_RATE / 1000ULL);
+        if (target_sample > p->wav_total_samples) target_sample = p->wav_total_samples;
+        p->wav_current_sample = target_sample;
+    }
+    pthread_mutex_unlock(&p->mutex);
+}
+
 void ds_voice_player_stop(DSVoicePlayer *p) {
     if (!p) return;
     atomic_store(&p->stop_requested, true);

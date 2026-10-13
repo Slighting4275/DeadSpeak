@@ -11,7 +11,7 @@ typedef struct {
     bool attached;
 } DSJniScope;
 
-static inline bool ds_jni_scope_begin(DSJniScope *scope, ANativeActivity *activity) {
+static inline bool ds_jni_scope_begin(DSJniScope *scope, const ANativeActivity *activity) {
     *scope = (DSJniScope){0};
     if (!activity || !activity->vm || !activity->clazz) return false;
     scope->vm = activity->vm;

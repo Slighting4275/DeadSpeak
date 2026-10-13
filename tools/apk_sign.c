@@ -350,7 +350,7 @@ done:
     if (!ok) return fail(signing ? "RSA signing failed" : "RSA signature verification failed");
     return true;
 }
-static bool verify_apk(Apk *apk) {
+static bool verify_apk(const Apk *apk) {
     Slice block = apk->v2, signers, signer, signed_data, signatures, public_key, record, signature, id;
     if (!take_lp(&block, &signers) || block.n || !take_lp(&signers, &signer) || signers.n ||
         !take_lp(&signer, &signed_data) || !take_lp(&signer, &signatures) || !take_lp(&signer, &public_key) || signer.n ||

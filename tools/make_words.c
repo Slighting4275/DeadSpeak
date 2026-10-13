@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define MAX_WORDS 6000
+#define MAX_WORDS 8192
 #define WORD_BYTES 32
 
 static const char *words[] = {
@@ -12,6 +12,12 @@ static const char *words[] = {
     "ASH", "LISTEN", "LANTERN", "ECHO", "ROOM", "WINTER", "RETURN", "QUIET",
     "ORCHARD", "DUST", "DOOR", "REMEMBER", "WATCH", "CANDLE", "NIGHT", "WEST",
     "BENEATH", "HOME", "VAULT", "RAIN", "SILENCE", "CLOSE", "WITNESS", "TIDE",
+    /* Paranormal investigation vocabulary */
+    "APPARITION", "POLTERGEIST", "HAUNTED", "CEMETERY", "SPECTER", "PORTAL",
+    "PARANORMAL", "ENTITY", "PHANTOM", "ECTOPLASM", "COLD", "SHADOW",
+    "SPIRIT", "DARKNESS", "TRAPPED", "WHISPER", "RESIDUAL", "MANIFEST",
+    "HELP", "RUN", "BEHIND", "WATCHING", "BURIED", "GRAVE", "CORRIDOR",
+    "ATTIC", "BASEMENT", "PASSING", "PRESENCE", "WARNING", "VOICES", "DANGER",
     /* English names */
     "ALEX", "JORDAN", "RILEY", "MORGAN", "JAMIE", "TAYLOR", "SAM", "CASEY",
     /* Spanish */
@@ -58,6 +64,8 @@ static const char *words[] = {
     "BUNA", "CASA", "LUMINA", "APA", "NOAPTE", "MARIA", "ION", "ELENA",
     /* Indonesian */
     "HALO", "RUMAH", "CAHAYA", "AIR", "MALAM", "SITI", "BUDI", "PUTRI",
+    /* Extended paranormal and environmental lexicon */
+#include "extended_words.h"
 };
 
 static int write_u16(FILE *file, uint16_t value) {

@@ -10,9 +10,10 @@ extern "C" {
 #endif
 
 typedef enum {
-    DS_VOICE_MODE_CLASSIC = 0,   /* Eerie resonant formant voice */
-    DS_VOICE_MODE_WHISPER = 1,   /* Breathy spectral whisper */
-    DS_VOICE_MODE_SPIRIT_BOX = 2 /* Resonant formant sweeps with radio static */
+    DS_VOICE_MODE_CLASSIC = 0,    /* Eerie resonant formant voice */
+    DS_VOICE_MODE_WHISPER = 1,    /* Breathy spectral whisper */
+    DS_VOICE_MODE_DYNAMIC = 2,    /* Dynamic EMF-anomaly modulated reactive pitch and rate */
+    DS_VOICE_MODE_SPIRIT_BOX = 3  /* Resonant formant sweeps with radio static */
 } DSVoiceMode;
 
 typedef struct {

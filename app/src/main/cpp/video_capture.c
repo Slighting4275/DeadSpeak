@@ -421,13 +421,13 @@ static bool pump_encoder(DSVideoWorker *w, int64_t timeout_us) {
 }
 
 static bool close_encoder(DSVideoWorker *w, bool finalize) {
-    bool okay = finalize;
+    bool okay = false;
     if (finalize && w->codec_started) {
         okay = media_ok(w, AMediaCodec_signalEndOfInputStream(w->codec), "signal encoder EOS");
         const int64_t deadline = clock_ns(CLOCK_MONOTONIC) + INT64_C(3000000000);
         while (okay && !w->saw_eos && clock_ns(CLOCK_MONOTONIC) < deadline) okay = pump_encoder(w, 10000);
         okay = okay && w->saw_eos && w->saw_frame && w->muxer_started;
-    } else okay = false;
+    }
     if (w->muxer) {
         if (w->muxer_started && !media_ok(w, AMediaMuxer_stop(w->muxer), "finalize MP4")) okay = false;
         AMediaMuxer_delete(w->muxer); w->muxer = NULL;

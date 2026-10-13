@@ -5,3 +5,4 @@ local.properties
 .toolchain/
 .signing/
 .signing-stage-*/
+.bug-check/
