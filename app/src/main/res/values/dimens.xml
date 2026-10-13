@@ -1,0 +1,11 @@
+<resources>
+    <dimen name="text_size_display_xl">48sp</dimen>
+    <dimen name="text_size_display_lg">34sp</dimen>
+    <dimen name="text_size_title_lg">24sp</dimen>
+    <dimen name="text_size_title_md">20sp</dimen>
+    <dimen name="text_size_body_lg">16sp</dimen>
+    <dimen name="text_size_body_md">14sp</dimen>
+    <dimen name="text_size_caption">12sp</dimen>
+    <dimen name="text_size_badge">10sp</dimen>
+    <dimen name="text_size_micro">8sp</dimen>
+</resources>

@@ -32,6 +32,7 @@
 #include "voice_synth.h"
 #include "voice_player.h"
 #include "motion_filter.h"
+#include "typography.h"
 
 #define LOG_TAG "DeadSpeak"
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
@@ -1042,31 +1043,6 @@ static const char *camera_fragment_shader =
     "    }\n"
     "}";
 
-static const uint8_t font[43][7] = {
-    {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}, {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E},
-    {0x0F,0x10,0x10,0x10,0x10,0x10,0x0F}, {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E},
-    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}, {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10},
-    {0x0F,0x10,0x10,0x17,0x11,0x11,0x0F}, {0x11,0x11,0x11,0x1F,0x11,0x11,0x11},
-    {0x1F,0x04,0x04,0x04,0x04,0x04,0x1F}, {0x07,0x02,0x02,0x02,0x12,0x12,0x0C},
-    {0x11,0x12,0x14,0x18,0x14,0x12,0x11}, {0x10,0x10,0x10,0x10,0x10,0x10,0x1F},
-    {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}, {0x11,0x19,0x15,0x13,0x11,0x11,0x11},
-    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},
-    {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}, {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},
-    {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}, {0x1F,0x04,0x04,0x04,0x04,0x04,0x04},
-    {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}, {0x11,0x11,0x11,0x11,0x11,0x0A,0x04},
-    {0x11,0x11,0x11,0x15,0x15,0x1B,0x11}, {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11},
-    {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}, {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F},
-    {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
-    {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}, {0x1E,0x01,0x01,0x0E,0x01,0x01,0x1E},
-    {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, {0x1F,0x10,0x10,0x1E,0x01,0x01,0x1E},
-    {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
-    {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},
-    {0x00,0x00,0x04,0x00,0x00,0x04,0x00}, {0x00,0x00,0x00,0x1F,0x00,0x00,0x00},
-    {0x00,0x00,0x00,0x00,0x00,0x06,0x06}, {0x00,0x04,0x04,0x1F,0x04,0x04,0x00},
-    {0x02,0x04,0x08,0x08,0x08,0x04,0x02}, {0x08,0x04,0x02,0x02,0x02,0x04,0x08},
-    {0x19,0x19,0x02,0x04,0x08,0x13,0x13},
-};
-
 static uint64_t now_millis(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1256,43 +1232,44 @@ static void line(DeadSpeak *state, float x1, float y1, float x2, float y2, float
     glDrawArrays(GL_LINES, 0, 2);
 }
 
-static int glyph_index(char c) {
-    if (c >= 'a' && c <= 'z') c -= ('a' - 'A');
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= '0' && c <= '9') return 26 + (c - '0');
-    if (c == ':') return 36;
-    if (c == '-') return 37;
-    if (c == '.') return 38;
-    if (c == '+') return 39;
-    if (c == '(') return 40;
-    if (c == ')') return 41;
-    if (c == '%') return 42;
-    return -1;
-}
-
-static void text(DeadSpeak *state, const char *value, float x, float y, float scale, float r, float g, float b, float a) {
+static void text_styled(DeadSpeak *state, const char *value, float x, float y, float scale, DSFontType font_type, float r, float g, float b, float a) {
+    if (!value || scale <= 0.0f) return;
     float cursor = x;
-    for (size_t i = 0; value[i] != 0; ++i) {
+    const float pixel_w = (font_type == DS_FONT_BOLD) ? (scale * 1.35f) : scale;
+    const float pixel_h = scale;
+
+    for (size_t i = 0; value[i] != '\0'; ++i) {
         const char ch = value[i];
-        if (ch == ' ') { cursor += 6.0f * scale; continue; }
-        const int index = glyph_index(ch);
-        if (index < 0) { cursor += 6.0f * scale; continue; }
+        const float adv = ds_text_char_advance(ch, scale, font_type);
+        if (ch == ' ') { cursor += adv; continue; }
+        const int index = ds_glyph_index(ch);
+        if (index < 0) { cursor += adv; continue; }
         for (int row = 0; row < 7; ++row) {
+            const uint8_t row_bits = ds_font_bitmap[index][row];
             for (int col = 0; col < 5; ++col) {
-                if ((font[index][row] >> (4 - col)) & 1) {
-                    rect(state, cursor + (float)col * scale, y + (float)row * scale, scale, scale, r, g, b, a);
+                if ((row_bits >> (4 - col)) & 1) {
+                    rect(state, cursor + (float)col * scale, y + (float)row * scale, pixel_w, pixel_h, r, g, b, a);
                 }
             }
         }
-        cursor += 6.0f * scale;
+        cursor += adv;
     }
 }
 
+static void text(DeadSpeak *state, const char *value, float x, float y, float scale, float r, float g, float b, float a) {
+    text_styled(state, value, x, y, scale, DS_FONT_STANDARD, r, g, b, a);
+}
+
+static float fit_text_scale_styled(const char *value, float preferred, float available_width, DSFontType font_type) {
+    return ds_fit_text_scale_styled(value, preferred, available_width, font_type);
+}
+
 static float fit_text_scale(const char *value, float preferred, float available_width) {
-    const size_t length = value ? strlen(value) : 0;
-    if (length == 0) return preferred;
-    const float fit = available_width / ((float)length * 6.0f);
-    return fit < preferred ? fit : preferred;
+    return ds_fit_text_scale_styled(value, preferred, available_width, DS_FONT_STANDARD);
+}
+
+static float text_width(const char *value, float scale, DSFontType font_type) {
+    return ds_text_width(value, scale, font_type);
 }
 
 static void circle(DeadSpeak *state, float cx, float cy, float radius, float r, float g, float b, float a) {
@@ -1328,9 +1305,11 @@ static float body_content_height(const DeadSpeak *state) {
 
 static void custom_button(DeadSpeak *state, DSRect button, const char *label, bool selected) {
     rect(state, button.x, button.y, button.w, button.h, selected ? 0.10f : 0.14f, selected ? 0.32f : 0.18f, selected ? 0.25f : 0.19f, 0.97f);
-    const float scale = fit_text_scale(label, 1.4f, button.w - 10);
-    text(state, label, button.x + (button.w - strlen(label) * 6 * scale) / 2,
-         button.y + (button.h - 7 * scale) / 2, scale, 0.88f, 0.98f, 0.93f, 1);
+    const DSFontType font_type = selected ? DS_FONT_BOLD : DS_FONT_STANDARD;
+    const float scale = fit_text_scale_styled(label, ds_sp_to_scale(DS_FONT_SIZE_BODY_MD), button.w - 10, font_type);
+    const float total_w = text_width(label, scale, font_type);
+    text_styled(state, label, button.x + (button.w - total_w) / 2,
+                button.y + (button.h - 7.0f * scale) / 2, scale, font_type, 0.88f, 0.98f, 0.93f, 1);
 }
 
 static void draw_log(DeadSpeak *state, float panel_r, float panel_g, float panel_b,
@@ -1713,7 +1692,9 @@ static void draw_camera(DeadSpeak *state) {
     }
     if (!state->minimal_hud) {
         rect(state, 0, 0, state->width, 58, 0, 0, 0, 0.6f);
-        text(state, "DEADSPEAK", 16, 18, 2.6f, accent_r, accent_g, accent_b, 1);
+        const float header_max_w = (float)(state->width - 340 - 20);
+        const float header_scale = fit_text_scale_styled("DEADSPEAK", ds_sp_to_scale(DS_FONT_SIZE_BODY_LG), header_max_w, DS_FONT_BOLD);
+        text_styled(state, "DEADSPEAK", 16, 16, header_scale, DS_FONT_BOLD, accent_r, accent_g, accent_b, 1);
 
         /* Top Right Voice Synthesizer, Geiger, Style and Tint Buttons */
         const DSRect spk_btn = {state->width - 76, 12, 68, 34};
@@ -1766,7 +1747,7 @@ static void draw_camera(DeadSpeak *state) {
         else snprintf(status, sizeof(status), "%s", preview_live ? "LIVE CAMERA" :
             !state->camera_enabled ? "CAMERA OFF" : ds_video_failed(&state->video) ? "CAMERA ERROR - TAP CAM" :
             has_camera_permission(state) ? "STARTING CAMERA" : "TAP CAM TO ALLOW CAMERA");
-        text(state, status, 16, 42, 1.0f, recording ? 1 : 0.8f, recording ? 0.25f : 0.9f, recording ? 0.25f : 0.85f, 1);
+        text_styled(state, status, 16, 38, fit_text_scale_styled(status, ds_sp_to_scale(DS_FONT_SIZE_MICRO), header_max_w, DS_FONT_STANDARD), DS_FONT_STANDARD, recording ? 1 : 0.8f, recording ? 0.25f : 0.9f, recording ? 0.25f : 0.85f, 1);
         if (!preview_live) {
             const char *message = state->camera_enabled ? "TAP CAM TO ENABLE OR RETRY" : "CAMERA IS OFF";
             text(state, message, 16, 110, fit_text_scale(message, 1.5f, state->width - 100), 0.8f, 0.9f, 0.85f, 1);
@@ -2008,8 +1989,9 @@ static void draw_camera(DeadSpeak *state) {
     const float word_r = is_moving ? 0.96f : 0.95f;
     const float word_g = is_moving ? 0.75f : 0.98f;
     const float word_b = is_moving ? 0.35f : 0.95f;
-    text(state, primary_word, ui.word.x + 10, ui.word.y + 6, fit_text_scale(primary_word, 1.75f, ui.word.w - 20), word_r, word_g, word_b, 1);
-    text(state, sub_text, ui.word.x + 10, ui.word.y + 24, fit_text_scale(sub_text, 0.95f, ui.word.w - 20), 0.65f, 0.85f, 0.78f, 0.9f);
+    const float card_word_scale = fit_text_scale_styled(primary_word, ds_sp_to_scale(DS_FONT_SIZE_BODY_LG), ui.word.w - 20, DS_FONT_BOLD);
+    text_styled(state, primary_word, ui.word.x + 10, ui.word.y + 6, card_word_scale, DS_FONT_BOLD, word_r, word_g, word_b, 1);
+    text_styled(state, sub_text, ui.word.x + 10, ui.word.y + 24, fit_text_scale_styled(sub_text, ds_sp_to_scale(DS_FONT_SIZE_BADGE), ui.word.w - 20, DS_FONT_STANDARD), DS_FONT_STANDARD, 0.65f, 0.85f, 0.78f, 0.9f);
 
     /* 4. RECORD SHUTTER BUTTON */
     const float cx = ui.record.x + ui.record.w / 2, cy = ui.record.y + ui.record.h / 2;
@@ -2027,13 +2009,15 @@ static void draw_camera(DeadSpeak *state) {
     static const char *const filter_names[] = {"NIGHT", "THERMAL", "EDGE", "MONO", "SEPIA", "RAW"};
     text(state, filter_names[state->video_filter], 16, ui.record.y + 24, 1.2f, 0.9f, 0.95f, 0.92f, 1);
     if (atomic_load(&state->audio_failed) || ds_video_failed(&state->video))
-        text(state, "CAPTURE ERROR", 16, ui.record.y + 44, 1.0f, 1, 0.65f, 0.3f, 1);
+        text_styled(state, "CAPTURE ERROR", 16, ui.record.y + 44, ds_sp_to_scale(DS_FONT_SIZE_BADGE), DS_FONT_BOLD, 1, 0.65f, 0.3f, 1);
     rect(state, ui.navigation.x, ui.navigation.y, ui.navigation.w, ui.navigation.h, 0, 0, 0, 0.82f);
     const char *nav[] = {"CAMERA", "LOG", "EXPLORE", "GUIDE"};
     for (unsigned i = 0; i < 4; ++i) {
-        const float scale = fit_text_scale(nav[i], 1.2f, state->width / 4.0f - 12);
-        text(state, nav[i], state->width * (i + 0.5f) / 4 - strlen(nav[i]) * 3 * scale,
-             ui.navigation.y + 20, scale, 0.8f, 0.95f, 0.86f, 1);
+        const float nav_scale = ds_sp_to_scale(i == 0 ? DS_FONT_SIZE_BODY_MD : DS_FONT_SIZE_CAPTION);
+        const DSFontType nav_font = i == 0 ? DS_FONT_BOLD : DS_FONT_STANDARD;
+        const float total_w = text_width(nav[i], nav_scale, nav_font);
+        text_styled(state, nav[i], state->width * (i + 0.5f) / 4.0f - total_w / 2.0f,
+                    ui.navigation.y + 20, nav_scale, nav_font, 0.8f, 0.95f, 0.86f, 1);
     }
     if (state->custom_open) draw_custom_words(state);
 }
@@ -2063,7 +2047,7 @@ static void draw_frame(DeadSpeak *state) {
     const float header_offset = state->ui.compact ? -8.0f : 0.0f;
     rect(state, 18, 22 + header_offset, 22, 22, mint_r, mint_g, mint_b, 0.9f);
     rect(state, 23, 27 + header_offset, 12, 12, 0.027f, 0.043f, 0.047f, 1.0f);
-    text(state, "DEADSPEAK", 50, 24 + header_offset, fit_text_scale("DEADSPEAK", 3.0f, w - 68.0f), mint_r, mint_g, mint_b, 1.0f);
+    text_styled(state, "DEADSPEAK", 50, 24 + header_offset, fit_text_scale_styled("DEADSPEAK", ds_sp_to_scale(DS_FONT_SIZE_TITLE_LG), w - 68.0f, DS_FONT_BOLD), DS_FONT_BOLD, mint_r, mint_g, mint_b, 1.0f);
     const char *author = "EXALTED6165 LABS";
     const float author_scale = fit_text_scale(author, 1.3f, (w - 68.0f) * 0.46f);
     text(state, author, 50, 49 + header_offset, author_scale, muted_r, muted_g, muted_b, 1.0f);
@@ -2075,13 +2059,14 @@ static void draw_frame(DeadSpeak *state) {
 
     const char *screen_title = state->tab == 0 ? "FIELD SCAN" : (state->tab == 1 ? "EVIDENCE LOG" :
                                (state->tab == 2 ? "EXPLORE" : "FIELD GUIDE"));
-    text(state, screen_title, 22, state->ui.title_y, fit_text_scale(screen_title, state->ui.compact ? 2.4f : 3.4f, w - 44), 0.95f, 0.98f, 0.94f, 1.0f);
+    const float title_scale = fit_text_scale_styled(screen_title, state->ui.compact ? ds_sp_to_scale(DS_FONT_SIZE_TITLE_MD) : ds_sp_to_scale(DS_FONT_SIZE_TITLE_LG), w - 44, DS_FONT_BOLD);
+    text_styled(state, screen_title, 22, state->ui.title_y, title_scale, DS_FONT_BOLD, 0.95f, 0.98f, 0.94f, 1.0f);
     if (state->tab == 2) {
-        text(state, "PUBLIC REPORTS - NOT VERIFIED CLAIMS", 22, state->ui.subtitle_y, fit_text_scale("PUBLIC REPORTS - NOT VERIFIED CLAIMS", 1.05f, w - 44), amber_r, amber_g, amber_b, 1.0f);
+        text_styled(state, "PUBLIC REPORTS - NOT VERIFIED CLAIMS", 22, state->ui.subtitle_y, fit_text_scale_styled("PUBLIC REPORTS - NOT VERIFIED CLAIMS", ds_sp_to_scale(DS_FONT_SIZE_BADGE), w - 44, DS_FONT_STANDARD), DS_FONT_STANDARD, amber_r, amber_g, amber_b, 1.0f);
     } else {
         char sensor_label[64];
         snprintf(sensor_label, sizeof(sensor_label), "MAGNETOMETER %s", ds_sensor_status_name(state->readings[0].status));
-        text(state, sensor_label, 22, state->ui.subtitle_y, fit_text_scale(sensor_label, state->ui.compact ? 1.1f : 1.5f, w - 44), magnetic_live ? mint_r : amber_r, magnetic_live ? mint_g : amber_g, magnetic_live ? mint_b : amber_b, 1.0f);
+        text_styled(state, sensor_label, 22, state->ui.subtitle_y, fit_text_scale_styled(sensor_label, state->ui.compact ? ds_sp_to_scale(DS_FONT_SIZE_CAPTION) : ds_sp_to_scale(DS_FONT_SIZE_BODY_MD), w - 44, DS_FONT_STANDARD), DS_FONT_STANDARD, magnetic_live ? mint_r : amber_r, magnetic_live ? mint_g : amber_g, magnetic_live ? mint_b : amber_b, 1.0f);
     }
 
     const DSRect body = state->ui.body;
@@ -2129,11 +2114,13 @@ static void draw_frame(DeadSpeak *state) {
     char value[32];
     if (magnetic_live) snprintf(value, sizeof(value), "%05.1f", state->magnetic_field);
     else snprintf(value, sizeof(value), "%s", ds_sensor_status_name(state->readings[0].status));
-    const float value_scale = fit_text_scale(value, 5.0f, field.w - 84.0f);
-    const float value_width = (float)strlen(value) * 6.0f * value_scale;
-    const float value_x = cx - (value_width + 12.0f + 2.0f * 6.0f * 1.6f) * 0.5f;
-    text(state, value, value_x, cy - value_scale * 3.5f, value_scale, 0.95f, 0.98f, 0.94f, 1.0f);
-    if (magnetic_live) text(state, "UT", value_x + value_width + 12.0f, cy - 5.6f, 1.6f, muted_r, muted_g, muted_b, 1.0f);
+    const float value_scale = fit_text_scale_styled(value, ds_sp_to_scale(DS_FONT_SIZE_DISPLAY_XL), field.w - 84.0f, DS_FONT_MONO);
+    const float value_width = text_width(value, value_scale, DS_FONT_MONO);
+    const float ut_scale = ds_sp_to_scale(DS_FONT_SIZE_BODY_LG);
+    const float ut_width = text_width("UT", ut_scale, DS_FONT_STANDARD);
+    const float value_x = cx - (value_width + 12.0f + ut_width) * 0.5f;
+    text_styled(state, value, value_x, cy - value_scale * 3.5f, value_scale, DS_FONT_MONO, 0.95f, 0.98f, 0.94f, 1.0f);
+    if (magnetic_live) text_styled(state, "UT", value_x + value_width + 12.0f, cy - 5.6f, ut_scale, DS_FONT_STANDARD, muted_r, muted_g, muted_b, 1.0f);
 
     const float signal_width = (field.w - 36) * (magnetic_live ? state->signal : 0.0f);
     rect(state, field.x + 18, field.y + field.h - 36, field.w - 36, 4, 0.14f, 0.20f, 0.20f, 1.0f);
@@ -2142,29 +2129,31 @@ static void draw_frame(DeadSpeak *state) {
     snprintf(motion_label, sizeof(motion_label), "ACCEL %s  GYRO %s", ds_sensor_status_name(state->readings[1].status), ds_sensor_status_name(state->readings[2].status));
     text(state, motion_label, field.x + 18, field.y + field.h - 20,
          fit_text_scale(motion_label, 1.0f, field.w - 110), muted_r, muted_g, muted_b, 1.0f);
-    text(state, state->scanning ? "SCANNING" : "STANDBY", field.x + field.w - 72, field.y + field.h - 20, 1.2f, state->scanning ? mint_r : amber_r, state->scanning ? mint_g : amber_g, state->scanning ? mint_b : amber_b, 1.0f);
+    text_styled(state, state->scanning ? "SCANNING" : "STANDBY", field.x + field.w - 76, field.y + field.h - 20, ds_sp_to_scale(DS_FONT_SIZE_CAPTION), DS_FONT_BOLD, state->scanning ? mint_r : amber_r, state->scanning ? mint_g : amber_g, state->scanning ? mint_b : amber_b, 1.0f);
 
     rect(state, word.x, word.y, word.w, word.h, panel_r, panel_g, panel_b, 1.0f);
-    text(state, "SIGNAL WORD", word.x + 14, word.y + 20, fit_text_scale("SIGNAL WORD", 1.4f, word.w - 28), muted_r, muted_g, muted_b, 1.0f);
+    text_styled(state, "SIGNAL WORD", word.x + 14, word.y + 20, fit_text_scale_styled("SIGNAL WORD", ds_sp_to_scale(DS_FONT_SIZE_BODY_MD), word.w - 28, DS_FONT_STANDARD), DS_FONT_STANDARD, muted_r, muted_g, muted_b, 1.0f);
     const char *word_label = magnetic_live ? (state->word[0] ? state->word : "QUIET") : "NO SENSOR DATA";
     const float word_width = word.w - 28.0f;
-    text(state, word_label, word.x + 14, word.y + word.h * 0.43f, fit_text_scale(word_label, 3.8f, word_width), mint_r, mint_g, mint_b, 1.0f);
-    text(state, "ENVIRONMENTAL TRIGGER", word.x + 14, word.y + word.h - 25, fit_text_scale("ENVIRONMENTAL TRIGGER", 1.15f, word_width), muted_r, muted_g, muted_b, 1.0f);
+    const float word_scale = fit_text_scale_styled(word_label, ds_sp_to_scale(DS_FONT_SIZE_DISPLAY_LG), word_width, DS_FONT_BOLD);
+    text_styled(state, word_label, word.x + 14, word.y + word.h * 0.43f, word_scale, DS_FONT_BOLD, mint_r, mint_g, mint_b, 1.0f);
+    text_styled(state, "ENVIRONMENTAL TRIGGER", word.x + 14, word.y + word.h - 25, fit_text_scale_styled("ENVIRONMENTAL TRIGGER", ds_sp_to_scale(DS_FONT_SIZE_BADGE), word_width, DS_FONT_STANDARD), DS_FONT_STANDARD, muted_r, muted_g, muted_b, 1.0f);
 
     const float second_x = capture.x;
     rect(state, capture.x, capture.y, capture.w, capture.h, panel_r, panel_g, panel_b, 1.0f);
-    text(state, "CAPTURE", second_x + 14, capture.y + 20, 1.4f, muted_r, muted_g, muted_b, 1.0f);
+    text_styled(state, "CAPTURE", second_x + 14, capture.y + 20, ds_sp_to_scale(DS_FONT_SIZE_BODY_MD), DS_FONT_STANDARD, muted_r, muted_g, muted_b, 1.0f);
     const bool audio_active = atomic_load(&state->audio_active);
     const bool video_active = ds_video_active(&state->video);
     const bool capture_active = audio_active || video_active;
     const bool capture_failed = atomic_load(&state->audio_failed) || ds_video_failed(&state->video);
     const char *capture_label = capture_active ? "LIVE" : (state->capture_requested ? "ALLOW ACCESS" : (capture_failed ? "ERROR" : "READY"));
     const float capture_width = capture.w - 28.0f;
-    text(state, capture_label, second_x + 14, capture.y + capture.h * 0.43f, fit_text_scale(capture_label, 3.2f, capture_width), capture_active ? amber_r : (capture_failed ? amber_r : mint_r), capture_active ? amber_g : (capture_failed ? amber_g : mint_g), capture_active ? amber_b : (capture_failed ? amber_b : mint_b), 1.0f);
+    const float capture_scale = fit_text_scale_styled(capture_label, ds_sp_to_scale(DS_FONT_SIZE_DISPLAY_LG), capture_width, DS_FONT_BOLD);
+    text_styled(state, capture_label, second_x + 14, capture.y + capture.h * 0.43f, capture_scale, DS_FONT_BOLD, capture_active ? amber_r : (capture_failed ? amber_r : mint_r), capture_active ? amber_g : (capture_failed ? amber_g : mint_g), capture_active ? amber_b : (capture_failed ? amber_b : mint_b), 1.0f);
     static const char *const filter_names[] = {"NIGHT", "THERMAL", "EDGE", "MONO", "SEPIA", "RAW"};
     char filter_label[32];
     snprintf(filter_label, sizeof(filter_label), "FILTER: %s", filter_names[state->video_filter]);
-    text(state, filter_label, second_x + 14, capture.y + capture.h - 25, fit_text_scale(filter_label, 1.05f, capture_width), muted_r, muted_g, muted_b, 1.0f);
+    text_styled(state, filter_label, second_x + 14, capture.y + capture.h - 25, fit_text_scale_styled(filter_label, ds_sp_to_scale(DS_FONT_SIZE_BADGE), capture_width, DS_FONT_STANDARD), DS_FONT_STANDARD, muted_r, muted_g, muted_b, 1.0f);
     const unsigned audio_level = atomic_load(&state->audio_level_milli);
     rect(state, spectrum.x, spectrum.y, spectrum.w, spectrum.h, panel_r, panel_g, panel_b, 1.0f);
     text(state, "MIC", spectrum.x + 14, spectrum.y + 10, 1.0f, muted_r, muted_g, muted_b, 1.0f);
@@ -2194,11 +2183,13 @@ navigation:
     const float nav_y = state->ui.nav_top;
     const float nav_label_y = nav_y + (state->ui.compact ? 15 : 25);
     rect(state, 18, nav_y, w - 36, 1, 0.19f, 0.27f, 0.26f, 0.9f);
-    text(state, "SCAN", w * 0.08f, nav_label_y, 1.2f, state->tab == 0 ? mint_r : muted_r, state->tab == 0 ? mint_g : muted_g, state->tab == 0 ? mint_b : muted_b, 1.0f);
-    text(state, "LOG", w * 0.32f, nav_label_y, 1.2f, state->tab == 1 ? mint_r : muted_r, state->tab == 1 ? mint_g : muted_g, state->tab == 1 ? mint_b : muted_b, 1.0f);
-    text(state, "EXPLORE", w * 0.51f, nav_label_y, 1.1f, state->tab == 2 ? mint_r : muted_r, state->tab == 2 ? mint_g : muted_g, state->tab == 2 ? mint_b : muted_b, 1.0f);
-    text(state, "GUIDE", w * 0.81f, nav_label_y, 1.2f, state->tab == 3 ? mint_r : muted_r, state->tab == 3 ? mint_g : muted_g, state->tab == 3 ? mint_b : muted_b, 1.0f);
-    text(state, "SKEPTICISM IS A FEATURE", 22, h - 39, 1.1f, muted_r, muted_g, muted_b, 1.0f);
+    const float nav_active_scale = ds_sp_to_scale(DS_FONT_SIZE_BODY_MD);
+    const float nav_inactive_scale = ds_sp_to_scale(DS_FONT_SIZE_CAPTION);
+    text_styled(state, "SCAN", w * 0.08f, nav_label_y, state->tab == 0 ? nav_active_scale : nav_inactive_scale, state->tab == 0 ? DS_FONT_BOLD : DS_FONT_STANDARD, state->tab == 0 ? mint_r : muted_r, state->tab == 0 ? mint_g : muted_g, state->tab == 0 ? mint_b : muted_b, 1.0f);
+    text_styled(state, "LOG", w * 0.32f, nav_label_y, state->tab == 1 ? nav_active_scale : nav_inactive_scale, state->tab == 1 ? DS_FONT_BOLD : DS_FONT_STANDARD, state->tab == 1 ? mint_r : muted_r, state->tab == 1 ? mint_g : muted_g, state->tab == 1 ? mint_b : muted_b, 1.0f);
+    text_styled(state, "EXPLORE", w * 0.51f, nav_label_y, state->tab == 2 ? nav_active_scale : nav_inactive_scale, state->tab == 2 ? DS_FONT_BOLD : DS_FONT_STANDARD, state->tab == 2 ? mint_r : muted_r, state->tab == 2 ? mint_g : muted_g, state->tab == 2 ? mint_b : muted_b, 1.0f);
+    text_styled(state, "GUIDE", w * 0.81f, nav_label_y, state->tab == 3 ? nav_active_scale : nav_inactive_scale, state->tab == 3 ? DS_FONT_BOLD : DS_FONT_STANDARD, state->tab == 3 ? mint_r : muted_r, state->tab == 3 ? mint_g : muted_g, state->tab == 3 ? mint_b : muted_b, 1.0f);
+    text_styled(state, "SKEPTICISM IS A FEATURE", 22, h - 39, ds_sp_to_scale(DS_FONT_SIZE_BADGE), DS_FONT_STANDARD, muted_r, muted_g, muted_b, 1.0f);
 
     eglSwapBuffers(state->display, state->surface);
 }
