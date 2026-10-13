@@ -377,7 +377,13 @@ static void copy_file_data(const char *src, const char *dst) {
     if (!out) { fclose(in); return; }
     char buf[1024];
     size_t n;
-    while (!feof(in) && (n = fread(buf, 1, sizeof(buf), in)) > 0) fwrite(buf, 1, n, out);
+    while (!feof(in) && !ferror(in)) {
+        n = fread(buf, 1, sizeof(buf), in);
+        if (n > 0) {
+            if (fwrite(buf, 1, n, out) != n) break;
+        }
+        if (n < sizeof(buf)) break;
+    }
     fflush(out);
     fsync(fileno(out));
     fclose(in);

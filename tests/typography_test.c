@@ -50,6 +50,7 @@ int main(void) {
     /* 6. Verify font atlas unpacking */
     uint8_t *unpacked = malloc(DS_FONT_ATLAS_RAW_SIZE);
     check(unpacked != nullptr, "atlas memory allocation");
+    if (!unpacked) abort();
     ds_font_unpack_atlas(unpacked, DS_FONT_ATLAS_RAW_SIZE);
     bool has_non_zero = false;
     for (size_t i = 0; i < DS_FONT_ATLAS_RAW_SIZE; ++i) {
