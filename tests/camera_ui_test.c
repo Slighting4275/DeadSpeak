@@ -38,6 +38,35 @@ int main(void) {
     assert(!ds_preview_uv(0,480,0,448,997,uv));
     assert(!ds_preview_uv(640,480,45,448,997,uv));
     assert(!ds_preview_uv(640,480,0,NAN,997,uv));
-    printf("PASS: %u camera overlay layouts, shared hit regions and aspect-fill rotations\n", layouts);
+
+    /* Verify gesture classification */
+    assert(ds_classify_gesture(-100.0f, 10.0f, 40.0f) == DS_GESTURE_SWIPE_LEFT);
+    assert(ds_classify_gesture(100.0f, -10.0f, 40.0f) == DS_GESTURE_SWIPE_RIGHT);
+    assert(ds_classify_gesture(5.0f, -80.0f, 40.0f) == DS_GESTURE_SWIPE_UP);
+    assert(ds_classify_gesture(5.0f, 80.0f, 40.0f) == DS_GESTURE_SWIPE_DOWN);
+    assert(ds_classify_gesture(20.0f, 10.0f, 40.0f) == DS_GESTURE_NONE);
+    assert(ds_classify_gesture(50.0f, 50.0f, 40.0f) == DS_GESTURE_NONE);
+
+    /* Verify filter cycling */
+    assert(ds_cycle_filter_index(0, 1, 6) == 1);
+    assert(ds_cycle_filter_index(5, 1, 6) == 0);
+    assert(ds_cycle_filter_index(0, -1, 6) == 5);
+    assert(ds_cycle_filter_index(1, -1, 6) == 0);
+
+    /* Verify filter HUD card and fade calculation */
+    const DSFilterHUD hud_expired = ds_filter_hud(400.0f, 800.0f, 1000U, 1000U);
+    assert(!hud_expired.visible);
+
+    const DSFilterHUD hud_active = ds_filter_hud(400.0f, 800.0f, 2300U, 1000U);
+    assert(hud_active.visible);
+    assert(hud_active.alpha == 1.0f);
+    assert(hud_active.card.w > 0.0f && hud_active.card.h > 0.0f);
+    assert(hud_active.card.x >= 0.0f && hud_active.card.x + hud_active.card.w <= 400.0f);
+
+    const DSFilterHUD hud_fading = ds_filter_hud(400.0f, 800.0f, 2300U, 2150U);
+    assert(hud_fading.visible);
+    assert(fabsf(hud_fading.alpha - 0.5f) < 0.01f);
+
+    printf("PASS: %u camera overlay layouts, shared hit regions, gestures, and filter HUD\n", layouts);
     return 0;
 }

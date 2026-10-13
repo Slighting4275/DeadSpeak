@@ -47,4 +47,56 @@ static inline bool ds_preview_uv(int source_width, int source_height, int rotati
     return true;
 }
 
+#include <stdint.h>
+
+typedef enum {
+    DS_GESTURE_NONE = 0,
+    DS_GESTURE_SWIPE_LEFT,
+    DS_GESTURE_SWIPE_RIGHT,
+    DS_GESTURE_SWIPE_UP,
+    DS_GESTURE_SWIPE_DOWN,
+} DSGesture;
+
+static inline DSGesture ds_classify_gesture(float dx, float dy, float min_swipe_dist) {
+    const float ax = fabsf(dx);
+    const float ay = fabsf(dy);
+    if (ax > ay && ax >= min_swipe_dist) {
+        return dx < 0.0f ? DS_GESTURE_SWIPE_LEFT : DS_GESTURE_SWIPE_RIGHT;
+    }
+    if (ay > ax && ay >= min_swipe_dist) {
+        return dy < 0.0f ? DS_GESTURE_SWIPE_UP : DS_GESTURE_SWIPE_DOWN;
+    }
+    return DS_GESTURE_NONE;
+}
+
+static inline unsigned ds_cycle_filter_index(unsigned current, int direction, unsigned count) {
+    if (count == 0) return 0;
+    if (direction >= 0) {
+        return (current + 1U) % count;
+    } else {
+        return (current + count - 1U) % count;
+    }
+}
+
+typedef struct {
+    DSRect card;
+    float alpha;
+    bool visible;
+} DSFilterHUD;
+
+static inline DSFilterHUD ds_filter_hud(float width, float height, uint64_t deadline_ms, uint64_t now_ms) {
+    DSFilterHUD hud = {0};
+    if (deadline_ms <= now_ms) return hud;
+    const uint64_t remaining = deadline_ms - now_ms;
+    constexpr uint64_t FADE_DURATION_MS = 300U;
+    hud.visible = true;
+    hud.alpha = remaining > FADE_DURATION_MS ? 1.0f : ((float)remaining / (float)FADE_DURATION_MS);
+    const float card_w = fminf(200.0f, width - 40.0f);
+    const float card_h = 88.0f;
+    const float cx = width * 0.5f;
+    const float cy = height * 0.44f;
+    hud.card = (DSRect){cx - card_w * 0.5f, cy - card_h * 0.5f, card_w, card_h};
+    return hud;
+}
+
 #endif

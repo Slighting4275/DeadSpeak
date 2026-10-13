@@ -190,6 +190,7 @@ typedef struct {
     DSVoicePlayer *voice_player;
     DSVideoCapture video;
     DSVideoFilter video_filter;
+    uint64_t filter_hud_deadline;
     DSExplore explore;
     char explore_cache_path[512];
     char explore_query[48];
@@ -1813,6 +1814,81 @@ static void draw_custom_words(DeadSpeak *state) {
     text(state, message, modal.x + 12, modal.y + modal.h - 20, fit_text_scale(message, 1.0f, modal.w - 24), 0.96f, 0.75f, 0.43f, 1);
 }
 
+static void draw_filter_hud(DeadSpeak *state, uint64_t now) {
+    const DSFilterHUD hud = ds_filter_hud((float)state->width, (float)state->height, state->filter_hud_deadline, now);
+    if (!hud.visible || hud.alpha <= 0.001f) return;
+
+    const float alpha = hud.alpha;
+    const DSRect card = hud.card;
+    const float cx = card.x + card.w * 0.5f;
+
+    /* Theme-aware accent colors */
+    float accent_r = 0.92f, accent_g = 0.98f, accent_b = 0.95f;
+    if (state->hud_hue > 0.001f) {
+        ds_interpolate_hud_accent(state->hud_hue, &accent_r, &accent_g, &accent_b);
+    }
+
+    /* Filter metadata */
+    static const struct {
+        const char *title;
+        const char *mode;
+        float r, g, b;
+    } filter_meta[6] = {
+        [DS_VIDEO_FILTER_NIGHT]   = {"NIGHT VISION", "PHOSPHOR GREEN",  0.15f, 1.00f, 0.35f},
+        [DS_VIDEO_FILTER_THERMAL] = {"THERMAL HEAT", "HEATMAP SPECTRUM", 1.00f, 0.55f, 0.15f},
+        [DS_VIDEO_FILTER_EDGE]    = {"EDGE CONTOUR", "SOBEL SPECTRAL",   0.30f, 0.95f, 0.85f},
+        [DS_VIDEO_FILTER_MONO]    = {"MONOCHROME",   "IR CONTRAST",      0.90f, 0.92f, 0.95f},
+        [DS_VIDEO_FILTER_SEPIA]   = {"SEPIA RETRO",  "SPECTRAL WARM",    0.95f, 0.80f, 0.45f},
+        [DS_VIDEO_FILTER_RAW]     = {"RAW SENSOR",   "DIRECT FEED",      0.80f, 0.95f, 0.88f},
+    };
+
+    const unsigned filter_idx = (unsigned)state->video_filter % 6U;
+    const auto meta = filter_meta[filter_idx];
+
+    /* 1. Translucent dark rounded card background */
+    rect(state, card.x, card.y, card.w, card.h, 0.04f, 0.05f, 0.05f, 0.90f * alpha);
+
+    /* 2. Top accent highlight and outer border */
+    line(state, card.x, card.y, card.x + card.w, card.y, accent_r, accent_g, accent_b, 0.90f * alpha);
+    line(state, card.x, card.y + card.h, card.x + card.w, card.y + card.h, 0.20f, 0.28f, 0.25f, 0.70f * alpha);
+    line(state, card.x, card.y, card.x, card.y + card.h, 0.20f, 0.28f, 0.25f, 0.70f * alpha);
+    line(state, card.x + card.w, card.y, card.x + card.w, card.y + card.h, 0.20f, 0.28f, 0.25f, 0.70f * alpha);
+
+    /* 3. Top hint: < SWIPE TO CYCLE > */
+    const float hint_scale = ds_sp_to_scale(DS_FONT_SIZE_BADGE);
+    const float hint_w = text_width("< SWIPE TO CYCLE >", hint_scale, DS_FONT_STANDARD);
+    text_styled(state, "< SWIPE TO CYCLE >", cx - hint_w * 0.5f, card.y + 12.0f, hint_scale,
+                DS_FONT_STANDARD, 0.65f, 0.85f, 0.78f, 0.85f * alpha);
+
+    /* 4. Filter Title in bold */
+    const float title_scale = fit_text_scale_styled(meta.title, ds_sp_to_scale(DS_FONT_SIZE_BODY_LG), card.w - 20.0f, DS_FONT_BOLD);
+    const float title_w = text_width(meta.title, title_scale, DS_FONT_BOLD);
+    text_styled(state, meta.title, cx - title_w * 0.5f, card.y + 32.0f, title_scale,
+                DS_FONT_BOLD, meta.r, meta.g, meta.b, alpha);
+
+    /* 5. Subtitle description */
+    const float sub_scale = ds_sp_to_scale(DS_FONT_SIZE_BADGE);
+    const float sub_w = text_width(meta.mode, sub_scale, DS_FONT_STANDARD);
+    text_styled(state, meta.mode, cx - sub_w * 0.5f, card.y + 54.0f, sub_scale,
+                DS_FONT_STANDARD, 0.75f, 0.88f, 0.82f, 0.80f * alpha);
+
+    /* 6. Filter index pips across the bottom */
+    constexpr unsigned PIP_COUNT = 6U;
+    constexpr float PIP_W = 12.0f;
+    constexpr float PIP_GAP = 5.0f;
+    constexpr float TOTAL_PIPS_W = (float)PIP_COUNT * PIP_W + (float)(PIP_COUNT - 1U) * PIP_GAP;
+    const float start_pip_x = cx - TOTAL_PIPS_W * 0.5f;
+    for (unsigned p = 0; p < PIP_COUNT; ++p) {
+        const bool active = (p == filter_idx);
+        const float px = start_pip_x + (float)p * (PIP_W + PIP_GAP);
+        rect(state, px, card.y + 72.0f, PIP_W, 3.0f,
+             active ? accent_r : 0.22f,
+             active ? accent_g : 0.28f,
+             active ? accent_b : 0.26f,
+             active ? 0.95f * alpha : 0.45f * alpha);
+    }
+}
+
 static void draw_camera(DeadSpeak *state) {
     const DSCameraUI ui = state->camera_ui;
     const uint64_t now = now_millis();
@@ -2179,6 +2255,7 @@ static void draw_camera(DeadSpeak *state) {
         text_styled(state, nav[i], state->width * (i + 0.5f) / 4.0f - total_w / 2.0f,
                     ui.navigation.y + 20, nav_scale, nav_font, 0.8f, 0.95f, 0.86f, 1);
     }
+    draw_filter_hud(state, now);
     if (state->custom_open) draw_custom_words(state);
 }
 
@@ -2541,8 +2618,10 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
         if (fabsf(y - state->touch_start_y) > 8.0f || fabsf(x - state->touch_start_x) > 8.0f)
             state->touch_dragged = true;
         if (state->touch_dragged && state->tab != 0) {
-            state->scroll[state->tab] = fminf(ds_scroll_limit(body_content_height(state), state->ui.body),
-                fmaxf(0.0f, state->scroll[state->tab] + state->touch_y - y));
+            if (fabsf(y - state->touch_start_y) >= fabsf(x - state->touch_start_x) * 0.8f) {
+                state->scroll[state->tab] = fminf(ds_scroll_limit(body_content_height(state), state->ui.body),
+                    fmaxf(0.0f, state->scroll[state->tab] + state->touch_y - y));
+            }
         }
         state->touch_y = y;
         return 1;
@@ -2558,18 +2637,40 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
         state->touch_dragged = true;
     state->touch_active = false;
     if (state->touch_dragged) {
+        const float dx = x - state->touch_start_x;
+        const float dy = y - state->touch_start_y;
+        const DSGesture gesture = ds_classify_gesture(dx, dy, 40.0f);
         if (state->tab == 0) {
-            const float dx = x - state->touch_start_x;
-            const float dy = y - state->touch_start_y;
-            if (fabsf(dx) > 40.0f && fabsf(dy) < 70.0f && !ds_video_active(&state->video) && !atomic_load(&state->audio_active)) {
-                ds_video_preview_stop(&state->video);
-                state->preview_received_ms = 0;
-                if (dx < 0) {
-                    state->video_filter = (DSVideoFilter)(((unsigned)state->video_filter + 1U) % 6U);
-                } else {
-                    state->video_filter = (DSVideoFilter)(((unsigned)state->video_filter + 5U) % 6U);
+            if (gesture == DS_GESTURE_SWIPE_LEFT) {
+                state->video_filter = (DSVideoFilter)ds_cycle_filter_index((unsigned)state->video_filter, 1, 6);
+                state->filter_hud_deadline = now_millis() + 1300U;
+                return 1;
+            } else if (gesture == DS_GESTURE_SWIPE_RIGHT) {
+                state->video_filter = (DSVideoFilter)ds_cycle_filter_index((unsigned)state->video_filter, -1, 6);
+                state->filter_hud_deadline = now_millis() + 1300U;
+                return 1;
+            } else if (gesture == DS_GESTURE_SWIPE_UP) {
+                state->sensor_details = !state->sensor_details;
+                return 1;
+            }
+        } else {
+            if (gesture == DS_GESTURE_SWIPE_LEFT) {
+                const int previous_tab = state->tab;
+                state->tab = (state->tab + 1) % 4;
+                if (previous_tab == 2 && state->explore_search_active) {
+                    state->explore_search_active = false;
+                    ANativeActivity_hideSoftInput(state->app->activity, ANATIVEACTIVITY_HIDE_SOFT_INPUT_NOT_ALWAYS);
                 }
-                state->camera_enabled = true;
+                if (state->tab == 2) start_explore(state);
+                return 1;
+            } else if (gesture == DS_GESTURE_SWIPE_RIGHT) {
+                const int previous_tab = state->tab;
+                state->tab = (state->tab + 3) % 4;
+                if (previous_tab == 2 && state->explore_search_active) {
+                    state->explore_search_active = false;
+                    ANativeActivity_hideSoftInput(state->app->activity, ANATIVEACTIVITY_HIDE_SOFT_INPUT_NOT_ALWAYS);
+                }
+                if (state->tab == 2) start_explore(state);
                 return 1;
             }
         }
@@ -2619,13 +2720,16 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
                     }
                 }
             } else if (i == 1) { state->scanning = !state->scanning; state->word[0] = 0; }
-            else if (i == 2 && !ds_video_active(&state->video) && !atomic_load(&state->audio_active)) {
-                ds_video_preview_stop(&state->video);
-                state->preview_received_ms = 0;
-                state->video_filter = (DSVideoFilter)(((unsigned)state->video_filter + 1U) % 6U);
-                state->camera_enabled = true;
+            else if (i == 2) {
+                state->video_filter = (DSVideoFilter)ds_cycle_filter_index((unsigned)state->video_filter, 1, 6);
+                state->filter_hud_deadline = now_millis() + 1300U;
             } else if (i == 3) { state->custom_open = true; state->custom_editing = false; state->custom_message[0] = 0; }
             else if (i == 4) state->sensor_details = !state->sensor_details;
+            return 1;
+        }
+        if (x < 140.0f && y >= state->camera_ui.record.y && y <= state->camera_ui.record.y + 50.0f) {
+            state->video_filter = (DSVideoFilter)ds_cycle_filter_index((unsigned)state->video_filter, 1, 6);
+            state->filter_hud_deadline = now_millis() + 1300U;
             return 1;
         }
         if (state->sensor_details && !state->minimal_hud && ds_rect_contains((DSRect){20, (state->height < 650 ? 76 : 142) + 84, 112, 40}, x, y)) {
@@ -2771,7 +2875,8 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
         }
     } else if (state->tab == 0 && ds_rect_contains(state->ui.capture, x, y) &&
                y >= state->ui.capture.y + state->ui.capture.h - 44.0f) {
-        state->video_filter = (DSVideoFilter)(((unsigned)state->video_filter + 1U) % 6U);
+        state->video_filter = (DSVideoFilter)ds_cycle_filter_index((unsigned)state->video_filter, 1, 6);
+        state->filter_hud_deadline = now_millis() + 1300U;
     } else if (state->tab == 0 && ds_rect_contains(state->ui.capture, x, y)) {
         if (atomic_load(&state->audio_active) || ds_video_active(&state->video) || state->capture_requested) {
             state->capture_requested = false;
