@@ -85,4 +85,60 @@ static inline const char *ds_sensor_status_name(DSSensorStatus status) {
     }
     return "BLOCKED";
 }
+
+#define DS_PROXIMITY_HOLD_MS UINT64_C(2500)
+
+typedef struct {
+    float baseline_cm;
+    float distance_cm;
+    bool baseline_ready;
+    bool near_active;
+    uint32_t break_count;
+    uint64_t hold_until_ms;
+} DSProximityState;
+
+static inline void ds_proximity_init(DSProximityState *p) {
+    if (!p) return;
+    *p = (DSProximityState){0};
+}
+
+static inline bool ds_proximity_update(DSProximityState *p, float distance_cm, uint64_t now_ms) {
+    if (!p || !isfinite(distance_cm) || distance_cm < 0.0f) return false;
+    p->distance_cm = distance_cm;
+    if (!p->baseline_ready && distance_cm > 0.0f) {
+        p->baseline_cm = distance_cm;
+        p->baseline_ready = true;
+    } else if (p->baseline_ready && distance_cm > p->baseline_cm) {
+        p->baseline_cm = distance_cm;
+    }
+    const bool near_now = (distance_cm < 4.0f) ||
+        (p->baseline_ready && p->baseline_cm >= 3.0f && distance_cm < p->baseline_cm * 0.65f);
+    const bool was_near = p->near_active;
+    p->near_active = near_now;
+    if (near_now) {
+        p->hold_until_ms = now_ms + DS_PROXIMITY_HOLD_MS;
+        if (!was_near) {
+            if (p->break_count < UINT32_MAX) ++p->break_count;
+            return true;
+        }
+    } else if (was_near) {
+        p->hold_until_ms = now_ms + DS_PROXIMITY_HOLD_MS;
+    }
+    return false;
+}
+
+static inline float ds_proximity_surge(const DSProximityState *p, uint64_t now_ms) {
+    if (!p) return 0.0f;
+    if (p->near_active) return 1.0f;
+    if (p->hold_until_ms > now_ms) {
+        const float frac = (float)(p->hold_until_ms - now_ms) / (float)DS_PROXIMITY_HOLD_MS;
+        return frac > 1.0f ? 1.0f : (frac < 0.0f ? 0.0f : frac);
+    }
+    return 0.0f;
+}
+
+static inline float ds_proximity_delta(const DSProximityState *p) {
+    if (!p || !p->baseline_ready) return 0.0f;
+    return p->distance_cm - p->baseline_cm;
+}
 #endif

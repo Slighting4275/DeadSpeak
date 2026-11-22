@@ -112,6 +112,72 @@ int main(void) {
     assert(fgets(line, sizeof(line), tf) != NULL);
     assert(strcmp(line, "4500,3\n") == 0);
     fclose(tf);
+
+    /* 6. Timeline tag parsing, waveform resampling & scrub math */
+    DSTimelineMarker markers[8];
+    const size_t n_markers = ds_parse_tags_file(tags_path, markers, 8);
+    assert(n_markers == 2);
+    assert(markers[0].timestamp_ms == 1250ULL && markers[0].tag_id == 3U);
+    assert(markers[1].timestamp_ms == 4500ULL && markers[1].tag_id == 3U);
+    assert(ds_find_nearest_marker(markers, n_markers, 1300ULL, 250ULL) == 0);
+    assert(ds_find_nearest_marker(markers, n_markers, 2500ULL, 250ULL) == -1);
+    assert(ds_scrub_fraction_to_ms(-0.5f, 10000ULL) == 0ULL);
+    assert(ds_scrub_fraction_to_ms(0.5f, 10000ULL) == 5000ULL);
+    assert(ds_scrub_fraction_to_ms(1.5f, 10000ULL) == 10000ULL);
+
+    const char *wf_path = "build/host/evp_ops_wf_test.txt";
+    unlink(wf_path);
+    FILE *wff = fopen(wf_path, "w");
+    assert(wff != NULL);
+    fputs("0,0.10\n250,0.90\n500,0.20\n750,0.60\n", wff);
+    fclose(wff);
+    float wf_bars[8] = {0};
+    uint64_t wf_dur = 0;
+    const size_t wf_n = ds_resample_waveform_file(wf_path, wf_bars, 8, &wf_dur);
+    assert(wf_n == 4 && wf_dur == 750ULL);
+    assert(fabsf(wf_bars[1] - 0.90f) < 0.01f);
+    unlink(wf_path);
+
+    /* 7. Multi-band EQ smoother & peak-hold tracker */
+    DSEqMeterState eq = {0};
+    const float hot[8] = {0.8f, 0.6f, 0.4f, 0.2f, 0.9f, 0.5f, 0.3f, 0.1f};
+    ds_eq_meter_update(&eq, hot, 33.0f);
+    assert(eq.levels[0] > 0.3f && eq.peaks[0] >= eq.levels[0]);
+    const float peak0 = eq.peaks[0];
+    const float quiet[8] = {0};
+    ds_eq_meter_update(&eq, quiet, 100.0f);
+    assert(eq.levels[0] < hot[0] && fabsf(eq.peaks[0] - peak0) < 0.001f);
+    ds_eq_meter_update(&eq, quiet, 600.0f);
+    assert(eq.peaks[0] < peak0);
+
+    /* 8. Snapshot pan/zoom UV + brightness/contrast/filter edit & atomic export */
+    DSSnapEditParams ed = ds_snap_edit_defaults();
+    assert(ed.zoom == 1.0f && ed.pan_x == 0.0f && ed.brightness == 0.0f && ed.contrast == 1.0f);
+    ed.zoom = 2.0f; ed.pan_x = 9.0f; ed.brightness = 2.0f; ed.contrast = 9.0f;
+    ds_snap_edit_clamp(&ed);
+    assert(ed.zoom == 2.0f && ed.pan_x <= 0.251f && ed.brightness == 0.5f && ed.contrast == 2.0f);
+    float suv[12];
+    assert(ds_snap_compute_uv(&ed, suv));
+    for (size_t i = 0; i < 12; ++i) assert(isfinite(suv[i]) && suv[i] >= -1e-4f && suv[i] <= 1.0001f);
+
+    uint8_t base_rgba[2 * 2 * 4] = {
+        100,100,100,255, 140,140,140,255,
+        80, 80, 80, 255, 180,180,180,255,
+    };
+    const char *src_bmp = "build/host/evp_ops_edit_src.bmp";
+    const char *dst_bmp = "build/host/evp_ops_edit_dst.bmp";
+    unlink(src_bmp); unlink(dst_bmp);
+    assert(ds_write_filtered_bmp(src_bmp, base_rgba, 2, 2, 0, false, 1.0f, DS_VIDEO_FILTER_RAW));
+    ed = ds_snap_edit_defaults();
+    ed.brightness = 0.2f;
+    ed.contrast = 1.5f;
+    ed.filter = DS_VIDEO_FILTER_NIGHT;
+    assert(ds_edit_and_save_bmp(src_bmp, dst_bmp, &ed));
+    int ew = 0, eh = 0;
+    uint8_t edited_px[4 * 4];
+    assert(ds_load_bmp_rgba(dst_bmp, edited_px, sizeof(edited_px), &ew, &eh));
+    assert(ew == 2 && eh == 2 && edited_px[1] >= edited_px[0] && edited_px[1] >= edited_px[2]);
+    unlink(src_bmp); unlink(dst_bmp);
     unlink(tags_path);
 
     puts("PASS: evp_ops cue synth, EVP highpass/notch, playback loop/speed, BMP snapshot, and tag append");

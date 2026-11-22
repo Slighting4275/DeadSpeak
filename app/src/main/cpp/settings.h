@@ -8,6 +8,13 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+typedef enum {
+    DS_AUDIO_VIS_WAVE = 0,
+    DS_AUDIO_VIS_EQ = 1,
+    DS_AUDIO_VIS_OFF = 2,
+    DS_AUDIO_VIS_COUNT = 3,
+} DSAudioVisualMode;
+
 typedef struct {
     DSVoiceMode voice_mode;
     float voice_pitch_hz;
@@ -28,6 +35,8 @@ typedef struct {
     bool hpf_enabled;
     bool mute_on_vox;
     bool audio_shader;
+    DSHudLayout hud_layout;
+    DSAudioVisualMode audio_visual_mode;
 } DSSettings;
 
 /* Returns initialized default settings matching DeadSpeak's baseline behavior. */

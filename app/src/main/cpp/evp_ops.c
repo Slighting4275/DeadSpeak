@@ -263,6 +263,16 @@ static inline uint32_t get_le32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
+static void compute_sobel_rgb(float c0, float c1, float c2, float c3, float c5,
+                              float c6, float c7, float c8, uint8_t out_rgb[3]) {
+    const float gx = -c0 + c2 - 2.0f * c3 + 2.0f * c5 - c6 + c8;
+    const float gy = -c0 - 2.0f * c1 - c2 + c6 + 2.0f * c7 + c8;
+    const float edge = fminf(1.0f, sqrtf(gx * gx + gy * gy) * 3.2f);
+    out_rgb[0] = clamp_u8(edge * 0.1f * 255.0f);
+    out_rgb[1] = clamp_u8(edge * 255.0f);
+    out_rgb[2] = clamp_u8(edge * 0.75f * 255.0f);
+}
+
 bool ds_write_filtered_bmp(const char *path, const uint8_t *src_rgba,
                            int src_w, int src_h, int rotation, bool mirror_x,
                            float zoom, DSVideoFilter filter) {
@@ -321,12 +331,7 @@ bool ds_write_filtered_bmp(const char *path, const uint8_t *src_rgba,
                 const float c6 = oriented_luma(src_rgba, src_w, src_h, norm_rot, mirror_x, zoom, x - 1, y + 1, ow, oh);
                 const float c7 = oriented_luma(src_rgba, src_w, src_h, norm_rot, mirror_x, zoom, x, y + 1, ow, oh);
                 const float c8 = oriented_luma(src_rgba, src_w, src_h, norm_rot, mirror_x, zoom, x + 1, y + 1, ow, oh);
-                const float gx = -c0 + c2 - 2.0f * c3 + 2.0f * c5 - c6 + c8;
-                const float gy = -c0 - 2.0f * c1 - c2 + c6 + 2.0f * c7 + c8;
-                const float edge = fminf(1.0f, sqrtf(gx * gx + gy * gy) * 3.2f);
-                rgb[0] = clamp_u8(edge * 0.1f * 255.0f);
-                rgb[1] = clamp_u8(edge * 255.0f);
-                rgb[2] = clamp_u8(edge * 0.75f * 255.0f);
+                compute_sobel_rgb(c0, c1, c2, c3, c5, c6, c7, c8, rgb);
             } else {
                 uint8_t px[4];
                 sample_oriented_rgba(src_rgba, src_w, src_h, norm_rot, mirror_x, zoom, x, y, ow, oh, px);
@@ -421,5 +426,276 @@ bool ds_append_tag_entry(const char *tags_path, uint64_t timestamp_ms, uint8_t t
     bool ok = len > 0 && write(fd, line, (size_t)len) == (ssize_t)len;
     if (ok) ok = fsync(fd) == 0;
     if (close(fd) != 0) ok = false;
+    return ok;
+}
+
+static FILE *open_regular_read(const char *path) {
+    if (!path || !path[0]) return NULL;
+    const int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+        close(fd);
+        return NULL;
+    }
+    FILE *f = fdopen(fd, "r");
+    if (!f) close(fd);
+    return f;
+}
+
+size_t ds_parse_tags_file(const char *path, DSTimelineMarker *out, size_t max_count) {
+    if (!out || max_count == 0U) return 0U;
+    FILE *f = open_regular_read(path);
+    if (!f) return 0U;
+    size_t count = 0U;
+    char line[128];
+    while (count < max_count && fgets(line, sizeof(line), f)) {
+        char *comma = strchr(line, ',');
+        if (!comma) continue;
+        *comma = '\0';
+        const uint64_t ms = (uint64_t)strtoull(line, NULL, 10);
+        const long id_val = strtol(comma + 1, NULL, 10);
+        const uint8_t id = (id_val >= 0 && id_val <= 255) ? (uint8_t)id_val : 0U;
+        out[count++] = (DSTimelineMarker){ .timestamp_ms = ms, .tag_id = id };
+    }
+    fclose(f);
+    return count;
+}
+
+size_t ds_resample_waveform_file(const char *path, float *out_bars, size_t max_bars, uint64_t *out_duration_ms) {
+    if (out_duration_ms) *out_duration_ms = 0ULL;
+    if (!out_bars || max_bars == 0U) return 0U;
+    FILE *wf = open_regular_read(path);
+    if (!wf) return 0U;
+    size_t total = 0U;
+    uint64_t max_ms = 0ULL;
+    char line[128];
+    while (fgets(line, sizeof(line), wf)) {
+        char *comma = strchr(line, ',');
+        if (!comma) continue;
+        const uint64_t ms = (uint64_t)strtoull(line, NULL, 10);
+        if (ms > max_ms) max_ms = ms;
+        ++total;
+    }
+    if (total == 0U) {
+        fclose(wf);
+        return 0U;
+    }
+    rewind(wf);
+    const size_t bars = total < max_bars ? total : max_bars;
+    memset(out_bars, 0, bars * sizeof(float));
+    size_t idx = 0U;
+    while (fgets(line, sizeof(line), wf)) {
+        const char *comma = strchr(line, ',');
+        if (!comma) continue;
+        const float amp = strtof(comma + 1, NULL);
+        const size_t bucket = (idx * bars) / total;
+        if (bucket < bars && isfinite(amp) && amp > out_bars[bucket]) {
+            out_bars[bucket] = amp;
+        }
+        ++idx;
+    }
+    fclose(wf);
+    if (out_duration_ms) *out_duration_ms = max_ms;
+    return bars;
+}
+
+int ds_find_nearest_marker(const DSTimelineMarker *markers, size_t count, uint64_t target_ms, uint64_t tolerance_ms) {
+    if (!markers || count == 0U) return -1;
+    int best_idx = -1;
+    uint64_t best_diff = UINT64_MAX;
+    for (size_t i = 0U; i < count; ++i) {
+        const uint64_t t = markers[i].timestamp_ms;
+        const uint64_t diff = t >= target_ms ? (t - target_ms) : (target_ms - t);
+        if (diff <= tolerance_ms && diff < best_diff) {
+            best_diff = diff;
+            best_idx = (int)i;
+        }
+    }
+    return best_idx;
+}
+
+uint64_t ds_scrub_fraction_to_ms(float frac, uint64_t duration_ms) {
+    if (duration_ms == 0ULL || !isfinite(frac) || frac <= 0.0f) return 0ULL;
+    if (frac >= 1.0f) return duration_ms;
+    return (uint64_t)((double)frac * (double)duration_ms + 0.5);
+}
+
+void ds_eq_meter_update(DSEqMeterState *eq, const float raw_bands[8], float dt_ms) {
+    if (!eq || !raw_bands) return;
+    if (!isfinite(dt_ms) || dt_ms <= 0.0f) dt_ms = 16.6f;
+    else if (dt_ms > 1000.0f) dt_ms = 1000.0f;
+
+    const float scale = dt_ms / 16.67f;
+    const float attack = fminf(0.85f, fmaxf(0.35f, 0.50f * scale));
+    const float release = fminf(0.45f, fmaxf(0.08f, 0.14f * scale));
+
+    for (size_t i = 0U; i < 8U; ++i) {
+        float target = isfinite(raw_bands[i]) ? raw_bands[i] : 0.0f;
+        if (target < 0.0f) target = 0.0f; else if (target > 1.0f) target = 1.0f;
+        const float k = (target > eq->levels[i]) ? attack : release;
+        eq->levels[i] += (target - eq->levels[i]) * k;
+        if (eq->levels[i] >= eq->peaks[i]) {
+            eq->peaks[i] = eq->levels[i];
+            eq->peak_hold_ms[i] = 450.0f;
+        } else if (eq->peak_hold_ms[i] > dt_ms) {
+            eq->peak_hold_ms[i] -= dt_ms;
+        } else {
+            const float decay_ms = dt_ms - eq->peak_hold_ms[i];
+            eq->peak_hold_ms[i] = 0.0f;
+            eq->peaks[i] = fmaxf(eq->levels[i], eq->peaks[i] - decay_ms * 0.0012f);
+        }
+    }
+}
+
+DSSnapEditParams ds_snap_edit_defaults(void) {
+    return (DSSnapEditParams){
+        .zoom = 1.0f,
+        .pan_x = 0.0f,
+        .pan_y = 0.0f,
+        .brightness = 0.0f,
+        .contrast = 1.0f,
+        .filter = DS_VIDEO_FILTER_RAW,
+    };
+}
+
+void ds_snap_edit_clamp(DSSnapEditParams *p) {
+    if (!p) return;
+    if (!isfinite(p->zoom) || p->zoom < 1.0f) p->zoom = 1.0f;
+    else if (p->zoom > 4.0f) p->zoom = 4.0f;
+
+    const float max_pan = (p->zoom - 1.0f) / (2.0f * p->zoom);
+    if (!isfinite(p->pan_x)) p->pan_x = 0.0f;
+    else if (p->pan_x < -max_pan) p->pan_x = -max_pan;
+    else if (p->pan_x > max_pan) p->pan_x = max_pan;
+
+    if (!isfinite(p->pan_y)) p->pan_y = 0.0f;
+    else if (p->pan_y < -max_pan) p->pan_y = -max_pan;
+    else if (p->pan_y > max_pan) p->pan_y = max_pan;
+
+    if (!isfinite(p->brightness)) p->brightness = 0.0f;
+    else if (p->brightness < -0.5f) p->brightness = -0.5f;
+    else if (p->brightness > 0.5f) p->brightness = 0.5f;
+
+    if (!isfinite(p->contrast)) p->contrast = 1.0f;
+    else if (p->contrast < 0.5f) p->contrast = 0.5f;
+    else if (p->contrast > 2.0f) p->contrast = 2.0f;
+
+    if ((int)p->filter < DS_VIDEO_FILTER_NIGHT || (int)p->filter > DS_VIDEO_FILTER_RAW) {
+        p->filter = DS_VIDEO_FILTER_RAW;
+    }
+}
+
+bool ds_snap_compute_uv(const DSSnapEditParams *p, float uv[12]) {
+    if (!uv) return false;
+    DSSnapEditParams ed = p ? *p : ds_snap_edit_defaults();
+    ds_snap_edit_clamp(&ed);
+    const float span = 1.0f / ed.zoom;
+    const float u0 = fmaxf(0.0f, fminf(1.0f - span, 0.5f + ed.pan_x - span * 0.5f));
+    const float v0 = fmaxf(0.0f, fminf(1.0f - span, 0.5f + ed.pan_y - span * 0.5f));
+    const float u1 = u0 + span;
+    const float v1 = v0 + span;
+    const float coords[12] = {u0, v0, u1, v0, u0, v1, u0, v1, u1, v0, u1, v1};
+    memcpy(uv, coords, sizeof(coords));
+    return true;
+}
+
+static inline uint8_t adjust_channel_brightness_contrast(uint8_t c, float brightness, float contrast) {
+    const float f = ((float)c / 255.0f - 0.5f) * contrast + 0.5f + brightness;
+    return clamp_u8(f * 255.0f);
+}
+
+static float sample_adjusted_luma(const uint8_t *src, int w, int h, int x, int y, float brightness, float contrast) {
+    const int cx = x < 0 ? 0 : (x >= w ? w - 1 : x);
+    const int cy = y < 0 ? 0 : (y >= h ? h - 1 : y);
+    const uint8_t *sp = src + ((size_t)cy * (size_t)w + (size_t)cx) * 4U;
+    const float r = (float)adjust_channel_brightness_contrast(sp[0], brightness, contrast) / 255.0f;
+    const float g = (float)adjust_channel_brightness_contrast(sp[1], brightness, contrast) / 255.0f;
+    const float b = (float)adjust_channel_brightness_contrast(sp[2], brightness, contrast) / 255.0f;
+    return r * 0.299f + g * 0.587f + b * 0.114f;
+}
+
+bool ds_apply_snap_edit_rgba(const uint8_t *src_rgba, uint8_t *dst_rgba, int w, int h, const DSSnapEditParams *p) {
+    if (!src_rgba || !dst_rgba || w <= 0 || h <= 0 || w > 4096 || h > 4096) return false;
+    DSSnapEditParams ed = p ? *p : ds_snap_edit_defaults();
+    ds_snap_edit_clamp(&ed);
+
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            uint8_t *dp = dst_rgba + ((size_t)y * (size_t)w + (size_t)x) * 4U;
+            if (ed.filter == DS_VIDEO_FILTER_EDGE) {
+                const float c0 = sample_adjusted_luma(src_rgba, w, h, x - 1, y - 1, ed.brightness, ed.contrast);
+                const float c1 = sample_adjusted_luma(src_rgba, w, h, x, y - 1, ed.brightness, ed.contrast);
+                const float c2 = sample_adjusted_luma(src_rgba, w, h, x + 1, y - 1, ed.brightness, ed.contrast);
+                const float c3 = sample_adjusted_luma(src_rgba, w, h, x - 1, y, ed.brightness, ed.contrast);
+                const float c5 = sample_adjusted_luma(src_rgba, w, h, x + 1, y, ed.brightness, ed.contrast);
+                const float c6 = sample_adjusted_luma(src_rgba, w, h, x - 1, y + 1, ed.brightness, ed.contrast);
+                const float c7 = sample_adjusted_luma(src_rgba, w, h, x, y + 1, ed.brightness, ed.contrast);
+                const float c8 = sample_adjusted_luma(src_rgba, w, h, x + 1, y + 1, ed.brightness, ed.contrast);
+                compute_sobel_rgb(c0, c1, c2, c3, c5, c6, c7, c8, dp);
+            } else {
+                const uint8_t *sp = src_rgba + ((size_t)y * (size_t)w + (size_t)x) * 4U;
+                const uint8_t br = adjust_channel_brightness_contrast(sp[0], ed.brightness, ed.contrast);
+                const uint8_t bg = adjust_channel_brightness_contrast(sp[1], ed.brightness, ed.contrast);
+                const uint8_t bb = adjust_channel_brightness_contrast(sp[2], ed.brightness, ed.contrast);
+                ds_apply_filter_pixel(br, bg, bb, ed.filter, dp);
+            }
+            dp[3] = 255U;
+        }
+    }
+    return true;
+}
+
+bool ds_edit_and_save_bmp(const char *src_path, const char *dst_path, const DSSnapEditParams *p) {
+    if (!src_path || !dst_path || !dst_path[0]) return false;
+    const size_t cap = 1280U * 720U * 4U;
+    uint8_t *src = malloc(cap);
+    uint8_t *dst = malloc(cap);
+    if (!src || !dst) {
+        free(src);
+        free(dst);
+        return false;
+    }
+    int w = 0, h = 0;
+    bool ok = ds_load_bmp_rgba(src_path, src, cap, &w, &h);
+    if (ok) ok = ds_apply_snap_edit_rgba(src, dst, w, h, p);
+    DSSnapEditParams ed = p ? *p : ds_snap_edit_defaults();
+    ds_snap_edit_clamp(&ed);
+    if (ok && ed.zoom > 1.01f && w > 1 && h > 1) {
+        /* Bilinear pan+zoom crop matching GPU GL_LINEAR preview */
+        const float span = 1.0f / ed.zoom;
+        const float u0 = 0.5f + ed.pan_x - span * 0.5f;
+        const float v0 = 0.5f + ed.pan_y - span * 0.5f;
+        uint8_t *cropped = src;
+        for (int y = 0; y < h; ++y) {
+            const float sv = v0 + ((float)y + 0.5f) / (float)h * span;
+            const float fy = fmaxf(0.0f, fminf((float)(h - 1), sv * (float)(h - 1)));
+            const int y0 = (int)fy;
+            const int y1 = (y0 + 1 < h) ? (y0 + 1) : y0;
+            const float ty = fy - (float)y0;
+            for (int x = 0; x < w; ++x) {
+                const float su = u0 + ((float)x + 0.5f) / (float)w * span;
+                const float fx = fmaxf(0.0f, fminf((float)(w - 1), su * (float)(w - 1)));
+                const int x0 = (int)fx;
+                const int x1 = (x0 + 1 < w) ? (x0 + 1) : x0;
+                const float tx = fx - (float)x0;
+                const uint8_t *p00 = dst + ((size_t)y0 * (size_t)w + (size_t)x0) * 4U;
+                const uint8_t *p10 = dst + ((size_t)y0 * (size_t)w + (size_t)x1) * 4U;
+                const uint8_t *p01 = dst + ((size_t)y1 * (size_t)w + (size_t)x0) * 4U;
+                const uint8_t *p11 = dst + ((size_t)y1 * (size_t)w + (size_t)x1) * 4U;
+                uint8_t *out_p = cropped + ((size_t)y * (size_t)w + (size_t)x) * 4U;
+                for (int c = 0; c < 3; ++c) {
+                    const float top = (float)p00[c] * (1.0f - tx) + (float)p10[c] * tx;
+                    const float bot = (float)p01[c] * (1.0f - tx) + (float)p11[c] * tx;
+                    out_p[c] = clamp_u8(top * (1.0f - ty) + bot * ty);
+                }
+                out_p[3] = 255U;
+            }
+        }
+        memcpy(dst, cropped, (size_t)w * (size_t)h * 4U);
+    }
+    if (ok) ok = ds_write_filtered_bmp(dst_path, dst, w, h, 0, false, 1.0f, DS_VIDEO_FILTER_RAW);
+    free(src);
+    free(dst);
     return ok;
 }

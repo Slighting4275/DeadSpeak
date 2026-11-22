@@ -585,15 +585,34 @@ static void hud_draw_text(uint8_t *rgba, int tex_w, int tex_h, int sx, int sy, i
 static void rasterize_hud_overlay(DSVideoWorker *w, const DSVideoHudState *hud, int64_t elapsed_us) {
     uint8_t *buf = w->hud_rgba;
     memset(buf, 0, (size_t)DS_HUD_TEX_W * (size_t)DS_HUD_TEX_H * 4U);
+    const unsigned total_s = (unsigned)(elapsed_us / INT64_C(1000000));
+    if (hud->hud_layout == DS_HUD_LAYOUT_MINIMAL) {
+        hud_fill_rect(buf, DS_HUD_TEX_W, DS_HUD_TEX_H, 0, 18, 176, 36, 8, 12, 11, 190);
+        char min_line[32];
+        snprintf(min_line, sizeof(min_line), "REC %02u:%02u%s", total_s / 60U, total_s % 60U,
+                 hud->anomaly ? " !" : "");
+        hud_draw_text(buf, DS_HUD_TEX_W, DS_HUD_TEX_H, 12, 29, 2, min_line,
+                      hud->anomaly ? 255 : 232, hud->anomaly ? 140 : 248, hud->anomaly ? 45 : 238);
+        return;
+    }
+
     hud_fill_rect(buf, DS_HUD_TEX_W, DS_HUD_TEX_H, 0, 0, DS_HUD_TEX_W, DS_HUD_TEX_H, 8, 12, 11, 200);
     hud_fill_rect(buf, DS_HUD_TEX_W, DS_HUD_TEX_H, 0, 0, DS_HUD_TEX_W, 2, 48, 220, 145, 220);
 
-    const unsigned total_s = (unsigned)(elapsed_us / INT64_C(1000000));
     char top_line[80];
     snprintf(top_line, sizeof(top_line), "REC %02u:%02u  %s  EMF %.1f UT (%+.1f)",
              total_s / 60U, total_s % 60U, hud->filter_name[0] ? hud->filter_name : "RAW",
              hud->emf_ut, hud->emf_delta);
     hud_draw_text(buf, DS_HUD_TEX_W, DS_HUD_TEX_H, 14, 10, 2, top_line, 232, 248, 238);
+
+    if (hud->hud_layout == DS_HUD_LAYOUT_COMPACT) {
+        if (hud->word[0]) {
+            char compact_w[64];
+            snprintf(compact_w, sizeof(compact_w), "VOX: %s", hud->word);
+            hud_draw_text(buf, DS_HUD_TEX_W, DS_HUD_TEX_H, 14, 38, 2, compact_w, 140, 240, 195);
+        }
+        return;
+    }
 
     char bot_line[80];
     if (hud->word[0]) {

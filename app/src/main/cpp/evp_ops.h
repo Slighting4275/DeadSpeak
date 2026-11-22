@@ -53,6 +53,42 @@ bool ds_load_bmp_rgba(const char *path, uint8_t *out_rgba, size_t capacity, int 
 /* Appends a timestamped tag line ("<ms>,<tag_id>\n") safely to a _tags.txt file. */
 bool ds_append_tag_entry(const char *tags_path, uint64_t timestamp_ms, uint8_t tag_id);
 
+/* Parsed timeline tag entry & waveform resampling helpers for LOG scrubbing */
+typedef struct {
+    uint64_t timestamp_ms;
+    uint8_t tag_id;
+} DSTimelineMarker;
+
+size_t ds_parse_tags_file(const char *path, DSTimelineMarker *out, size_t max_count);
+size_t ds_resample_waveform_file(const char *path, float *out_bars, size_t max_bars, uint64_t *out_duration_ms);
+int ds_find_nearest_marker(const DSTimelineMarker *markers, size_t count, uint64_t target_ms, uint64_t tolerance_ms);
+uint64_t ds_scrub_fraction_to_ms(float frac, uint64_t duration_ms);
+
+/* 8-band EQ level smoother with peak-hold decay for FFT equalizer mode */
+typedef struct {
+    float levels[8];
+    float peaks[8];
+    float peak_hold_ms[8];
+} DSEqMeterState;
+
+void ds_eq_meter_update(DSEqMeterState *eq, const float raw_bands[8], float dt_ms);
+
+/* Post-capture BMP snapshot zoom/pan & brightness/contrast/filter editor */
+typedef struct {
+    float zoom;
+    float pan_x;
+    float pan_y;
+    float brightness;
+    float contrast;
+    DSVideoFilter filter;
+} DSSnapEditParams;
+
+DSSnapEditParams ds_snap_edit_defaults(void);
+void ds_snap_edit_clamp(DSSnapEditParams *p);
+bool ds_snap_compute_uv(const DSSnapEditParams *p, float uv[12]);
+bool ds_apply_snap_edit_rgba(const uint8_t *src_rgba, uint8_t *dst_rgba, int w, int h, const DSSnapEditParams *p);
+bool ds_edit_and_save_bmp(const char *src_path, const char *dst_path, const DSSnapEditParams *p);
+
 #ifdef __cplusplus
 }
 #endif

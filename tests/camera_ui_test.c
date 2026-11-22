@@ -107,6 +107,19 @@ int main(void) {
     assert(hud_fading.visible);
     assert(fabsf(hud_fading.alpha - 0.5f) < 0.01f);
 
+    /* Verify HUD layout preset cycling, labels, and visibility flags */
+    assert(ds_hud_layout_next(DS_HUD_LAYOUT_FULL) == DS_HUD_LAYOUT_COMPACT);
+    assert(ds_hud_layout_next(DS_HUD_LAYOUT_COMPACT) == DS_HUD_LAYOUT_MINIMAL);
+    assert(ds_hud_layout_next(DS_HUD_LAYOUT_MINIMAL) == DS_HUD_LAYOUT_FULL);
+    assert(ds_hud_layout_next((DSHudLayout)99) == DS_HUD_LAYOUT_FULL);
+    const DSHudVisibility vis_full = ds_hud_visibility(DS_HUD_LAYOUT_FULL);
+    const DSHudVisibility vis_cmp  = ds_hud_visibility(DS_HUD_LAYOUT_COMPACT);
+    const DSHudVisibility vis_min  = ds_hud_visibility(DS_HUD_LAYOUT_MINIMAL);
+    assert(vis_full.show_top_chrome && vis_full.show_quick_rows && vis_full.show_meters && vis_full.show_word_card);
+    assert(vis_cmp.show_top_chrome && !vis_cmp.show_quick_rows && vis_cmp.show_meters && vis_cmp.show_word_card);
+    assert(!vis_min.show_top_chrome && !vis_min.show_quick_rows && !vis_min.show_meters && !vis_min.show_word_card);
+    assert(ds_hud_layout_label(DS_HUD_LAYOUT_COMPACT)[0] != '\0');
+
     printf("PASS: %u camera overlay layouts, shared hit regions, gestures, and filter HUD\n", layouts);
     return 0;
 }

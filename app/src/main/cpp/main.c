@@ -88,11 +88,6 @@ typedef enum {
 } DSTagId;
 
 typedef struct {
-    uint64_t timestamp_ms;
-    uint8_t tag_id;
-} DSTagEntry;
-
-typedef struct {
     float r, g, b;
 } DSColor;
 
@@ -138,16 +133,17 @@ typedef struct {
     int display_rotation;
     DSLayout ui;
     float scroll[4];
-    float touch_y, touch_start_y, touch_start_x;
+    float touch_x, touch_y, touch_start_y, touch_start_x;
     bool touch_active, touch_dragged, body_drawing;
-    bool minimal_hud;
+    bool log_scrubbing, snap_panning;
+    DSHudLayout hud_layout;
     GLuint program;
     GLint position;
     GLint color;
     GLuint camera_program, camera_texture;
     GLint camera_filter_loc, camera_image_loc, camera_anomaly_loc, camera_time_loc;
     GLuint wave_program;
-    GLint wave_time_loc, wave_amp_loc, wave_bands_loc, wave_color_loc, wave_theme_loc;
+    GLint wave_time_loc, wave_amp_loc, wave_bands_loc, wave_peaks_loc, wave_color_loc, wave_theme_loc, wave_mode_loc;
     GLuint text_program, text_texture;
     GLint text_pos_loc, text_uv_loc, text_color_loc, text_sampler_loc;
     bool text_engine_ready;
@@ -177,6 +173,7 @@ typedef struct {
     bool scanning;
     bool proximity_active;
     float proximity_distance;
+    DSProximityState proximity_state;
     bool capture_requested;
     bool permission_requested;
     uint64_t permission_deadline;
@@ -209,10 +206,17 @@ typedef struct {
     uint64_t last_emf_alert_ms;
     _Atomic bool hpf_enabled;
     _Atomic bool mute_on_vox;
-    bool audio_shader;
+    DSAudioVisualMode audio_visual_mode;
+    DSEqMeterState eq_meter;
+    uint64_t eq_last_ms;
     char snap_viewing_name[96];
+    char snap_full_path[640];
     int snap_width, snap_height;
-    bool snap_zoomed;
+    DSSnapEditParams snap_edit;
+    uint8_t *snap_orig_rgba;
+    DSRect active_scrubber_box;
+    DSRect active_snap_box;
+    uint64_t active_scrubber_dur_ms;
     uint64_t loop_a_ms, loop_b_ms;
     bool loop_has_a, loop_has_b;
     float playback_speed;
@@ -246,7 +250,7 @@ typedef struct {
     DSThemeMode theme_mode;
     uint8_t hud_tint_step;
     float hud_hue;
-    DSTagEntry loaded_tags[DS_MAX_LOADED_TAGS];
+    DSTimelineMarker loaded_tags[DS_MAX_LOADED_TAGS];
     size_t loaded_tags_count;
     char loaded_tags_filename[96];
     float loaded_waveform[DS_MAX_WAVEFORM_BARS];
@@ -300,51 +304,73 @@ static void save_settings(const DeadSpeak *state) {
         .emf_alerts = state->emf_alerts_enabled,
         .hpf_enabled = atomic_load(&state->hpf_enabled),
         .mute_on_vox = atomic_load(&state->mute_on_vox),
-        .audio_shader = state->audio_shader,
+        .audio_shader = state->audio_visual_mode != DS_AUDIO_VIS_OFF,
+        .hud_layout = state->hud_layout,
+        .audio_visual_mode = state->audio_visual_mode,
     };
     (void)ds_settings_save(state->settings_path, &s);
 }
 
-static bool resolve_companion_tags_path(const DeadSpeak *state, const char *filename, char *out_path, size_t cap) {
-    if (!state || !filename || !filename[0] || !out_path || cap == 0) return false;
+static bool resolve_companion_file_path(const DeadSpeak *state, const char *filename, const char *suffix,
+                                        bool must_exist, char *out_path, size_t cap) {
+    if (!state || !filename || !filename[0] || !suffix || !out_path || cap == 0U) return false;
     const size_t len = strlen(filename);
-    if (len > 4 && (strcmp(filename + len - 4, ".wav") == 0 || strcmp(filename + len - 4, ".mp4") == 0)) {
-        snprintf(out_path, cap, "%s/%.*s_tags.txt", state->evidence_dir, (int)(len - 4), filename);
-        if (strncmp(filename, "VIDEO_", 6) != 0 || access(out_path, F_OK) == 0) return true;
-        /* Match VIDEO_YYYYMMDD_HHMMSS to concurrent EVP_*_tags.txt */
-        if (len > 21 && filename[14] == '_') {
-            char date_prefix[16];
-            snprintf(date_prefix, sizeof(date_prefix), "EVP_%.8s_", filename + 6);
-            const long v_hh = strtol((char[3]){filename[15], filename[16], 0}, NULL, 10);
-            const long v_mm = strtol((char[3]){filename[17], filename[18], 0}, NULL, 10);
-            const long v_ss = strtol((char[3]){filename[19], filename[20], 0}, NULL, 10);
-            const long v_sec = v_hh * 3600L + v_mm * 60L + v_ss;
-            long best_diff = 4L;
-            char best[640] = {0};
-            DIR *dir = opendir(state->evidence_dir);
-            if (dir) {
-                struct dirent *ent;
-                while ((ent = readdir(dir)) != NULL) {
-                    const size_t nlen = strlen(ent->d_name);
-                    if (nlen > 28 && strncmp(ent->d_name, date_prefix, 13) == 0 &&
-                        strcmp(ent->d_name + nlen - 9, "_tags.txt") == 0) {
-                        const long e_hh = strtol((char[3]){ent->d_name[13], ent->d_name[14], 0}, NULL, 10);
-                        const long e_mm = strtol((char[3]){ent->d_name[15], ent->d_name[16], 0}, NULL, 10);
-                        const long e_ss = strtol((char[3]){ent->d_name[17], ent->d_name[18], 0}, NULL, 10);
-                        const long diff = labs(v_sec - (e_hh * 3600L + e_mm * 60L + e_ss));
-                        if (diff < best_diff) {
-                            best_diff = diff;
-                            snprintf(best, sizeof(best), "%s/%s", state->evidence_dir, ent->d_name);
-                        }
+    if (len > 4U && (strcmp(filename + len - 4U, ".wav") == 0 || strcmp(filename + len - 4U, ".mp4") == 0)) {
+        snprintf(out_path, cap, "%s/%.*s%s", state->evidence_dir, (int)(len - 4U), filename, suffix);
+    } else {
+        snprintf(out_path, cap, "%s/%s%s", state->evidence_dir, filename, suffix);
+    }
+    if (access(out_path, F_OK) == 0) return true;
+    if (state->app && state->app->activity && state->app->activity->externalDataPath &&
+        len > 4U && (strcmp(filename + len - 4U, ".wav") == 0 || strcmp(filename + len - 4U, ".mp4") == 0)) {
+        char ext_path[640];
+        snprintf(ext_path, sizeof(ext_path), "%s/Movies/%.*s%s",
+                 state->app->activity->externalDataPath, (int)(len - 4U), filename, suffix);
+        if (access(ext_path, F_OK) == 0) {
+            snprintf(out_path, cap, "%s", ext_path);
+            return true;
+        }
+    }
+    /* Pair VIDEO_YYYYMMDD_HHMMSS...mp4 with its concurrent EVP_YYYYMMDD_HHMMSS... companion file */
+    if (strncmp(filename, "VIDEO_", 6) == 0 && len > 21U && filename[14] == '_') {
+        char date_prefix[16];
+        snprintf(date_prefix, sizeof(date_prefix), "EVP_%.8s_", filename + 6);
+        const long v_hh = strtol((char[3]){filename[15], filename[16], 0}, NULL, 10);
+        const long v_mm = strtol((char[3]){filename[17], filename[18], 0}, NULL, 10);
+        const long v_ss = strtol((char[3]){filename[19], filename[20], 0}, NULL, 10);
+        const long v_sec = v_hh * 3600L + v_mm * 60L + v_ss;
+        const size_t slen = strlen(suffix);
+        long best_diff = 4L;
+        char best[640] = {0};
+        DIR *dir = opendir(state->evidence_dir);
+        if (dir) {
+            struct dirent *ent;
+            while ((ent = readdir(dir)) != NULL) {
+                const size_t nlen = strlen(ent->d_name);
+                if (nlen > 19U + slen && strncmp(ent->d_name, date_prefix, 13) == 0 &&
+                    strcmp(ent->d_name + nlen - slen, suffix) == 0) {
+                    const long e_hh = strtol((char[3]){ent->d_name[13], ent->d_name[14], 0}, NULL, 10);
+                    const long e_mm = strtol((char[3]){ent->d_name[15], ent->d_name[16], 0}, NULL, 10);
+                    const long e_ss = strtol((char[3]){ent->d_name[17], ent->d_name[18], 0}, NULL, 10);
+                    const long diff = labs(v_sec - (e_hh * 3600L + e_mm * 60L + e_ss));
+                    if (diff < best_diff) {
+                        best_diff = diff;
+                        snprintf(best, sizeof(best), "%s/%s", state->evidence_dir, ent->d_name);
                     }
                 }
-                closedir(dir);
             }
-            if (best[0]) { snprintf(out_path, cap, "%s", best); return true; }
+            closedir(dir);
         }
-        return true;
+        if (best[0]) {
+            snprintf(out_path, cap, "%s", best);
+            return true;
+        }
     }
-    return false;
+    return !must_exist && len > 4U && (strcmp(filename + len - 4U, ".wav") == 0 || strcmp(filename + len - 4U, ".mp4") == 0);
+}
+
+static bool resolve_companion_tags_path(const DeadSpeak *state, const char *filename, char *out_path, size_t cap) {
+    return resolve_companion_file_path(state, filename, "_tags.txt", false, out_path, cap);
 }
 
 static float current_anomaly_fx(const DeadSpeak *state, uint64_t now) {
@@ -352,7 +378,8 @@ static float current_anomaly_fx(const DeadSpeak *state, uint64_t now) {
     float strength = 0.0f;
     if (atomic_load(&state->sub_bass_anomaly) && now < state->sub_bass_anomaly_expiry_ms) strength = 0.75f;
     if (state->signal > 0.70f) strength = fmaxf(strength, fminf(1.0f, (state->signal - 0.50f) * 1.4f));
-    if (state->proximity_active) strength = fmaxf(strength, 0.55f);
+    const float prox_surge = ds_proximity_surge(&state->proximity_state, now);
+    if (prox_surge > 0.01f) strength = fmaxf(strength, prox_surge * 0.70f);
     return strength;
 }
 
@@ -778,7 +805,8 @@ static void delete_recording_and_companions(DeadSpeak *state, const char *filena
     if (strcmp(state->snap_viewing_name, filename) == 0) {
         state->snap_viewing_name[0] = '\0';
         state->snap_width = state->snap_height = 0;
-        state->snap_zoomed = false;
+        state->snap_edit = ds_snap_edit_defaults();
+        state->snap_full_path[0] = '\0';
     }
     if (strcmp(state->loaded_tags_filename, filename) == 0) {
         state->loaded_tags_count = 0;
@@ -788,55 +816,6 @@ static void delete_recording_and_companions(DeadSpeak *state, const char *filena
     refresh_media_files(state);
 }
 
-static FILE *open_companion_file(const DeadSpeak *state, const char *filename, const char *suffix) {
-    const size_t len = strlen(filename);
-    char path[640];
-    if (len > 4 && (strcmp(filename + len - 4, ".wav") == 0 || strcmp(filename + len - 4, ".mp4") == 0)) {
-        snprintf(path, sizeof(path), "%s/%.*s%s", state->evidence_dir, (int)(len - 4), filename, suffix);
-    } else {
-        snprintf(path, sizeof(path), "%s/%s%s", state->evidence_dir, filename, suffix);
-    }
-    FILE *f = fopen(path, "r");
-    if (!f && state->app && state->app->activity && state->app->activity->externalDataPath &&
-        len > 4 && (strcmp(filename + len - 4, ".wav") == 0 || strcmp(filename + len - 4, ".mp4") == 0)) {
-        snprintf(path, sizeof(path), "%s/Movies/%.*s%s", state->app->activity->externalDataPath, (int)(len - 4), filename, suffix);
-        f = fopen(path, "r");
-    }
-    /* Pair VIDEO_YYYYMMDD_HHMMSS...mp4 with its concurrent EVP_YYYYMMDD_HHMMSS... companion file */
-    if (!f && strncmp(filename, "VIDEO_", 6) == 0 && len > 21 && filename[14] == '_') {
-        char date_prefix[16];
-        snprintf(date_prefix, sizeof(date_prefix), "EVP_%.8s_", filename + 6);
-        const long v_hh = strtol((char[3]){filename[15], filename[16], 0}, NULL, 10);
-        const long v_mm = strtol((char[3]){filename[17], filename[18], 0}, NULL, 10);
-        const long v_ss = strtol((char[3]){filename[19], filename[20], 0}, NULL, 10);
-        const long v_sec = v_hh * 3600L + v_mm * 60L + v_ss;
-        const size_t slen = strlen(suffix);
-        long best_diff = 4L;
-        char best_path[640] = {0};
-        DIR *dir = opendir(state->evidence_dir);
-        if (dir) {
-            struct dirent *ent;
-            while ((ent = readdir(dir)) != NULL) {
-                const size_t nlen = strlen(ent->d_name);
-                if (nlen > 19 + slen && strncmp(ent->d_name, date_prefix, 13) == 0 &&
-                    strcmp(ent->d_name + nlen - slen, suffix) == 0) {
-                    const long e_hh = strtol((char[3]){ent->d_name[13], ent->d_name[14], 0}, NULL, 10);
-                    const long e_mm = strtol((char[3]){ent->d_name[15], ent->d_name[16], 0}, NULL, 10);
-                    const long e_ss = strtol((char[3]){ent->d_name[17], ent->d_name[18], 0}, NULL, 10);
-                    const long diff = labs(v_sec - (e_hh * 3600L + e_mm * 60L + e_ss));
-                    if (diff < best_diff) {
-                        best_diff = diff;
-                        snprintf(best_path, sizeof(best_path), "%s/%s", state->evidence_dir, ent->d_name);
-                    }
-                }
-            }
-            closedir(dir);
-        }
-        if (best_path[0]) f = fopen(best_path, "r");
-    }
-    return f;
-}
-
 static void load_recording_tags(DeadSpeak *state, const char *filename) {
     if (!state || !filename || !filename[0]) return;
     if (strcmp(state->loaded_tags_filename, filename) == 0) return;
@@ -844,50 +823,14 @@ static void load_recording_tags(DeadSpeak *state, const char *filename) {
     state->loaded_waveform_count = 0;
     snprintf(state->loaded_tags_filename, sizeof(state->loaded_tags_filename), "%s", filename);
 
-    FILE *f = open_companion_file(state, filename, "_tags.txt");
-    if (f) {
-        char line[128];
-        while (state->loaded_tags_count < DS_MAX_LOADED_TAGS && fgets(line, sizeof(line), f)) {
-            char *comma = strchr(line, ',');
-            if (comma) {
-                *comma = '\0';
-                const uint64_t ms = (uint64_t)strtoull(line, NULL, 10);
-                const long id_val = strtol(comma + 1, NULL, 10);
-                const uint8_t id = (id_val >= 0 && id_val <= 255) ? (uint8_t)id_val : 0;
-                state->loaded_tags[state->loaded_tags_count++] = (DSTagEntry){
-                    .timestamp_ms = ms,
-                    .tag_id = id
-                };
-            }
-        }
-        fclose(f);
+    char cpath[640];
+    if (resolve_companion_file_path(state, filename, "_tags.txt", true, cpath, sizeof(cpath))) {
+        state->loaded_tags_count = ds_parse_tags_file(cpath, state->loaded_tags, DS_MAX_LOADED_TAGS);
     }
 
-    FILE *wf = open_companion_file(state, filename, "_waveform.txt");
-    if (wf) {
-        size_t total = 0;
-        char line[128];
-        while (fgets(line, sizeof(line), wf)) {
-            if (strchr(line, ',')) ++total;
-        }
-        if (total > 0) {
-            rewind(wf);
-            const size_t bars = total < DS_MAX_WAVEFORM_BARS ? total : DS_MAX_WAVEFORM_BARS;
-            memset(state->loaded_waveform, 0, sizeof(state->loaded_waveform));
-            size_t idx = 0;
-            while (fgets(line, sizeof(line), wf)) {
-                const char *comma = strchr(line, ',');
-                if (!comma) continue;
-                const float amp = strtof(comma + 1, NULL);
-                const size_t bucket = (idx * bars) / total;
-                if (bucket < bars && isfinite(amp) && amp > state->loaded_waveform[bucket]) {
-                    state->loaded_waveform[bucket] = amp;
-                }
-                ++idx;
-            }
-            state->loaded_waveform_count = bars;
-        }
-        fclose(wf);
+    if (resolve_companion_file_path(state, filename, "_waveform.txt", true, cpath, sizeof(cpath))) {
+        state->loaded_waveform_count = ds_resample_waveform_file(
+            cpath, state->loaded_waveform, DS_MAX_WAVEFORM_BARS, NULL);
     }
 }
 
@@ -1486,8 +1429,10 @@ static bool setup_display(DeadSpeak *state) {
     state->wave_time_loc = glGetUniformLocation(state->wave_program, "u_time");
     state->wave_amp_loc = glGetUniformLocation(state->wave_program, "u_amp");
     state->wave_bands_loc = glGetUniformLocation(state->wave_program, "u_bands");
+    state->wave_peaks_loc = glGetUniformLocation(state->wave_program, "u_peaks");
     state->wave_color_loc = glGetUniformLocation(state->wave_program, "u_color");
     state->wave_theme_loc = glGetUniformLocation(state->wave_program, "u_theme");
+    state->wave_mode_loc = glGetUniformLocation(state->wave_program, "u_mode");
     glGenTextures(1, &state->camera_texture);
     glBindTexture(GL_TEXTURE_2D, state->camera_texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -1751,6 +1696,24 @@ static void filled_circle(DeadSpeak *state, float x, float y, float radius, floa
     }
 }
 
+#define DS_LOG_SNAP_CARD_H 278.0f
+#define DS_LOG_MP4_CARD_H  296.0f
+#define DS_LOG_WAV_CARD_H  116.0f
+
+static float cycle_float_step(float cur, const float *steps, size_t count) {
+    if (!steps || count == 0U) return cur;
+    size_t best_idx = 0U;
+    float best_diff = fabsf(cur - steps[0]);
+    for (size_t i = 1U; i < count; ++i) {
+        const float d = fabsf(cur - steps[i]);
+        if (d < best_diff) {
+            best_diff = d;
+            best_idx = i;
+        }
+    }
+    return steps[(best_idx + 1U) % count];
+}
+
 static float body_content_height(const DeadSpeak *state) {
     if (state->tab == 0) return state->ui.scan_height;
     if (state->tab == 2) return state->ui.explore_height;
@@ -1759,7 +1722,9 @@ static float body_content_height(const DeadSpeak *state) {
     const bool playing_mp4 = ds_media_player_is_playing(state->media_player, NULL, 0, NULL);
     const bool playing_wav = ds_voice_player_is_playing_wav(state->voice_player, NULL, 0, NULL);
     const bool snap_open = state->snap_viewing_name[0] != '\0';
-    const float extra = playing_mp4 ? 260.0f : (playing_wav ? 80.0f : (snap_open ? 236.0f : 0.0f));
+    const float extra = playing_mp4 ? (DS_LOG_MP4_CARD_H - 30.0f) :
+                        (playing_wav ? (DS_LOG_WAV_CARD_H - 30.0f) :
+                        (snap_open ? (DS_LOG_SNAP_CARD_H - 10.0f) : 0.0f));
     const float media = 36.0f + (float)(state->media_count ? state->media_count : 1) * 36.0f + extra + 20.0f;
     return state->ui.wide ? fmaxf(words, 22.0f + media) : fmaxf(140.0f, words + 20.0f) + media;
 }
@@ -1794,58 +1759,63 @@ static DSLogLayout log_layout(const DeadSpeak *state) {
 typedef struct {
     DSRect prev_tag, next_tag, pause_btn, stop, del_active, scrubber, del_idle, item_row, video_box;
     DSRect speed_btn, ab_btn, mark_btn;
+    DSRect bright_btn, contrast_btn, filter_btn, save_btn;
 } DSMediaItemLayout;
 
 static DSMediaItemLayout media_item_layout(DSLogLayout log, float cur_item_y, bool is_mp4, bool is_bmp) {
     const float inner_w = log.column_width - 32.0f;
     const float r2_w = (inner_w - 12.0f) / 3.0f;
+    const float r4_w = (inner_w - 12.0f) * 0.25f;
     if (is_bmp) {
         return (DSMediaItemLayout){
-            .video_box  = {log.media_x, cur_item_y + 22.0f, inner_w, 178.0f},
-            .speed_btn  = {log.media_x + 4.0f, cur_item_y + 208.0f, 88.0f, 28.0f},
-            .stop       = {log.media_x + 98.0f, cur_item_y + 208.0f, 76.0f, 28.0f},
-            .del_active = {log.media_x + log.column_width - 74.0f, cur_item_y + 208.0f, 42.0f, 28.0f},
-            .del_idle   = {log.media_x + log.column_width - 72.0f, cur_item_y + 1.0f, 40.0f, 22.0f},
-            .item_row   = {log.media_x, cur_item_y - 4.0f, log.column_width - 76.0f, 36.0f},
+            .video_box    = {log.media_x, cur_item_y + 22.0f, inner_w, 178.0f},
+            .speed_btn    = {log.media_x + 4.0f, cur_item_y + 206.0f, r4_w, 26.0f},
+            .bright_btn   = {log.media_x + 4.0f + (r4_w + 4.0f), cur_item_y + 206.0f, r4_w, 26.0f},
+            .contrast_btn = {log.media_x + 4.0f + 2.0f * (r4_w + 4.0f), cur_item_y + 206.0f, r4_w, 26.0f},
+            .filter_btn   = {log.media_x + 4.0f + 3.0f * (r4_w + 4.0f), cur_item_y + 206.0f, r4_w, 26.0f},
+            .save_btn     = {log.media_x + 4.0f, cur_item_y + 236.0f, 100.0f, 26.0f},
+            .stop         = {log.media_x + 110.0f, cur_item_y + 236.0f, 76.0f, 26.0f},
+            .del_active   = {log.media_x + log.column_width - 74.0f, cur_item_y + 236.0f, 42.0f, 26.0f},
+            .del_idle     = {log.media_x + log.column_width - 72.0f, cur_item_y + 1.0f, 40.0f, 22.0f},
+            .item_row     = {log.media_x, cur_item_y - 4.0f, log.column_width - 76.0f, 36.0f},
         };
     }
     if (is_mp4) {
         return (DSMediaItemLayout){
             .video_box  = {log.media_x, cur_item_y + 22.0f, inner_w, 172.0f},
-            .scrubber   = {log.media_x + 4.0f, cur_item_y + 200.0f, log.column_width - 36.0f, 16.0f},
-            .prev_tag   = {log.media_x + 4.0f, cur_item_y + 222.0f, 54.0f, 26.0f},
-            .next_tag   = {log.media_x + 62.0f, cur_item_y + 222.0f, 54.0f, 26.0f},
-            .pause_btn  = {log.media_x + 120.0f, cur_item_y + 222.0f, 52.0f, 26.0f},
-            .stop       = {log.media_x + 176.0f, cur_item_y + 222.0f, 44.0f, 26.0f},
-            .del_active = {log.media_x + log.column_width - 74.0f, cur_item_y + 222.0f, 42.0f, 26.0f},
-            .speed_btn  = {log.media_x + 4.0f, cur_item_y + 252.0f, r2_w, 24.0f},
-            .ab_btn     = {log.media_x + 4.0f + (r2_w + 4.0f), cur_item_y + 252.0f, r2_w, 24.0f},
-            .mark_btn   = {log.media_x + 4.0f + 2.0f * (r2_w + 4.0f), cur_item_y + 252.0f, r2_w, 24.0f},
+            .scrubber   = {log.media_x + 4.0f, cur_item_y + 198.0f, log.column_width - 36.0f, 24.0f},
+            .prev_tag   = {log.media_x + 4.0f, cur_item_y + 226.0f, 54.0f, 26.0f},
+            .next_tag   = {log.media_x + 62.0f, cur_item_y + 226.0f, 54.0f, 26.0f},
+            .pause_btn  = {log.media_x + 120.0f, cur_item_y + 226.0f, 52.0f, 26.0f},
+            .stop       = {log.media_x + 176.0f, cur_item_y + 226.0f, 44.0f, 26.0f},
+            .del_active = {log.media_x + log.column_width - 74.0f, cur_item_y + 226.0f, 42.0f, 26.0f},
+            .speed_btn  = {log.media_x + 4.0f, cur_item_y + 256.0f, r2_w, 24.0f},
+            .ab_btn     = {log.media_x + 4.0f + (r2_w + 4.0f), cur_item_y + 256.0f, r2_w, 24.0f},
+            .mark_btn   = {log.media_x + 4.0f + 2.0f * (r2_w + 4.0f), cur_item_y + 256.0f, r2_w, 24.0f},
             .del_idle   = {log.media_x + log.column_width - 72.0f, cur_item_y + 1.0f, 40.0f, 22.0f},
             .item_row   = {log.media_x, cur_item_y - 4.0f, log.column_width - 76.0f, 36.0f},
         };
     }
     return (DSMediaItemLayout){
-        .prev_tag   = {log.media_x + 4.0f, cur_item_y + 42.0f, 54.0f, 26.0f},
-        .next_tag   = {log.media_x + 62.0f, cur_item_y + 42.0f, 54.0f, 26.0f},
-        .pause_btn  = {log.media_x + 120.0f, cur_item_y + 42.0f, 56.0f, 26.0f},
-        .stop       = {log.media_x + 180.0f, cur_item_y + 42.0f, 46.0f, 26.0f},
-        .del_active = {log.media_x + log.column_width - 74.0f, cur_item_y + 42.0f, 42.0f, 26.0f},
-        .speed_btn  = {log.media_x + 4.0f, cur_item_y + 72.0f, r2_w, 24.0f},
-        .ab_btn     = {log.media_x + 4.0f + (r2_w + 4.0f), cur_item_y + 72.0f, r2_w, 24.0f},
-        .mark_btn   = {log.media_x + 4.0f + 2.0f * (r2_w + 4.0f), cur_item_y + 72.0f, r2_w, 24.0f},
-        .scrubber   = {log.media_x + 4.0f, cur_item_y + 20.0f, log.column_width - 36.0f, 16.0f},
+        .prev_tag   = {log.media_x + 4.0f, cur_item_y + 48.0f, 54.0f, 26.0f},
+        .next_tag   = {log.media_x + 62.0f, cur_item_y + 48.0f, 54.0f, 26.0f},
+        .pause_btn  = {log.media_x + 120.0f, cur_item_y + 48.0f, 56.0f, 26.0f},
+        .stop       = {log.media_x + 180.0f, cur_item_y + 48.0f, 46.0f, 26.0f},
+        .del_active = {log.media_x + log.column_width - 74.0f, cur_item_y + 48.0f, 42.0f, 26.0f},
+        .speed_btn  = {log.media_x + 4.0f, cur_item_y + 78.0f, r2_w, 24.0f},
+        .ab_btn     = {log.media_x + 4.0f + (r2_w + 4.0f), cur_item_y + 78.0f, r2_w, 24.0f},
+        .mark_btn   = {log.media_x + 4.0f + 2.0f * (r2_w + 4.0f), cur_item_y + 78.0f, r2_w, 24.0f},
+        .scrubber   = {log.media_x + 4.0f, cur_item_y + 20.0f, log.column_width - 36.0f, 24.0f},
         .del_idle   = {log.media_x + log.column_width - 72.0f, cur_item_y + 1.0f, 40.0f, 22.0f},
         .item_row   = {log.media_x, cur_item_y - 4.0f, log.column_width - 76.0f, 36.0f},
     };
 }
 
-static void draw_textured_quad(DeadSpeak *state, DSRect box, int tex_w, int tex_h, int rot, float zoom) {
+static void draw_textured_quad_uv(DeadSpeak *state, DSRect box, int tex_w, int tex_h, const float uv[12]) {
     rect(state, box.x, box.y, box.w, box.h, 0.02f, 0.03f, 0.03f, 1.0f);
     if (tex_w <= 0 || tex_h <= 0 || !state->mp4_texture || !state->camera_program) return;
 
-    const bool swap = rot == 90 || rot == 270;
-    const float src_aspect = (float)(swap ? tex_h : tex_w) / (float)(swap ? tex_w : tex_h);
+    const float src_aspect = (float)tex_w / (float)tex_h;
     float draw_w = box.w, draw_h = box.h;
     if (box.w / box.h > src_aspect) draw_w = box.h * src_aspect;
     else draw_h = box.w / src_aspect;
@@ -1853,8 +1823,6 @@ static void draw_textured_quad(DeadSpeak *state, DSRect box, int tex_w, int tex_
     float dy = box.y + (box.h - draw_h) * 0.5f;
     if (state->body_drawing) dy -= state->scroll[state->tab];
 
-    float uv[12];
-    if (!ds_preview_uv_zoom(tex_w, tex_h, rot, draw_w, draw_h, zoom, false, uv)) return;
     const float x1 = (dx / state->width) * 2.0f - 1.0f;
     const float x2 = ((dx + draw_w) / state->width) * 2.0f - 1.0f;
     const float y1 = 1.0f - (dy / state->height) * 2.0f;
@@ -1876,6 +1844,35 @@ static void draw_textured_quad(DeadSpeak *state, DSRect box, int tex_w, int tex_
     glDisableVertexAttribArray(1);
 }
 
+static void draw_textured_quad(DeadSpeak *state, DSRect box, int tex_w, int tex_h, int rot, float zoom) {
+    if (tex_w <= 0 || tex_h <= 0) {
+        rect(state, box.x, box.y, box.w, box.h, 0.02f, 0.03f, 0.03f, 1.0f);
+        return;
+    }
+    const bool swap = rot == 90 || rot == 270;
+    const int eff_w = swap ? tex_h : tex_w;
+    const int eff_h = swap ? tex_w : tex_h;
+    const float src_aspect = (float)eff_w / (float)eff_h;
+    float draw_w = box.w, draw_h = box.h;
+    if (box.w / box.h > src_aspect) draw_w = box.h * src_aspect;
+    else draw_h = box.w / src_aspect;
+    float uv[12];
+    if (!ds_preview_uv_zoom(tex_w, tex_h, rot, draw_w, draw_h, zoom, false, uv)) return;
+    draw_textured_quad_uv(state, box, eff_w, eff_h, uv);
+}
+
+static void refresh_snap_preview_texture(DeadSpeak *state) {
+    if (!state || !state->snap_orig_rgba || !state->mp4_rgba || !state->mp4_texture ||
+        state->snap_width <= 0 || state->snap_height <= 0) return;
+    if (ds_apply_snap_edit_rgba(state->snap_orig_rgba, state->mp4_rgba,
+                                state->snap_width, state->snap_height, &state->snap_edit)) {
+        glBindTexture(GL_TEXTURE_2D, state->mp4_texture);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, state->snap_width, state->snap_height,
+                     0, GL_RGBA, GL_UNSIGNED_BYTE, state->mp4_rgba);
+    }
+}
+
 static void draw_mp4_quad(DeadSpeak *state, DSRect box) {
     if (!state->mp4_rgba || !state->mp4_texture || !state->camera_program) return;
     if (ds_media_player_copy_frame(state->media_player, state->mp4_rgba, DS_PREVIEW_CAPACITY,
@@ -1890,7 +1887,26 @@ static void draw_mp4_quad(DeadSpeak *state, DSRect box) {
 }
 
 static void draw_bmp_quad(DeadSpeak *state, DSRect box) {
-    draw_textured_quad(state, box, state->snap_width, state->snap_height, 0, state->snap_zoomed ? 2.0f : 1.0f);
+    if (state->snap_width > 0 && state->snap_height > 0 && box.w > 0.0f && box.h > 0.0f) {
+        const float src_aspect = (float)state->snap_width / (float)state->snap_height;
+        float draw_w = box.w, draw_h = box.h;
+        if (box.w / box.h > src_aspect) draw_w = box.h * src_aspect;
+        else draw_h = box.w / src_aspect;
+        state->active_snap_box = (DSRect){
+            box.x + (box.w - draw_w) * 0.5f,
+            box.y + (box.h - draw_h) * 0.5f,
+            draw_w,
+            draw_h,
+        };
+    } else {
+        state->active_snap_box = box;
+    }
+    float uv[12];
+    if (!ds_snap_compute_uv(&state->snap_edit, uv)) {
+        draw_textured_quad(state, box, state->snap_width, state->snap_height, 0, 1.0f);
+        return;
+    }
+    draw_textured_quad_uv(state, box, state->snap_width, state->snap_height, uv);
 }
 
 static void draw_log(DeadSpeak *state, const DSPalette *pal) {
@@ -1924,6 +1940,10 @@ static void draw_log(DeadSpeak *state, const DSPalette *pal) {
     text(state, "SAVED CAPTURES & SESSIONS", media_x, media_y, fit_text_scale("SAVED CAPTURES & SESSIONS", 1.35f, column_width - 146), pal->mint.r, pal->mint.g, pal->mint.b, 1.0f);
     custom_button(state, layout.export_btn, "EXPORT LOGS", false);
     if (state->media_count == 0U) text(state, "NO AUDIO OR VIDEO FILES", media_x, media_y + 34, fit_text_scale("NO AUDIO OR VIDEO FILES", 1.1f, column_width - 32), pal->muted.r, pal->muted.g, pal->muted.b, 1.0f);
+
+    state->active_scrubber_box = (DSRect){0};
+    state->active_snap_box = (DSRect){0};
+    state->active_scrubber_dur_ms = 0ULL;
 
     char curr_name[96] = {0};
     float active_prog = 0.0f;
@@ -1959,84 +1979,115 @@ static void draw_log(DeadSpeak *state, const DSPalette *pal) {
         const bool has_srt = (access(c_check, F_OK) == 0);
 
         if (is_this_snap) {
-            rect(state, media_x - 4, cur_item_y - 2, column_width - 24, 244.0f, 0.07f, 0.18f, 0.15f, 0.95f);
+            static const char *const flt_short[6] = {"NGT", "THM", "EDG", "IR", "SEP", "RAW"};
+            rect(state, media_x - 4, cur_item_y - 2, column_width - 24, 272.0f, 0.07f, 0.18f, 0.15f, 0.95f);
             char snap_lbl[128];
-            snprintf(snap_lbl, sizeof(snap_lbl), "[IMG] %s (%dx%d)", filename, state->snap_width, state->snap_height);
+            snprintf(snap_lbl, sizeof(snap_lbl), "[IMG] %s (%dx%d) DRAG TO PAN",
+                     filename, state->snap_width, state->snap_height);
             text(state, snap_lbl, media_x + 4, cur_item_y + 4, fit_text_scale(snap_lbl, 1.0f, column_width - 32), 0.95f, 0.98f, 0.94f, 1.0f);
             draw_bmp_quad(state, item.video_box);
-            custom_button(state, item.speed_btn, state->snap_zoomed ? "ZOOM: 2X" : "ZOOM: 1X", state->snap_zoomed);
+            char z_lbl[16], b_lbl[16], c_lbl[16], f_lbl[16];
+            snprintf(z_lbl, sizeof(z_lbl), "ZM %.0fX", state->snap_edit.zoom);
+            snprintf(b_lbl, sizeof(b_lbl), "BR %+.0f", state->snap_edit.brightness * 100.0f);
+            snprintf(c_lbl, sizeof(c_lbl), "CT %.1f", state->snap_edit.contrast);
+            snprintf(f_lbl, sizeof(f_lbl), "FX:%s", flt_short[(unsigned)state->snap_edit.filter % 6U]);
+            custom_button(state, item.speed_btn, z_lbl, state->snap_edit.zoom > 1.05f);
+            custom_button(state, item.bright_btn, b_lbl, fabsf(state->snap_edit.brightness) > 0.01f);
+            custom_button(state, item.contrast_btn, c_lbl, fabsf(state->snap_edit.contrast - 1.0f) > 0.05f);
+            custom_button(state, item.filter_btn, f_lbl, state->snap_edit.filter != DS_VIDEO_FILTER_RAW);
+            custom_button(state, item.save_btn, "SAVE EDIT", true);
             custom_button(state, item.stop, "CLOSE", false);
             rect(state, item.del_active.x, item.del_active.y, item.del_active.w, item.del_active.h, 0.45f, 0.12f, 0.12f, 0.9f);
             text(state, "DEL", item.del_active.x + 8.0f, item.del_active.y + 7.0f, 1.0f, 1.0f, 0.8f, 0.8f, 1.0f);
-            cur_item_y += 250.0f;
+            cur_item_y += DS_LOG_SNAP_CARD_H;
         } else if (is_this_playing) {
             load_recording_tags(state, filename);
             const unsigned cur_sec = (unsigned)(active_pos_ms / 1000ULL);
             const unsigned dur_sec = (unsigned)(active_dur_ms / 1000ULL);
-            const float card_h = is_mp4 ? 284.0f : 104.0f;
+            const float card_h = (is_mp4 ? DS_LOG_MP4_CARD_H : DS_LOG_WAV_CARD_H) - 6.0f;
 
             rect(state, media_x - 4, cur_item_y - 2, column_width - 24, card_h, 0.07f, 0.18f, 0.15f, 0.95f);
 
+            const int near_tag = (active_dur_ms > 0)
+                ? ds_find_nearest_marker(state->loaded_tags,
+                                         state->loaded_tags_count, active_pos_ms, 900ULL)
+                : -1;
+            char tag_desc[28] = {0};
+            if (near_tag >= 0) {
+                const uint8_t tid = state->loaded_tags[near_tag].tag_id;
+                const unsigned ts = (unsigned)(state->loaded_tags[near_tag].timestamp_ms / 1000ULL);
+                const char *tname = tid == DS_TAG_WORD ? "WORD" : (tid == DS_TAG_ANOMALY ? "ANOM" : "MARK");
+                snprintf(tag_desc, sizeof(tag_desc), " [%s @ %02u:%02u]", tname, ts / 60U, ts % 60U);
+            }
+
             char label[128];
             const bool paused = is_mp4 && ds_media_player_is_paused(state->media_player);
-            snprintf(label, sizeof(label), "%s %s  %02u:%02u / %02u:%02u (%u%%)",
+            snprintf(label, sizeof(label), "%s %s  %02u:%02u/%02u:%02u (%u%%)%s",
                      paused ? "|>" : "||", filename, cur_sec / 60, cur_sec % 60,
-                     dur_sec / 60, dur_sec % 60, (unsigned)(active_prog * 100.0f));
-            text(state, label, media_x + 4, cur_item_y + 4, fit_text_scale(label, 1.05f, column_width - 32), 0.95f, 0.98f, 0.94f, 1.0f);
+                     dur_sec / 60, dur_sec % 60, (unsigned)(active_prog * 100.0f), tag_desc);
+            text(state, label, media_x + 4, cur_item_y + 4, fit_text_scale(label, 1.02f, column_width - 32), 0.95f, 0.98f, 0.94f, 1.0f);
 
             if (is_mp4) {
                 draw_mp4_quad(state, item.video_box);
             }
 
-            /* Timeline waveform scrubber bar + A-B loop span */
+            state->active_scrubber_box = item.scrubber;
+            state->active_scrubber_dur_ms = active_dur_ms;
+
+            /* Interactive scrubbable waveform + synchronized event timeline */
             const float bar_x = item.scrubber.x;
             const float bar_w = item.scrubber.w;
-            const float bar_y = item.scrubber.y + 4.0f;
+            const float bar_y = item.scrubber.y + 3.0f;
+            const float track_h = 18.0f;
+            rect(state, bar_x, bar_y, bar_w, track_h, 0.05f, 0.09f, 0.09f, 0.85f);
             if (state->loaded_waveform_count > 0) {
                 const size_t wf_n = state->loaded_waveform_count;
                 const float slot_w = bar_w / (float)wf_n;
                 const float draw_w = fmaxf(1.0f, slot_w - 1.0f);
                 for (size_t b = 0; b < wf_n; ++b) {
                     const float norm_x = ((float)b + 0.5f) / (float)wf_n;
-                    const float amp = fminf(1.0f, fmaxf(0.12f, state->loaded_waveform[b] * 4.0f));
-                    const float bh = amp * 12.0f;
-                    const float by = bar_y + (12.0f - bh) * 0.5f;
+                    const float amp = fminf(1.0f, fmaxf(0.14f, state->loaded_waveform[b] * 4.0f));
+                    const float bh = amp * (track_h - 2.0f);
+                    const float by = bar_y + (track_h - bh) * 0.5f;
                     const bool played = norm_x <= active_prog;
                     rect(state, bar_x + (float)b * slot_w, by, draw_w, bh,
-                         played ? pal->mint.r : 0.18f,
-                         played ? pal->mint.g : 0.26f,
-                         played ? pal->mint.b : 0.24f,
-                         played ? 0.95f : 0.70f);
+                         played ? pal->mint.r : 0.20f,
+                         played ? pal->mint.g : 0.30f,
+                         played ? pal->mint.b : 0.28f,
+                         played ? 0.95f : 0.72f);
                 }
             } else {
-                rect(state, bar_x, bar_y, bar_w, 8, 0.12f, 0.18f, 0.17f, 1.0f);
-                rect(state, bar_x, bar_y, bar_w * active_prog, 8, pal->mint.r, pal->mint.g, pal->mint.b, 1.0f);
+                rect(state, bar_x, bar_y + 5.0f, bar_w, 8.0f, 0.12f, 0.18f, 0.17f, 1.0f);
+                rect(state, bar_x, bar_y + 5.0f, bar_w * active_prog, 8.0f, pal->mint.r, pal->mint.g, pal->mint.b, 1.0f);
             }
             if (active_dur_ms > 0 && state->loop_has_a) {
                 const float ax = bar_x + fminf(1.0f, (float)state->loop_a_ms / (float)active_dur_ms) * bar_w;
                 if (state->loop_has_b && state->loop_b_ms > state->loop_a_ms) {
                     const float bx = bar_x + fminf(1.0f, (float)state->loop_b_ms / (float)active_dur_ms) * bar_w;
-                    rect(state, ax, bar_y - 2.0f, fmaxf(2.0f, bx - ax), 12.0f, 0.95f, 0.65f, 0.15f, 0.36f);
-                    rect(state, bx - 1.0f, bar_y - 3.0f, 2.0f, 14.0f, 0.98f, 0.55f, 0.15f, 0.95f);
+                    rect(state, ax, bar_y, fmaxf(2.0f, bx - ax), track_h, 0.95f, 0.65f, 0.15f, 0.32f);
+                    rect(state, bx - 1.0f, bar_y - 2.0f, 2.0f, track_h + 4.0f, 0.98f, 0.55f, 0.15f, 0.95f);
                 }
-                rect(state, ax - 1.0f, bar_y - 3.0f, 2.0f, 14.0f, 0.35f, 0.98f, 0.60f, 0.95f);
+                rect(state, ax - 1.0f, bar_y - 2.0f, 2.0f, track_h + 4.0f, 0.35f, 0.98f, 0.60f, 0.95f);
             }
-            filled_circle(state, bar_x + bar_w * active_prog, bar_y + 4.0f, 5.5f, 1.0f, 1.0f, 1.0f, 1.0f);
 
-            /* Tag dots along timeline */
+            /* Synchronized event timeline pins & marker heads */
             if (active_dur_ms > 0) {
                 for (size_t t = 0; t < state->loaded_tags_count; ++t) {
                     const uint64_t t_ms = state->loaded_tags[t].timestamp_ms;
                     if (t_ms <= active_dur_ms) {
                         const float dot_x = bar_x + (float)t_ms / (float)active_dur_ms * bar_w;
                         const uint8_t tid = state->loaded_tags[t].tag_id;
-                        const float dr = tid == DS_TAG_WORD ? 0.2f : tid == DS_TAG_ANOMALY ? 1.0f : 0.85f;
-                        const float dg = tid == DS_TAG_WORD ? 0.95f : tid == DS_TAG_ANOMALY ? 0.55f : 0.35f;
-                        const float db = tid == DS_TAG_WORD ? 0.4f : tid == DS_TAG_ANOMALY ? 0.1f : 0.95f;
-                        filled_circle(state, dot_x, bar_y + 4.0f, 3.2f, dr, dg, db, 1.0f);
+                        const float dr = tid == DS_TAG_WORD ? 0.20f : tid == DS_TAG_ANOMALY ? 1.00f : 0.92f;
+                        const float dg = tid == DS_TAG_WORD ? 0.95f : tid == DS_TAG_ANOMALY ? 0.52f : 0.35f;
+                        const float db = tid == DS_TAG_WORD ? 0.45f : tid == DS_TAG_ANOMALY ? 0.10f : 0.98f;
+                        rect(state, dot_x - 0.75f, bar_y - 1.0f, 1.5f, track_h + 2.0f, dr, dg, db, 0.85f);
+                        filled_circle(state, dot_x, bar_y + 2.0f, (int)t == near_tag ? 4.2f : 2.8f, dr, dg, db, 1.0f);
                     }
                 }
             }
+            const float head_x = bar_x + bar_w * active_prog;
+            rect(state, head_x - 1.0f, bar_y - 2.0f, 2.0f, track_h + 4.0f, 1.0f, 1.0f, 1.0f, 0.95f);
+            filled_circle(state, head_x, bar_y + track_h * 0.5f, 5.0f, 1.0f, 1.0f, 1.0f, 1.0f);
 
             custom_button(state, item.prev_tag, "<< TAG", false);
             custom_button(state, item.next_tag, "TAG >>", false);
@@ -2059,7 +2110,7 @@ static void draw_log(DeadSpeak *state, const DSPalette *pal) {
             custom_button(state, item.ab_btn, ab_lbl, state->loop_has_a);
             custom_button(state, item.mark_btn, "+BOOKMARK", false);
 
-            cur_item_y += is_mp4 ? 290.0f : 110.0f;
+            cur_item_y += is_mp4 ? DS_LOG_MP4_CARD_H : DS_LOG_WAV_CARD_H;
         } else {
             char label[128];
             if (is_wav) snprintf(label, sizeof(label), "> %s", filename);
@@ -2090,7 +2141,7 @@ static void draw_log(DeadSpeak *state, const DSPalette *pal) {
 
 typedef struct {
     DSRect voice_btns[4];
-    DSRect pitch_down, pitch_up, speed_down, speed_up, anom_btn;
+    DSRect pitch_down, pitch_up, speed_down, speed_up, anom_btn, hud_layout_btn;
     DSRect vox_gate_btn, wave_shader_btn;
 } DSGuideLayout;
 
@@ -2109,7 +2160,8 @@ static DSGuideLayout guide_layout(const DeadSpeak *state) {
     gl.pitch_up = (DSRect){x + half_w - sub_w, top + 186.0f, sub_w, 34.0f};
     gl.speed_down = (DSRect){x + half_w + btn_gap, top + 186.0f, sub_w, 34.0f};
     gl.speed_up = (DSRect){x + available - sub_w, top + 186.0f, sub_w, 34.0f};
-    gl.anom_btn = (DSRect){x, top + 228.0f, available, 34.0f};
+    gl.anom_btn = (DSRect){x, top + 228.0f, half_w, 34.0f};
+    gl.hud_layout_btn = (DSRect){x + half_w + btn_gap, top + 228.0f, half_w, 34.0f};
     gl.vox_gate_btn = (DSRect){x, top + 268.0f, half_w, 32.0f};
     gl.wave_shader_btn = (DSRect){x + half_w + btn_gap, top + 268.0f, half_w, 32.0f};
     return gl;
@@ -2137,15 +2189,30 @@ static void draw_guide(DeadSpeak *state, const DSPalette *pal) {
     text(state, sensor_line, x + 10, top + 54, fit_text_scale(sensor_line, 1.0f, available - 20), pal->mint.r, pal->mint.g, pal->mint.b, 1.0f);
 
     char baseline_line[128];
-    snprintf(baseline_line, sizeof(baseline_line), "BASELINE: %s (%.1f UT) | CAMERA:%s",
-             state->baseline.ready ? "READY" : "CALIBRATING", state->baseline.field,
-             state->camera_enabled ? "ON" : "OFF");
+    const float prox_srg = ds_proximity_surge(&state->proximity_state, now);
+    if (state->sensors[3] && ds_sensor_live(&state->readings[3], s_now)) {
+        snprintf(baseline_line, sizeof(baseline_line),
+                 "BASE:%.1fUT | PRX:%.1fCM (%+.1f) BRK:%u SRG:%u%% %s",
+                 state->baseline.field,
+                 state->proximity_state.distance_cm, ds_proximity_delta(&state->proximity_state),
+                 (unsigned)state->proximity_state.break_count, (unsigned)(prox_srg * 100.0f),
+                 state->proximity_active ? "ALERT" : "IDLE");
+    } else {
+        snprintf(baseline_line, sizeof(baseline_line),
+                 "BASE: %s (%.1f UT) | PRX: %s | CAM:%s",
+                 state->baseline.ready ? "READY" : "CAL", state->baseline.field,
+                 state->sensors[3] ? ds_sensor_status_name(state->readings[3].status) : "N/A",
+                 state->camera_enabled ? "ON" : "OFF");
+    }
     text(state, baseline_line, x + 10, top + 74, fit_text_scale(baseline_line, 1.0f, available - 20), pal->muted.r, pal->muted.g, pal->muted.b, 1.0f);
 
     char env_line[128];
-    snprintf(env_line, sizeof(env_line), "LIGHT: %.0f LUX  |  BARO: %.1f HPA",
-             state->sensors[4] ? state->ambient_lux : 0.0f,
-             state->sensors[5] ? state->pressure_hpa : 0.0f);
+    char lgt_s[24], bar_s[24];
+    if (state->sensors[4] && ds_sensor_live(&state->readings[4], s_now)) snprintf(lgt_s, sizeof(lgt_s), "%.0f LX", state->ambient_lux);
+    else snprintf(lgt_s, sizeof(lgt_s), "%s", state->sensors[4] ? ds_sensor_status_name(state->readings[4].status) : "N/A");
+    if (state->sensors[5] && ds_sensor_live(&state->readings[5], s_now)) snprintf(bar_s, sizeof(bar_s), "%.1f HPA", state->pressure_hpa);
+    else snprintf(bar_s, sizeof(bar_s), "%s", state->sensors[5] ? ds_sensor_status_name(state->readings[5].status) : "N/A");
+    snprintf(env_line, sizeof(env_line), "LIGHT: %s  |  BARO: %s", lgt_s, bar_s);
     text(state, env_line, x + 10, top + 94, fit_text_scale(env_line, 1.0f, available - 20), pal->muted.r, pal->muted.g, pal->muted.b, 1.0f);
 
     /* Interactive Formant Voice Test + Pitch/Speed Controls */
@@ -2173,12 +2240,15 @@ static void draw_guide(DeadSpeak *state, const DSPalette *pal) {
     text(state, speed_lbl, smx - ds_text_width(speed_lbl, s_scale, DS_FONT_STANDARD) * 0.5f, gl.speed_down.y + 11.0f,
          s_scale, pal->mint.r, pal->mint.g, pal->mint.b, 1.0f);
 
-    custom_button(state, gl.anom_btn,
-                  state->anomaly_fx ? "CAMERA ANOMALY DISTORTION FX: ON" : "CAMERA ANOMALY DISTORTION FX: OFF",
-                  state->anomaly_fx);
+    custom_button(state, gl.anom_btn, state->anomaly_fx ? "ANOMALY FX: ON" : "ANOMALY FX: OFF", state->anomaly_fx);
+    char hud_lbl[32];
+    snprintf(hud_lbl, sizeof(hud_lbl), "HUD: %s", ds_hud_layout_label(state->hud_layout));
+    custom_button(state, gl.hud_layout_btn, hud_lbl, state->hud_layout != DS_HUD_LAYOUT_FULL);
     const bool vox_gate_on = atomic_load(&state->mute_on_vox);
     custom_button(state, gl.vox_gate_btn, vox_gate_on ? "VOX GATE: ON" : "VOX GATE: OFF", vox_gate_on);
-    custom_button(state, gl.wave_shader_btn, state->audio_shader ? "WAVE SHADER: ON" : "WAVE SHADER: OFF", state->audio_shader);
+    static const char *const vis_labels[3] = {"AUDIO VIS: WAVE", "AUDIO VIS: FFT EQ", "AUDIO VIS: CLASSIC"};
+    custom_button(state, gl.wave_shader_btn, vis_labels[(unsigned)state->audio_visual_mode % DS_AUDIO_VIS_COUNT],
+                  state->audio_visual_mode != DS_AUDIO_VIS_OFF);
 
     if (state->guide_voice_label[0] && now < state->guide_voice_last_ms + 4000U) {
         text(state, state->guide_voice_label, x, top + 308, fit_text_scale(state->guide_voice_label, 1.0f, available), pal->amber.r, pal->amber.g, pal->amber.b, 1.0f);
@@ -2459,13 +2529,21 @@ static void draw_audio_wave(DeadSpeak *state, DSRect box, uint64_t now, DSColor 
     }
     const float amp = (float)atomic_load(&state->audio_level_milli) / 1000.0f;
     const float t = (float)(now % 60000ULL) * 0.001f;
+    const float dt_ms = state->eq_last_ms > 0ULL && now > state->eq_last_ms ? (float)(now - state->eq_last_ms) : 16.6f;
+    state->eq_last_ms = now;
+    ds_eq_meter_update(&state->eq_meter, bands8, dt_ms);
 
     glUseProgram(state->wave_program);
     if (state->wave_time_loc >= 0) glUniform1f(state->wave_time_loc, t);
     if (state->wave_amp_loc >= 0) glUniform1f(state->wave_amp_loc, amp);
-    if (state->wave_bands_loc >= 0) glUniform1fv(state->wave_bands_loc, 8, bands8);
+    if (state->wave_bands_loc >= 0) {
+        glUniform1fv(state->wave_bands_loc, 8,
+                     state->audio_visual_mode == DS_AUDIO_VIS_EQ ? state->eq_meter.levels : bands8);
+    }
+    if (state->wave_peaks_loc >= 0) glUniform1fv(state->wave_peaks_loc, 8, state->eq_meter.peaks);
     if (state->wave_color_loc >= 0) glUniform3f(state->wave_color_loc, accent.r, accent.g, accent.b);
     if (state->wave_theme_loc >= 0) glUniform1i(state->wave_theme_loc, (int)state->theme_mode);
+    if (state->wave_mode_loc >= 0) glUniform1i(state->wave_mode_loc, state->audio_visual_mode == DS_AUDIO_VIS_EQ ? 1 : 0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, verts);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, uvs);
     glEnableVertexAttribArray(0);
@@ -2585,13 +2663,15 @@ static void draw_camera(DeadSpeak *state) {
         glDrawArrays(GL_TRIANGLES, 0, 6);
         glDisableVertexAttribArray(1);
     }
-    /* Top Bar */
+    /* Top Bar & Customizable HUD Presets (FULL / COMPACT / MINIMAL) */
     const DSCameraControlsLayout ctrl = camera_controls_layout(state);
+    const DSHudVisibility hud_vis = ds_hud_visibility(state->hud_layout);
     DSColor accent = {0.92f, 0.98f, 0.95f};
     if (state->hud_hue > 0.001f) {
         accent = ds_interpolate_hud_accent(state->hud_hue);
     }
-    if (!state->minimal_hud) {
+    const float prox_surge = ds_proximity_surge(&state->proximity_state, now);
+    if (hud_vis.show_top_chrome) {
         rect(state, 0, 0, state->width, 58, 0, 0, 0, 0.6f);
         const float header_max_w = (float)(state->width - 340 - 20);
         const float header_scale = ds_fit_text_scale_styled("DEADSPEAK", ds_sp_to_scale(DS_FONT_SIZE_BODY_LG), header_max_w, DS_FONT_BOLD);
@@ -2610,31 +2690,52 @@ static void draw_camera(DeadSpeak *state) {
         snprintf(tint_label, sizeof(tint_label), "TINT %u%%", (unsigned)(state->hud_hue * 100.0f));
         custom_button(state, ctrl.tint, tint_label, state->hud_hue > 0.05f);
 
-        /* Quick Camera Row 1: Torch, Front/Rear Lens, Digital Zoom, Anomaly Distortion FX */
-        const bool torch_avail = ds_video_torch_available(&state->video);
-        const bool torch_on = ds_video_torch_enabled(&state->video);
-        custom_button(state, ctrl.torch, torch_avail ? (torch_on ? "TORCH ON" : "TORCH") : "NO TORCH", torch_on);
-        custom_button(state, ctrl.lens, is_front ? "FRONT" : "REAR", is_front);
-        char zoom_lbl[16];
-        snprintf(zoom_lbl, sizeof(zoom_lbl), "%.1fX", cam_zoom);
-        custom_button(state, ctrl.zoom_btn, zoom_lbl, cam_zoom > 1.05f);
-        custom_button(state, ctrl.anom_btn, state->anomaly_fx ? "FX GLITCH" : "FX CLEAN", state->anomaly_fx);
+        if (hud_vis.show_quick_rows) {
+            /* Quick Camera Row 1: Torch, Front/Rear Lens, Digital Zoom, Anomaly Distortion FX */
+            const bool torch_avail = ds_video_torch_available(&state->video);
+            const bool torch_on = ds_video_torch_enabled(&state->video);
+            custom_button(state, ctrl.torch, torch_avail ? (torch_on ? "TORCH ON" : "TORCH") : "NO TORCH", torch_on);
+            custom_button(state, ctrl.lens, is_front ? "FRONT" : "REAR", is_front);
+            char zoom_lbl[16];
+            snprintf(zoom_lbl, sizeof(zoom_lbl), "%.1fX", cam_zoom);
+            custom_button(state, ctrl.zoom_btn, zoom_lbl, cam_zoom > 1.05f);
+            custom_button(state, ctrl.anom_btn, state->anomaly_fx ? "FX GLITCH" : "FX CLEAN", state->anomaly_fx);
 
-        /* Quick Camera Row 2: Snapshot, Self-Timer, High-Pass Hum Cut, EMF Chime */
-        custom_button(state, ctrl.snap, "SNAP", false);
-        char tmr_lbl[16];
-        if (state->timer_seconds > 0U) snprintf(tmr_lbl, sizeof(tmr_lbl), "TMR %uS", (unsigned)state->timer_seconds);
-        else snprintf(tmr_lbl, sizeof(tmr_lbl), "TMR OFF");
-        custom_button(state, ctrl.timer, tmr_lbl, state->timer_seconds > 0U || state->timer_deadline_ms > 0U);
-        const bool hpf_on = atomic_load(&state->hpf_enabled);
-        custom_button(state, ctrl.hpf, hpf_on ? "HPF ON" : "HPF OFF", hpf_on);
-        custom_button(state, ctrl.alert_btn, state->emf_alerts_enabled ? "CHIME ON" : "QUIET", state->emf_alerts_enabled);
+            /* Quick Camera Row 2: Snapshot, Self-Timer, High-Pass Hum Cut, EMF Chime */
+            custom_button(state, ctrl.snap, "SNAP", false);
+            char tmr_lbl[16];
+            if (state->timer_seconds > 0U) snprintf(tmr_lbl, sizeof(tmr_lbl), "TMR %uS", (unsigned)state->timer_seconds);
+            else snprintf(tmr_lbl, sizeof(tmr_lbl), "TMR OFF");
+            custom_button(state, ctrl.timer, tmr_lbl, state->timer_seconds > 0U || state->timer_deadline_ms > 0U);
+            const bool hpf_on = atomic_load(&state->hpf_enabled);
+            custom_button(state, ctrl.hpf, hpf_on ? "HPF ON" : "HPF OFF", hpf_on);
+            custom_button(state, ctrl.alert_btn, state->emf_alerts_enabled ? "CHIME ON" : "QUIET", state->emf_alerts_enabled);
+        }
+
+        if (state->sensors[3] && !state->sensor_details && (prox_surge > 0.02f || (preview_live && hud_vis.show_quick_rows))) {
+            const float py = hud_vis.show_quick_rows ? 130.0f : 64.0f;
+            const float pw = fminf(300.0f, (float)state->width - 100.0f);
+            const bool hot_prox = state->proximity_active || prox_surge > 0.10f;
+            rect(state, 16.0f, py, pw, 22.0f, hot_prox ? 0.55f : 0.05f, hot_prox ? 0.16f : 0.09f, 0.07f, 0.86f);
+            if (prox_surge > 0.01f) {
+                rect(state, 18.0f, py + 17.0f, (pw - 4.0f) * prox_surge, 3.0f, 1.0f, 0.45f, 0.12f, 0.95f);
+            }
+            char prox_lbl[80];
+            snprintf(prox_lbl, sizeof(prox_lbl), "PROX %s %.1fCM (%+.1f) BRK:%u SRG:%u%%",
+                     state->proximity_active ? "ALERT" : "IDLE",
+                     state->proximity_state.distance_cm,
+                     ds_proximity_delta(&state->proximity_state),
+                     (unsigned)state->proximity_state.break_count,
+                     (unsigned)(prox_surge * 100.0f));
+            text(state, prox_lbl, 22.0f, py + 4.0f, fit_text_scale(prox_lbl, 0.95f, pw - 12.0f),
+                 hot_prox ? 1.0f : 0.72f, hot_prox ? 0.88f : 0.90f, hot_prox ? 0.65f : 0.84f, 1.0f);
+        }
 
         if (state->export_status_expiry_ms > now && state->export_status_message[0]) {
             const float toast_w = fminf(300.0f, state->width - 40.0f);
             const float toast_x = (state->width - toast_w) * 0.5f;
-            rect(state, toast_x, 132.0f, toast_w, 24.0f, 0.12f, 0.38f, 0.28f, 0.95f);
-            text(state, state->export_status_message, toast_x + 8.0f, 137.0f,
+            rect(state, toast_x, 158.0f, toast_w, 24.0f, 0.12f, 0.38f, 0.28f, 0.95f);
+            text(state, state->export_status_message, toast_x + 8.0f, 163.0f,
                  fit_text_scale(state->export_status_message, 1.0f, toast_w - 16.0f),
                  1.0f, 1.0f, 1.0f, 1.0f);
         }
@@ -2658,12 +2759,14 @@ static void draw_camera(DeadSpeak *state) {
         }
 
         char status[80];
-        if (recording) snprintf(status, sizeof(status), "REC %02llu:%02llu",
+        if (recording) snprintf(status, sizeof(status), "REC %02llu:%02llu  [%s]",
             (unsigned long long)((now - state->capture_started_ms) / 60000),
-            (unsigned long long)((now - state->capture_started_ms) / 1000 % 60));
-        else snprintf(status, sizeof(status), "%s", preview_live ? "LIVE CAMERA" :
+            (unsigned long long)((now - state->capture_started_ms) / 1000 % 60),
+            ds_hud_layout_label(state->hud_layout));
+        else snprintf(status, sizeof(status), "%s [%s]", preview_live ? "LIVE CAMERA" :
             !state->camera_enabled ? "CAMERA OFF" : ds_video_failed(&state->video) ? "CAMERA ERROR - TAP CAM" :
-            has_camera_permission(state) ? "STARTING CAMERA" : "TAP CAM TO ALLOW CAMERA");
+            has_camera_permission(state) ? "STARTING CAMERA" : "TAP CAM TO ALLOW CAMERA",
+            ds_hud_layout_label(state->hud_layout));
         text_styled(state, status, 16, 38, ds_fit_text_scale_styled(status, ds_sp_to_scale(DS_FONT_SIZE_MICRO), header_max_w, DS_FONT_STANDARD), DS_FONT_STANDARD, recording ? 1 : 0.8f, recording ? 0.25f : 0.9f, recording ? 0.25f : 0.85f, 1);
         if (!preview_live) {
             const char *message = state->camera_enabled ? "TAP CAM TO ENABLE OR RETRY" : "CAMERA IS OFF";
@@ -2673,11 +2776,19 @@ static void draw_camera(DeadSpeak *state) {
         for (unsigned i = 0; i < 5; ++i)
             custom_button(state, ui.tools[i], tools[i], i == 0 ? preview_live : i == 1 ? state->scanning : i == 4 ? state->sensor_details : false);
     } else {
-        /* Minimal HUD mode indication */
-        text(state, "MINIMAL HUD - TAP TO EXPAND", 16, 18, 1.0f, 0.6f, 0.8f, 0.7f, 0.7f);
+        text(state, "MINIMAL HUD - TAP VIEW", 16, 18, 1.0f, 0.6f, 0.85f, 0.72f, 0.75f);
+        if (state->sensors[3] && prox_surge > 0.05f) {
+            char min_prox[64];
+            snprintf(min_prox, sizeof(min_prox), "PROX BREAK x%u (%+.1fCM) %u%%",
+                     (unsigned)state->proximity_state.break_count,
+                     ds_proximity_delta(&state->proximity_state),
+                     (unsigned)(prox_surge * 100.0f));
+            rect(state, 16.0f, 40.0f, 240.0f, 22.0f, 0.68f, 0.20f, 0.06f, 0.90f);
+            text(state, min_prox, 22.0f, 45.0f, fit_text_scale(min_prox, 0.95f, 228.0f), 1.0f, 0.96f, 0.85f, 1.0f);
+        }
     }
 
-    if (state->sensor_details && !state->minimal_hud) {
+    if (state->sensor_details && hud_vis.show_top_chrome) {
         const DSSensorReading *reading = &state->readings[0];
         char details[80];
         snprintf(details, sizeof(details), "MAG %s  SAMPLES %llu", ds_sensor_status_name(reading->status), (unsigned long long)reading->count);
@@ -2714,12 +2825,12 @@ static void draw_camera(DeadSpeak *state) {
         text(state, details, 242, top + 120, fit_text_scale(details, 1.0f, fmaxf(32.0f, (float)state->width - 328.0f)), 0.8f, 0.95f, 0.86f, 1);
     }
     
-    /* 1. SOUND SPECTRUM & LIVE OSCILLOSCOPE ANALYZER HUD */
-    if (!state->minimal_hud) {
-        /* Rolling Word History Feed (only show rows that clear Quick Camera Row 2 at y=126) */
+    /* 1. SOUND SPECTRUM & LIVE OSCILLOSCOPE / FFT EQ ANALYZER HUD */
+    if (hud_vis.show_meters) {
+        /* Rolling Word History Feed (clears Quick Camera rows & Proximity bar) */
         if (state->log_count > 0 && !state->sensor_details) {
             unsigned show_count = state->log_count < 3U ? state->log_count : 3U;
-            while (show_count > 0U && ui.audio.y - (float)show_count * 22.0f - 6.0f <= 132.0f) {
+            while (show_count > 0U && ui.audio.y - (float)show_count * 22.0f - 6.0f <= 162.0f) {
                 --show_count;
             }
             if (show_count > 0U) {
@@ -2754,7 +2865,7 @@ static void draw_camera(DeadSpeak *state) {
         rect(state, ui.audio.x, ui.audio.y, ui.audio.w, ui.audio.h, 0, 0, 0, 0.65f);
         const bool audio_live = atomic_load(&state->audio_active);
         if (audio_live) {
-            if (state->audio_shader) {
+            if (state->audio_visual_mode != DS_AUDIO_VIS_OFF) {
                 draw_audio_wave(state, ui.audio, now, accent);
             } else if (state->theme_mode == DS_THEME_ABDUCTION) {
                 /* Abduction Theme: Bio-luminescent alien neon curve */
@@ -2837,59 +2948,61 @@ static void draw_camera(DeadSpeak *state) {
     }
     
     /* 2. EMF / MAGNETOMETER FLUCTUATOR & POLARITY BAR */
-    rect(state, ui.magnetic.x, ui.magnetic.y, ui.magnetic.w, ui.magnetic.h, 0, 0, 0, 0.68f);
     const bool magnetic_live = ds_sensor_live(&state->readings[0], sensor_now_ns());
-    char magnetic[64];
-    float delta = 0.0f;
-    if (magnetic_live) {
-        delta = state->baseline.ready ? (state->smoothed_field - state->baseline.field) : 0.0f;
-        const char *polarity = delta > 0.5f ? "[+PULL]" : delta < -0.5f ? "[-PUSH]" : "[N]";
-        snprintf(magnetic, sizeof(magnetic), "EMF %.1f UT (%+.1f) %s", state->magnetic_field, delta, polarity);
-    } else snprintf(magnetic, sizeof(magnetic), "EMF %s", ds_sensor_status_name(state->readings[0].status));
-    text(state, magnetic, ui.magnetic.x + 8, ui.magnetic.y + 11,
-         fit_text_scale(magnetic, 1.25f, ui.magnetic.w * 0.58f), 0.9f, 0.98f, 0.93f, 1);
-    
-    /* Peak-hold decay logic */
-    if (state->signal > state->emf_peak_signal) {
-        state->emf_peak_signal = state->signal;
-        state->emf_peak_decay_ms = now + 500;
-    } else if (now > state->emf_peak_decay_ms && state->emf_peak_signal > 0.0f) {
-        state->emf_peak_signal -= 0.02f;
-        if (state->emf_peak_signal < 0.0f) state->emf_peak_signal = 0.0f;
-    }
+    if (hud_vis.show_meters) {
+        rect(state, ui.magnetic.x, ui.magnetic.y, ui.magnetic.w, ui.magnetic.h, 0, 0, 0, 0.68f);
+        char magnetic[64];
+        float delta = 0.0f;
+        if (magnetic_live) {
+            delta = state->baseline.ready ? (state->smoothed_field - state->baseline.field) : 0.0f;
+            const char *polarity = delta > 0.5f ? "[+PULL]" : delta < -0.5f ? "[-PUSH]" : "[N]";
+            snprintf(magnetic, sizeof(magnetic), "EMF %.1f UT (%+.1f) %s", state->magnetic_field, delta, polarity);
+        } else snprintf(magnetic, sizeof(magnetic), "EMF %s", ds_sensor_status_name(state->readings[0].status));
+        text(state, magnetic, ui.magnetic.x + 8, ui.magnetic.y + 11,
+             fit_text_scale(magnetic, 1.25f, ui.magnetic.w * 0.58f), 0.9f, 0.98f, 0.93f, 1);
 
-    const float meter_x = ui.magnetic.x + ui.magnetic.w * 0.60f, meter_width = ui.magnetic.w * 0.36f;
-    rect(state, meter_x, ui.magnetic.y + 9, meter_width, 14, 0.15f, 0.20f, 0.18f, 1);
-
-    /* Graduated scale tick lines (0%, 25%, 50%, 75%, 100%) */
-    for (unsigned t = 0; t <= 4; ++t) {
-        const float tx = meter_x + (float)t * 0.25f * meter_width;
-        line(state, tx, ui.magnetic.y + 7, tx, ui.magnetic.y + 10, 0.45f, 0.55f, 0.50f, 0.8f);
-    }
-
-    if (magnetic_live && state->signal > 0.0f) {
-        const float r = state->signal < 0.4f ? 0.3f : state->signal < 0.7f ? 0.95f : 1.0f;
-        const float g = state->signal < 0.4f ? 0.95f : state->signal < 0.7f ? 0.85f : 0.2f;
-        const float b = state->signal < 0.4f ? 0.3f : 0.1f;
-        rect(state, meter_x, ui.magnetic.y + 9, meter_width * state->signal, 14, r, g, b, 1);
-
-        /* Analog needle pointer */
-        const float needle_x = meter_x + fminf(1.0f, fmaxf(0.0f, state->signal)) * meter_width;
-        line(state, needle_x, ui.magnetic.y + 5, needle_x, ui.magnetic.y + 25, 1.0f, 1.0f, 1.0f, 1.0f);
-        filled_circle(state, needle_x, ui.magnetic.y + 16, 2.8f, 1.0f, 0.95f, 0.3f, 1.0f);
-
-        /* Peak hold indicator line */
-        if (state->emf_peak_signal > 0.05f) {
-            rect(state, meter_x + meter_width * state->emf_peak_signal - 1.0f, ui.magnetic.y + 7, 2.0f, 18, 1.0f, 0.95f, 0.3f, 1.0f);
+        /* Peak-hold decay logic */
+        if (state->signal > state->emf_peak_signal) {
+            state->emf_peak_signal = state->signal;
+            state->emf_peak_decay_ms = now + 500;
+        } else if (now > state->emf_peak_decay_ms && state->emf_peak_signal > 0.0f) {
+            state->emf_peak_signal -= 0.02f;
+            if (state->emf_peak_signal < 0.0f) state->emf_peak_signal = 0.0f;
         }
-    }
 
-    /* 300ms High-EMF Alert Flasher */
-    if (magnetic_live && (delta > 4.0f || delta < -4.0f || state->magnetic_field > 75.0f)) {
-        emit_companion_tag(state, DS_TAG_ANOMALY);
-        if (((now / 300U) % 2U) == 0) {
-            rect(state, ui.magnetic.x + ui.magnetic.w - 96.0f, ui.magnetic.y - 18.0f, 92.0f, 18.0f, 0.95f, 0.15f, 0.10f, 0.95f);
-            text(state, "EMF ALERT", ui.magnetic.x + ui.magnetic.w - 90.0f, ui.magnetic.y - 14.0f, 0.90f, 1.0f, 1.0f, 1.0f, 1.0f);
+        const float meter_x = ui.magnetic.x + ui.magnetic.w * 0.60f, meter_width = ui.magnetic.w * 0.36f;
+        rect(state, meter_x, ui.magnetic.y + 9, meter_width, 14, 0.15f, 0.20f, 0.18f, 1);
+
+        /* Graduated scale tick lines (0%, 25%, 50%, 75%, 100%) */
+        for (unsigned t = 0; t <= 4; ++t) {
+            const float tx = meter_x + (float)t * 0.25f * meter_width;
+            line(state, tx, ui.magnetic.y + 7, tx, ui.magnetic.y + 10, 0.45f, 0.55f, 0.50f, 0.8f);
+        }
+
+        if (magnetic_live && state->signal > 0.0f) {
+            const float r = state->signal < 0.4f ? 0.3f : state->signal < 0.7f ? 0.95f : 1.0f;
+            const float g = state->signal < 0.4f ? 0.95f : state->signal < 0.7f ? 0.85f : 0.2f;
+            const float b = state->signal < 0.4f ? 0.3f : 0.1f;
+            rect(state, meter_x, ui.magnetic.y + 9, meter_width * state->signal, 14, r, g, b, 1);
+
+            /* Analog needle pointer */
+            const float needle_x = meter_x + fminf(1.0f, fmaxf(0.0f, state->signal)) * meter_width;
+            line(state, needle_x, ui.magnetic.y + 5, needle_x, ui.magnetic.y + 25, 1.0f, 1.0f, 1.0f, 1.0f);
+            filled_circle(state, needle_x, ui.magnetic.y + 16, 2.8f, 1.0f, 0.95f, 0.3f, 1.0f);
+
+            /* Peak hold indicator line */
+            if (state->emf_peak_signal > 0.05f) {
+                rect(state, meter_x + meter_width * state->emf_peak_signal - 1.0f, ui.magnetic.y + 7, 2.0f, 18, 1.0f, 0.95f, 0.3f, 1.0f);
+            }
+        }
+
+        /* 300ms High-EMF Alert Flasher */
+        if (magnetic_live && (delta > 4.0f || delta < -4.0f || state->magnetic_field > 75.0f)) {
+            emit_companion_tag(state, DS_TAG_ANOMALY);
+            if (((now / 300U) % 2U) == 0) {
+                rect(state, ui.magnetic.x + ui.magnetic.w - 96.0f, ui.magnetic.y - 18.0f, 92.0f, 18.0f, 0.95f, 0.15f, 0.10f, 0.95f);
+                text(state, "EMF ALERT", ui.magnetic.x + ui.magnetic.w - 90.0f, ui.magnetic.y - 14.0f, 0.90f, 1.0f, 1.0f, 1.0f, 1.0f);
+            }
         }
     }
 
@@ -2899,48 +3012,50 @@ static void draw_camera(DeadSpeak *state) {
     /* Holds triggered word on screen for 10,000 ms (10s) before resetting to Listening */
     const bool word_active = state->word[0] && (latest_word_time > 0 && (now - latest_word_time < 10000U));
     const bool recent_trigger = state->log_count > 0 && (now - latest_word_time < 3000U);
-    if (recent_trigger) {
-        const float pulse_a = 0.5f + 0.45f * fabsf(sinf((float)now * 0.007f));
-        rect(state, ui.word.x - 2, ui.word.y - 2, ui.word.w + 4, ui.word.h + 4, 0.15f, 0.95f, 0.70f, pulse_a);
-    }
-    const float bg_shade = recent_trigger ? 0.15f : 0.06f;
-    rect(state, ui.word.x, ui.word.y, ui.word.w, ui.word.h, bg_shade, bg_shade + 0.04f, bg_shade + 0.03f, 0.92f);
-    const bool is_moving = ds_motion_is_moving(&state->motion_filter, sensor_now_ns());
+    if (hud_vis.show_word_card || recent_trigger) {
+        if (recent_trigger) {
+            const float pulse_a = 0.5f + 0.45f * fabsf(sinf((float)now * 0.007f));
+            rect(state, ui.word.x - 2, ui.word.y - 2, ui.word.w + 4, ui.word.h + 4, 0.15f, 0.95f, 0.70f, pulse_a);
+        }
+        const float bg_shade = recent_trigger ? 0.15f : 0.06f;
+        rect(state, ui.word.x, ui.word.y, ui.word.w, ui.word.h, bg_shade, bg_shade + 0.04f, bg_shade + 0.03f, 0.92f);
+        const bool is_moving = ds_motion_is_moving(&state->motion_filter, sensor_now_ns());
 
-    char sub_text[96] = {0};
-    const char *primary_word = NULL;
-    if (!magnetic_live) {
-        primary_word = "NO SENSOR DATA";
-        snprintf(sub_text, sizeof(sub_text), "MAGNETOMETER UNAVAILABLE");
-    } else if (!state->scanning) {
-        primary_word = "SCAN PAUSED";
-        snprintf(sub_text, sizeof(sub_text), "TAP RESUME TO DETECT SENSOR ANOMALIES");
-    } else if (is_moving) {
-        primary_word = "MOTION DETECTED";
-        snprintf(sub_text, sizeof(sub_text), "STABILIZING SENSOR BASELINE...");
-    } else if (!state->baseline.ready) {
-        primary_word = "CALIBRATING";
-        snprintf(sub_text, sizeof(sub_text), "COLLECTING AMBIENT FIELD READINGS...");
-    } else if (state->custom_selected && !ds_custom_words_count(&state->custom_words)) {
-        primary_word = "CUSTOM BANK EMPTY";
-        snprintf(sub_text, sizeof(sub_text), "ADD WORDS IN WORD BANK MODAL");
-    } else if (word_active) {
-        primary_word = state->word;
-        snprintf(sub_text, sizeof(sub_text), "FIELD %.1f UT DEL %+.1f (%.0f,%.0f,%.0f)%s",
-                 state->word_fields[latest_slot], state->word_deltas[latest_slot],
-                 state->word_x[latest_slot], state->word_y[latest_slot], state->word_z[latest_slot],
-                 state->word_whispers[latest_slot] ? " [WHISPER]" : "");
-    } else {
-        primary_word = "LISTENING...";
-        snprintf(sub_text, sizeof(sub_text), "AWAITING SENSOR ANOMALIES");
-    }
+        char sub_text[96] = {0};
+        const char *primary_word = NULL;
+        if (!magnetic_live) {
+            primary_word = "NO SENSOR DATA";
+            snprintf(sub_text, sizeof(sub_text), "MAGNETOMETER UNAVAILABLE");
+        } else if (!state->scanning) {
+            primary_word = "SCAN PAUSED";
+            snprintf(sub_text, sizeof(sub_text), "TAP RESUME TO DETECT SENSOR ANOMALIES");
+        } else if (is_moving) {
+            primary_word = "MOTION DETECTED";
+            snprintf(sub_text, sizeof(sub_text), "STABILIZING SENSOR BASELINE...");
+        } else if (!state->baseline.ready) {
+            primary_word = "CALIBRATING";
+            snprintf(sub_text, sizeof(sub_text), "COLLECTING AMBIENT FIELD READINGS...");
+        } else if (state->custom_selected && !ds_custom_words_count(&state->custom_words)) {
+            primary_word = "CUSTOM BANK EMPTY";
+            snprintf(sub_text, sizeof(sub_text), "ADD WORDS IN WORD BANK MODAL");
+        } else if (word_active) {
+            primary_word = state->word;
+            snprintf(sub_text, sizeof(sub_text), "FIELD %.1f UT DEL %+.1f (%.0f,%.0f,%.0f)%s",
+                     state->word_fields[latest_slot], state->word_deltas[latest_slot],
+                     state->word_x[latest_slot], state->word_y[latest_slot], state->word_z[latest_slot],
+                     state->word_whispers[latest_slot] ? " [WHISPER]" : "");
+        } else {
+            primary_word = "LISTENING...";
+            snprintf(sub_text, sizeof(sub_text), "AWAITING SENSOR ANOMALIES");
+        }
 
-    const float word_r = is_moving ? 0.96f : 0.95f;
-    const float word_g = is_moving ? 0.75f : 0.98f;
-    const float word_b = is_moving ? 0.35f : 0.95f;
-    const float card_word_scale = ds_fit_text_scale_styled(primary_word, ds_sp_to_scale(DS_FONT_SIZE_BODY_LG), ui.word.w - 20, DS_FONT_BOLD);
-    text_styled(state, primary_word, ui.word.x + 10, ui.word.y + 6, card_word_scale, DS_FONT_BOLD, word_r, word_g, word_b, 1);
-    text_styled(state, sub_text, ui.word.x + 10, ui.word.y + 24, ds_fit_text_scale_styled(sub_text, ds_sp_to_scale(DS_FONT_SIZE_BADGE), ui.word.w - 20, DS_FONT_STANDARD), DS_FONT_STANDARD, 0.65f, 0.85f, 0.78f, 0.9f);
+        const float word_r = is_moving ? 0.96f : 0.95f;
+        const float word_g = is_moving ? 0.75f : 0.98f;
+        const float word_b = is_moving ? 0.35f : 0.95f;
+        const float card_word_scale = ds_fit_text_scale_styled(primary_word, ds_sp_to_scale(DS_FONT_SIZE_BODY_LG), ui.word.w - 20, DS_FONT_BOLD);
+        text_styled(state, primary_word, ui.word.x + 10, ui.word.y + 6, card_word_scale, DS_FONT_BOLD, word_r, word_g, word_b, 1);
+        text_styled(state, sub_text, ui.word.x + 10, ui.word.y + 24, ds_fit_text_scale_styled(sub_text, ds_sp_to_scale(DS_FONT_SIZE_BADGE), ui.word.w - 20, DS_FONT_STANDARD), DS_FONT_STANDARD, 0.65f, 0.85f, 0.78f, 0.9f);
+    }
 
     /* 4. RECORD SHUTTER BUTTON */
     const float cx = ui.record.x + ui.record.w / 2, cy = ui.record.y + ui.record.h / 2;
@@ -2996,6 +3111,7 @@ static void update_video_hud(DeadSpeak *state, uint64_t now) {
         .anomaly = atomic_load(&state->sub_bass_anomaly),
         .anomaly_fx = current_anomaly_fx(state, now),
         .time_ms = now,
+        .hud_layout = (uint8_t)state->hud_layout,
     };
     snprintf(hud_snap.word, sizeof(hud_snap.word), "%s", word_active ? state->word : "");
     snprintf(hud_snap.filter_name, sizeof(hud_snap.filter_name), "%s", fname);
@@ -3389,6 +3505,18 @@ static void capture_snapshot(DeadSpeak *state) {
     state->export_status_expiry_ms = now + 2200U;
 }
 
+static void seek_scrubber_at_x(DeadSpeak *state, DSRect box, uint64_t dur_ms, float x) {
+    if (!state || dur_ms == 0ULL || box.w <= 0.0f) return;
+    const float frac = (x - box.x) / box.w;
+    active_media_seek_ms(state, ds_scrub_fraction_to_ms(frac, dur_ms));
+}
+
+static void cycle_audio_visual_mode(DeadSpeak *state) {
+    if (!state) return;
+    state->audio_visual_mode = (DSAudioVisualMode)(((unsigned)state->audio_visual_mode + 1U) % DS_AUDIO_VIS_COUNT);
+    save_settings(state);
+}
+
 static int32_t handle_input(struct android_app *app, AInputEvent *event) {
     DeadSpeak *state = (DeadSpeak *)app->userData;
     if (AInputEvent_getType(event) == AINPUT_EVENT_TYPE_KEY && state->custom_open &&
@@ -3429,13 +3557,48 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
     if (action == AMOTION_EVENT_ACTION_DOWN) {
         state->touch_active = state->tab == 0 || ds_rect_contains(state->ui.body, x, y);
         state->touch_dragged = false;
-        state->touch_start_x = x;
+        state->log_scrubbing = false;
+        state->snap_panning = false;
+        state->touch_x = state->touch_start_x = x;
         state->touch_y = state->touch_start_y = y;
+        if (state->tab == DS_TAB_LOG && ds_rect_contains(state->ui.body, x, y)) {
+            const float body_y = y + state->scroll[DS_TAB_LOG];
+            if (state->active_scrubber_box.w > 0.0f && state->active_scrubber_dur_ms > 0ULL &&
+                ds_rect_contains(state->active_scrubber_box, x, body_y)) {
+                state->log_scrubbing = true;
+                seek_scrubber_at_x(state, state->active_scrubber_box, state->active_scrubber_dur_ms, x);
+                return 1;
+            }
+            if (state->snap_viewing_name[0] && state->snap_edit.zoom > 1.05f &&
+                state->active_snap_box.w > 0.0f && ds_rect_contains(state->active_snap_box, x, body_y)) {
+                state->snap_panning = true;
+                return 1;
+            }
+        }
         return 1;
     }
     if (action == AMOTION_EVENT_ACTION_CANCEL || action == AMOTION_EVENT_ACTION_POINTER_DOWN) {
         state->touch_active = false;
+        state->log_scrubbing = false;
+        state->snap_panning = false;
         state->touch_dragged = true;
+        return 1;
+    }
+    if (action == AMOTION_EVENT_ACTION_MOVE && state->log_scrubbing) {
+        seek_scrubber_at_x(state, state->active_scrubber_box, state->active_scrubber_dur_ms, x);
+        return 1;
+    }
+    if (action == AMOTION_EVENT_ACTION_MOVE && state->snap_panning) {
+        if (state->active_snap_box.w > 0.0f && state->active_snap_box.h > 0.0f) {
+            const float dx = x - state->touch_x;
+            const float dy = y - state->touch_y;
+            const float z = state->snap_edit.zoom > 1.0f ? state->snap_edit.zoom : 1.0f;
+            state->snap_edit.pan_x -= dx / (state->active_snap_box.w * z);
+            state->snap_edit.pan_y -= dy / (state->active_snap_box.h * z);
+            ds_snap_edit_clamp(&state->snap_edit);
+        }
+        state->touch_x = x;
+        state->touch_y = y;
         return 1;
     }
     if (action == AMOTION_EVENT_ACTION_MOVE && state->touch_active) {
@@ -3447,6 +3610,7 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
                     fmaxf(0.0f, state->scroll[state->tab] + state->touch_y - y));
             }
         }
+        state->touch_x = x;
         state->touch_y = y;
         return 1;
     }
@@ -3457,6 +3621,12 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
         return 1;
     }
     if (action != AMOTION_EVENT_ACTION_UP) return 1;
+    if (state->log_scrubbing || state->snap_panning) {
+        state->log_scrubbing = false;
+        state->snap_panning = false;
+        state->touch_active = false;
+        return 1;
+    }
     if (state->touch_active && (fabsf(y - state->touch_start_y) > 8.0f || fabsf(x - state->touch_start_x) > 8.0f))
         state->touch_dragged = true;
     state->touch_active = false;
@@ -3520,7 +3690,8 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
     }
     if (state->tab == DS_TAB_SCAN) {
         const DSCameraControlsLayout ctrl = camera_controls_layout(state);
-        if (!state->minimal_hud) {
+        const DSHudVisibility hud_vis = ds_hud_visibility(state->hud_layout);
+        if (hud_vis.show_top_chrome) {
             if (ds_rect_contains(ctrl.spk, x, y)) {
                 state->voice_config.enabled = !state->voice_config.enabled;
                 save_settings(state);
@@ -3543,57 +3714,57 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
                 save_settings(state);
                 return 1;
             }
-            if (ds_rect_contains(ctrl.torch, x, y)) {
-                if (ds_video_torch_available(&state->video)) {
-                    ds_video_set_torch(&state->video, !ds_video_torch_enabled(&state->video));
+            if (hud_vis.show_quick_rows) {
+                if (ds_rect_contains(ctrl.torch, x, y)) {
+                    if (ds_video_torch_available(&state->video)) {
+                        ds_video_set_torch(&state->video, !ds_video_torch_enabled(&state->video));
+                    }
+                    return 1;
                 }
-                return 1;
-            }
-            if (ds_rect_contains(ctrl.lens, x, y)) {
-                if (!ds_video_active(&state->video) && ds_video_front_available(&state->video)) {
-                    ds_video_set_front(&state->video, !ds_video_is_front(&state->video));
-                    state->preview_received_ms = 0;
+                if (ds_rect_contains(ctrl.lens, x, y)) {
+                    if (!ds_video_active(&state->video) && ds_video_front_available(&state->video)) {
+                        ds_video_set_front(&state->video, !ds_video_is_front(&state->video));
+                        state->preview_received_ms = 0;
+                        save_settings(state);
+                    }
+                    return 1;
+                }
+                if (ds_rect_contains(ctrl.zoom_btn, x, y)) {
+                    static const float zoom_steps[4] = {1.0f, 1.5f, 2.0f, 3.0f};
+                    state->zoom = cycle_float_step(state->zoom, zoom_steps, 4U);
+                    ds_video_set_zoom(&state->video, state->zoom);
                     save_settings(state);
+                    return 1;
                 }
-                return 1;
-            }
-            if (ds_rect_contains(ctrl.zoom_btn, x, y)) {
-                static const float zoom_steps[4] = {1.0f, 1.5f, 2.0f, 3.0f};
-                unsigned cur_idx = 0U;
-                float best_diff = fabsf(state->zoom - zoom_steps[0]);
-                for (unsigned zi = 1U; zi < 4U; ++zi) {
-                    const float diff = fabsf(state->zoom - zoom_steps[zi]);
-                    if (diff < best_diff) { best_diff = diff; cur_idx = zi; }
+                if (ds_rect_contains(ctrl.anom_btn, x, y)) {
+                    state->anomaly_fx = !state->anomaly_fx;
+                    save_settings(state);
+                    return 1;
                 }
-                state->zoom = zoom_steps[(cur_idx + 1U) % 4U];
-                ds_video_set_zoom(&state->video, state->zoom);
-                save_settings(state);
-                return 1;
+                if (ds_rect_contains(ctrl.snap, x, y)) {
+                    capture_snapshot(state);
+                    return 1;
+                }
+                if (ds_rect_contains(ctrl.timer, x, y)) {
+                    state->timer_deadline_ms = 0ULL;
+                    state->timer_seconds = state->timer_seconds == 0U ? 5U : (state->timer_seconds == 5U ? 10U : 0U);
+                    save_settings(state);
+                    return 1;
+                }
+                if (ds_rect_contains(ctrl.hpf, x, y)) {
+                    const bool next_hpf = !atomic_load(&state->hpf_enabled);
+                    atomic_store(&state->hpf_enabled, next_hpf);
+                    save_settings(state);
+                    return 1;
+                }
+                if (ds_rect_contains(ctrl.alert_btn, x, y)) {
+                    state->emf_alerts_enabled = !state->emf_alerts_enabled;
+                    save_settings(state);
+                    return 1;
+                }
             }
-            if (ds_rect_contains(ctrl.anom_btn, x, y)) {
-                state->anomaly_fx = !state->anomaly_fx;
-                save_settings(state);
-                return 1;
-            }
-            if (ds_rect_contains(ctrl.snap, x, y)) {
-                capture_snapshot(state);
-                return 1;
-            }
-            if (ds_rect_contains(ctrl.timer, x, y)) {
-                state->timer_deadline_ms = 0ULL;
-                state->timer_seconds = state->timer_seconds == 0U ? 5U : (state->timer_seconds == 5U ? 10U : 0U);
-                save_settings(state);
-                return 1;
-            }
-            if (ds_rect_contains(ctrl.hpf, x, y)) {
-                const bool next_hpf = !atomic_load(&state->hpf_enabled);
-                atomic_store(&state->hpf_enabled, next_hpf);
-                save_settings(state);
-                return 1;
-            }
-            if (ds_rect_contains(ctrl.alert_btn, x, y)) {
-                state->emf_alerts_enabled = !state->emf_alerts_enabled;
-                save_settings(state);
+            if (hud_vis.show_meters && ds_rect_contains(state->camera_ui.audio, x, y)) {
+                cycle_audio_visual_mode(state);
                 return 1;
             }
             for (unsigned i = 0; i < 5; ++i) if (ds_rect_contains(state->camera_ui.tools[i], x, y)) {
@@ -3660,10 +3831,12 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
             toggle_capture(state);
             return 1;
         }
-        /* Tap on camera background toggles Minimal HUD (anywhere above record row when minimized) */
-        if ((state->minimal_hud && y < state->camera_ui.record.y - 12.0f) ||
-            (!state->minimal_hud && y > 130.0f && y < state->camera_ui.record.y - 12.0f && x < state->width - 90.0f)) {
-            state->minimal_hud = !state->minimal_hud;
+        /* Tap on camera background cycles HUD layout preset (FULL -> COMPACT -> MINIMAL) */
+        const float min_tap_y = hud_vis.show_quick_rows ? 130.0f : (hud_vis.show_top_chrome ? 64.0f : 0.0f);
+        if ((!hud_vis.show_top_chrome && y < state->camera_ui.record.y - 12.0f) ||
+            (hud_vis.show_top_chrome && y > min_tap_y && y < state->camera_ui.record.y - 12.0f && x < state->width - 90.0f)) {
+            state->hud_layout = ds_hud_layout_next(state->hud_layout);
+            save_settings(state);
             return 1;
         }
         return 1;
@@ -3699,20 +3872,58 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
 
             if (is_this_snap) {
                 if (ds_rect_contains(item.speed_btn, x, y)) {
-                    state->snap_zoomed = !state->snap_zoomed;
+                    if (state->snap_edit.zoom < 1.5f) state->snap_edit.zoom = 2.0f;
+                    else if (state->snap_edit.zoom < 2.5f) state->snap_edit.zoom = 3.0f;
+                    else { state->snap_edit.zoom = 1.0f; state->snap_edit.pan_x = 0.0f; state->snap_edit.pan_y = 0.0f; }
+                    ds_snap_edit_clamp(&state->snap_edit);
+                    return 1;
+                }
+                if (ds_rect_contains(item.bright_btn, x, y)) {
+                    static const float brightness_steps[4] = {0.0f, 0.15f, 0.30f, -0.15f};
+                    state->snap_edit.brightness = cycle_float_step(state->snap_edit.brightness, brightness_steps, 4U);
+                    refresh_snap_preview_texture(state);
+                    return 1;
+                }
+                if (ds_rect_contains(item.contrast_btn, x, y)) {
+                    static const float contrast_steps[4] = {1.0f, 1.35f, 1.70f, 0.75f};
+                    state->snap_edit.contrast = cycle_float_step(state->snap_edit.contrast, contrast_steps, 4U);
+                    refresh_snap_preview_texture(state);
+                    return 1;
+                }
+                if (ds_rect_contains(item.filter_btn, x, y)) {
+                    state->snap_edit.filter = (DSVideoFilter)(((unsigned)state->snap_edit.filter + 1U) % 6U);
+                    refresh_snap_preview_texture(state);
+                    return 1;
+                }
+                if (ds_rect_contains(item.save_btn, x, y) && state->snap_full_path[0]) {
+                    struct timespec wall_time;
+                    struct tm local_tm = {0};
+                    clock_gettime(CLOCK_REALTIME, &wall_time);
+                    localtime_r(&wall_time.tv_sec, &local_tm);
+                    char stamp[32];
+                    strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &local_tm);
+                    char dst_path[640];
+                    snprintf(dst_path, sizeof(dst_path), "%s/SNAP_%s_%03ld.bmp",
+                             state->evidence_dir, stamp, wall_time.tv_nsec / 1000000L);
+                    const bool saved = ds_edit_and_save_bmp(state->snap_full_path, dst_path, &state->snap_edit);
+                    snprintf(state->export_status_message, sizeof(state->export_status_message),
+                             saved ? "SAVED EDITED SNAPSHOT" : "SAVE EDIT FAILED");
+                    state->export_status_expiry_ms = now_millis() + 2000U;
+                    if (saved) refresh_media_files(state);
                     return 1;
                 }
                 if (ds_rect_contains(item.stop, x, y)) {
                     state->snap_viewing_name[0] = '\0';
+                    state->snap_full_path[0] = '\0';
                     state->snap_width = state->snap_height = 0;
-                    state->snap_zoomed = false;
+                    state->snap_edit = ds_snap_edit_defaults();
                     return 1;
                 }
                 if (ds_rect_contains(item.del_active, x, y)) {
                     delete_recording_and_companions(state, filename);
                     return 1;
                 }
-                cur_item_y += 250.0f;
+                cur_item_y += DS_LOG_SNAP_CARD_H;
             } else if (is_this_playing) {
                 if (ds_rect_contains(item.prev_tag, x, y)) {
                     jump_to_tag(state, false);
@@ -3788,14 +3999,10 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
                     return 1;
                 }
                 if (ds_rect_contains(item.scrubber, x, y)) {
-                    if (dur_ms > 0 && item.scrubber.w > 0) {
-                        const float pct = fmaxf(0.0f, fminf(1.0f, (x - item.scrubber.x) / item.scrubber.w));
-                        const uint64_t target_ms = (uint64_t)(pct * (float)dur_ms);
-                        active_media_seek_ms(state, target_ms);
-                    }
+                    seek_scrubber_at_x(state, item.scrubber, dur_ms, x);
                     return 1;
                 }
-                cur_item_y += active_is_mp4 ? 290.0f : 110.0f;
+                cur_item_y += active_is_mp4 ? DS_LOG_MP4_CARD_H : DS_LOG_WAV_CARD_H;
             } else {
                 if (ds_rect_contains(item.del_idle, x, y)) {
                     delete_recording_and_companions(state, filename);
@@ -3808,16 +4015,15 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
                         state->app->activity->externalDataPath) {
                         snprintf(full_path, sizeof(full_path), "%s/Movies/%s", state->app->activity->externalDataPath, filename);
                     }
-                    if (is_bmp && state->mp4_rgba && state->mp4_texture) {
+                    if (is_bmp && state->mp4_rgba && state->snap_orig_rgba && state->mp4_texture) {
                         int bw = 0, bh = 0;
-                        if (ds_load_bmp_rgba(full_path, state->mp4_rgba, DS_PREVIEW_CAPACITY, &bw, &bh)) {
+                        if (ds_load_bmp_rgba(full_path, state->snap_orig_rgba, DS_PREVIEW_CAPACITY, &bw, &bh)) {
                             active_media_stop(state, true, true);
                             snprintf(state->snap_viewing_name, sizeof(state->snap_viewing_name), "%s", filename);
+                            snprintf(state->snap_full_path, sizeof(state->snap_full_path), "%s", full_path);
                             state->snap_width = bw; state->snap_height = bh;
-                            state->snap_zoomed = false;
-                            glBindTexture(GL_TEXTURE_2D, state->mp4_texture);
-                            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-                            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, bw, bh, 0, GL_RGBA, GL_UNSIGNED_BYTE, state->mp4_rgba);
+                            state->snap_edit = ds_snap_edit_defaults();
+                            refresh_snap_preview_texture(state);
                         } else {
                             snprintf(state->export_status_message, sizeof(state->export_status_message), "CANNOT OPEN IMAGE");
                             state->export_status_expiry_ms = now_millis() + 1800U;
@@ -3878,13 +4084,16 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
             state->anomaly_fx = !state->anomaly_fx;
             save_settings(state);
             return 1;
+        } else if (ds_rect_contains(gl.hud_layout_btn, x, y)) {
+            state->hud_layout = ds_hud_layout_next(state->hud_layout);
+            save_settings(state);
+            return 1;
         } else if (ds_rect_contains(gl.vox_gate_btn, x, y)) {
             atomic_store(&state->mute_on_vox, !atomic_load(&state->mute_on_vox));
             save_settings(state);
             return 1;
         } else if (ds_rect_contains(gl.wave_shader_btn, x, y)) {
-            state->audio_shader = !state->audio_shader;
-            save_settings(state);
+            cycle_audio_visual_mode(state);
             return 1;
         }
         if (voice_changed) {
@@ -3956,14 +4165,15 @@ static void poll_sensor(DeadSpeak *state) {
             DSSampleResult sample_prox = ds_sensor_accept(reading, event.timestamp, received, event.distance, 0.0f, 0.0f, 3);
             if (sample_prox != DS_SAMPLE_REJECTED && state->sensors[3]) {
                 state->proximity_distance = event.distance;
+                const bool fresh_break = ds_proximity_update(&state->proximity_state, event.distance, now_millis());
                 const bool was_active = state->proximity_active;
-                /* Standard Android hardware proximity sensors report ~0.0 cm for NEAR, and ~5.0 cm for FAR */
-                state->proximity_active = (event.distance < 4.0f);
-                if (state->proximity_active && !was_active) {
+                state->proximity_active = state->proximity_state.near_active;
+                if (fresh_break) {
                     __android_log_print(ANDROID_LOG_INFO, LOG_TAG,
-                        "PROXIMITY TRIGGERED: distance=%.1f cm", event.distance);
+                        "PROXIMITY TRIGGERED: distance=%.1f cm (breaks=%u)",
+                        event.distance, (unsigned)state->proximity_state.break_count);
                     if (state->scanning) ds_voice_player_set_geiger_rate(state->voice_player, 25.0f);
-                    emit_companion_tag(state, 2);
+                    emit_companion_tag(state, DS_TAG_ANOMALY);
                 } else if (!state->proximity_active && was_active && state->scanning) {
                     ds_voice_player_set_geiger_rate(state->voice_player, 0.0f);
                 }
@@ -4191,6 +4401,9 @@ void android_main(struct android_app *app) {
     state->camera_enabled = true;
     state->preview_rgba = malloc(DS_PREVIEW_CAPACITY);
     state->mp4_rgba = malloc(DS_PREVIEW_CAPACITY);
+    state->snap_orig_rgba = malloc(DS_PREVIEW_CAPACITY);
+    state->snap_edit = ds_snap_edit_defaults();
+    ds_proximity_init(&state->proximity_state);
     state->video_filter = DS_VIDEO_FILTER_RAW;
     state->video_aspect = DS_ASPECT_16_9;
     state->hud_burn_in = true;
@@ -4235,7 +4448,8 @@ void android_main(struct android_app *app) {
         state->emf_alerts_enabled = cfg.emf_alerts;
         atomic_store(&state->hpf_enabled, cfg.hpf_enabled);
         atomic_store(&state->mute_on_vox, cfg.mute_on_vox);
-        state->audio_shader = cfg.audio_shader;
+        state->hud_layout = cfg.hud_layout;
+        state->audio_visual_mode = cfg.audio_visual_mode;
         state->playback_speed = 1.0f;
         ds_video_set_front(&state->video, cfg.camera_front);
         ds_video_set_zoom(&state->video, cfg.zoom);
@@ -4312,6 +4526,7 @@ void android_main(struct android_app *app) {
                 free(state->dictionary);
                 free(state->preview_rgba);
                 free(state->mp4_rgba);
+                free(state->snap_orig_rgba);
                 ds_explore_destroy(&state->explore);
                 teardown_display(state);
                 app->userData = NULL;

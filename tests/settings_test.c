@@ -25,6 +25,10 @@ int main(void) {
     assert(s.anomaly_fx == true);
     assert(fabsf(s.zoom - 1.0f) < 0.01f);
 
+    assert(s.emf_alerts == true);
+    assert(s.hud_layout == DS_HUD_LAYOUT_FULL);
+    assert(s.audio_visual_mode == DS_AUDIO_VIS_WAVE);
+
     /* 2. Clamp invalid / out-of-range fields safely */
     DSSettings dirty = {
         .voice_mode = (DSVoiceMode)99,
@@ -41,6 +45,8 @@ int main(void) {
         .camera_front = true,
         .anomaly_fx = false,
         .zoom = 12.0f,
+        .hud_layout = (DSHudLayout)99,
+        .audio_visual_mode = (DSAudioVisualMode)99,
     };
     ds_settings_clamp(&dirty);
     assert(dirty.voice_mode == DS_VOICE_MODE_CLASSIC);
@@ -54,6 +60,8 @@ int main(void) {
     assert(dirty.camera_front == true);
     assert(dirty.anomaly_fx == false);
     assert(dirty.zoom == 3.0f);
+    assert(dirty.hud_layout == DS_HUD_LAYOUT_FULL);
+    assert(dirty.audio_visual_mode == DS_AUDIO_VIS_WAVE);
 
     /* 3. Round-trip atomic save & load, missing-file & null guards */
     assert(!ds_settings_save(NULL, &s));
@@ -87,6 +95,8 @@ int main(void) {
     custom.hpf_enabled = true;
     custom.mute_on_vox = false;
     custom.audio_shader = false;
+    custom.hud_layout = DS_HUD_LAYOUT_COMPACT;
+    custom.audio_visual_mode = DS_AUDIO_VIS_EQ;
 
     assert(ds_settings_save(path, &custom));
 
@@ -110,7 +120,21 @@ int main(void) {
     assert(loaded.emf_alerts == false);
     assert(loaded.hpf_enabled == true);
     assert(loaded.mute_on_vox == false);
-    assert(loaded.audio_shader == false);
+    assert(loaded.audio_shader == true);
+    assert(loaded.hud_layout == DS_HUD_LAYOUT_COMPACT);
+    assert(loaded.audio_visual_mode == DS_AUDIO_VIS_EQ);
+
+    /* Legacy audio_shader=0 without audio_visual_mode key maps to DS_AUDIO_VIS_OFF */
+    const char *legacy_path = "build/host/settings_legacy_audio.tmp";
+    unlink(legacy_path);
+    FILE *lf = fopen(legacy_path, "w");
+    assert(lf != NULL);
+    fputs("audio_shader=0\n", lf);
+    fclose(lf);
+    DSSettings legacy = {0};
+    assert(ds_settings_load(legacy_path, &legacy));
+    assert(legacy.audio_visual_mode == DS_AUDIO_VIS_OFF && !legacy.audio_shader);
+    unlink(legacy_path);
 
     /* 4. Out-of-range uint8 parsing does not wrap modulo 256 */
     const char *overflow_path = "build/host/settings_test_overflow.tmp";

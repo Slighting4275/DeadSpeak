@@ -25,6 +25,7 @@ typedef struct {
     bool anomaly;
     float anomaly_fx;
     uint64_t time_ms;
+    DSHudLayout hud_layout;
     char word[48];
     char filter_name[16];
 } DSVideoHudState;

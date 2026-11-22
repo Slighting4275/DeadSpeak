@@ -166,4 +166,59 @@ static inline DSFilterHUD ds_filter_hud(float width, float height, uint64_t dead
     return hud;
 }
 
+typedef enum {
+    DS_HUD_LAYOUT_FULL = 0,
+    DS_HUD_LAYOUT_COMPACT = 1,
+    DS_HUD_LAYOUT_MINIMAL = 2,
+    DS_HUD_LAYOUT_COUNT = 3,
+} DSHudLayout;
+
+typedef struct {
+    bool show_top_chrome;
+    bool show_quick_rows;
+    bool show_meters;
+    bool show_word_card;
+} DSHudVisibility;
+
+static inline DSHudLayout ds_hud_layout_next(DSHudLayout current) {
+    if ((unsigned)current >= DS_HUD_LAYOUT_COUNT) return DS_HUD_LAYOUT_FULL;
+    return (DSHudLayout)(((unsigned)current + 1U) % DS_HUD_LAYOUT_COUNT);
+}
+
+static inline const char *ds_hud_layout_label(DSHudLayout layout) {
+    switch (layout) {
+        case DS_HUD_LAYOUT_COMPACT: return "COMPACT";
+        case DS_HUD_LAYOUT_MINIMAL: return "MINIMAL";
+        case DS_HUD_LAYOUT_FULL:
+        default:                    return "FULL";
+    }
+}
+
+static inline DSHudVisibility ds_hud_visibility(DSHudLayout layout) {
+    switch (layout) {
+        case DS_HUD_LAYOUT_COMPACT:
+            return (DSHudVisibility){
+                .show_top_chrome = true,
+                .show_quick_rows = false,
+                .show_meters = true,
+                .show_word_card = true,
+            };
+        case DS_HUD_LAYOUT_MINIMAL:
+            return (DSHudVisibility){
+                .show_top_chrome = false,
+                .show_quick_rows = false,
+                .show_meters = false,
+                .show_word_card = false,
+            };
+        case DS_HUD_LAYOUT_FULL:
+        default:
+            return (DSHudVisibility){
+                .show_top_chrome = true,
+                .show_quick_rows = true,
+                .show_meters = true,
+                .show_word_card = true,
+            };
+    }
+}
+
 #endif
