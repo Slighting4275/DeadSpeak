@@ -91,7 +91,8 @@ typedef struct {
     EGLSurface egl_surface;
     DS_PFNEGLPRESENTATIONTIMEANDROID egl_presentation_time;
     GLuint gl_cam_prog, gl_hud_prog, gl_cam_tex, gl_hud_tex;
-    GLint gl_cam_img_loc, gl_cam_filter_loc, gl_hud_img_loc;
+    GLint gl_cam_img_loc, gl_cam_filter_loc, gl_cam_anomaly_loc, gl_cam_time_loc, gl_hud_img_loc;
+    bool current_torch, current_front;
     uint8_t *hud_rgba;
 
     bool codec_started, audio_started, muxer_started;
@@ -175,15 +176,22 @@ static void session_closed(void *context, ACameraCaptureSession *session) {
 static bool select_camera(DSVideoWorker *w, char id[128]) {
     ACameraIdList *ids = NULL;
     if (!camera_ok(w, ACameraManager_getCameraIdList(w->manager, &ids), "list cameras") || !ids) return false;
-    bool selected = false;
-    int64_t best_score = INT64_MAX;
+    const bool want_front = atomic_load(&w->capture->front_camera);
+    bool has_front = false;
+    ACameraMetadata *best_meta[2] = {NULL, NULL};
+    char best_id[2][128] = {{0}, {0}};
+    int best_pw[2] = {0, 0}, best_ph[2] = {0, 0};
+    int64_t best_score[2] = {INT64_MAX, INT64_MAX};
     for (int i = 0; i < ids->numCameras; ++i) {
         ACameraMetadata *metadata = NULL;
         if (ACameraManager_getCameraCharacteristics(w->manager, ids->cameraIds[i], &metadata) != ACAMERA_OK || !metadata) continue;
         ACameraMetadata_const_entry facing = {0}, streams = {0};
-        const bool rear = ACameraMetadata_getConstEntry(metadata, ACAMERA_LENS_FACING, &facing) == ACAMERA_OK &&
-            facing.type == ACAMERA_TYPE_BYTE && facing.count == 1 && facing.data.u8[0] == ACAMERA_LENS_FACING_BACK;
-        if (rear && ACameraMetadata_getConstEntry(metadata, ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, &streams) == ACAMERA_OK &&
+        const bool have_facing = ACameraMetadata_getConstEntry(metadata, ACAMERA_LENS_FACING, &facing) == ACAMERA_OK &&
+            facing.type == ACAMERA_TYPE_BYTE && facing.count == 1;
+        const bool is_front = have_facing && facing.data.u8[0] == ACAMERA_LENS_FACING_FRONT;
+        const bool is_back = have_facing && facing.data.u8[0] == ACAMERA_LENS_FACING_BACK;
+        if ((is_front || is_back) &&
+            ACameraMetadata_getConstEntry(metadata, ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, &streams) == ACAMERA_OK &&
             streams.type == ACAMERA_TYPE_INT32 && streams.count % 4U == 0U) {
             int pw = 0, ph = 0;
             int64_t score = INT64_MAX;
@@ -197,26 +205,51 @@ static bool select_camera(DSVideoWorker *w, char id[128]) {
                 candidate += llabs((int64_t)width * 9 - (int64_t)height * 16) * 100;
                 if (candidate < score) { score = candidate; pw = width; ph = height; }
             }
-            if (pw && score < best_score && strlen(ids->cameraIds[i]) < 128U) {
-                if (w->metadata) ACameraMetadata_free(w->metadata);
-                w->metadata = metadata; metadata = NULL;
-                snprintf(id, 128, "%s", ids->cameraIds[i]);
-                w->preview_width = pw; w->preview_height = ph;
-                best_score = score; selected = true;
+            const int slot = is_front ? 1 : 0;
+            if (is_front && pw > 0) has_front = true;
+            if (pw > 0 && score < best_score[slot] && strlen(ids->cameraIds[i]) < 128U) {
+                if (best_meta[slot]) ACameraMetadata_free(best_meta[slot]);
+                best_meta[slot] = metadata; metadata = NULL;
+                snprintf(best_id[slot], 128, "%s", ids->cameraIds[i]);
+                best_pw[slot] = pw; best_ph[slot] = ph;
+                best_score[slot] = score;
             }
         }
         if (metadata) ACameraMetadata_free(metadata);
     }
     ACameraManager_deleteCameraIdList(ids);
-    if (!selected) { fail(w, "no rear camera with a supported bounded YUV preview stream"); return false; }
+    atomic_store(&w->capture->front_available, has_front);
+    const int chosen = (want_front && best_meta[1]) ? 1 : (best_meta[0] ? 0 : (best_meta[1] ? 1 : -1));
+    if (chosen < 0) {
+        if (best_meta[0]) ACameraMetadata_free(best_meta[0]);
+        if (best_meta[1]) ACameraMetadata_free(best_meta[1]);
+        fail(w, "no camera with a supported bounded YUV preview stream");
+        return false;
+    }
+    const int other = 1 - chosen;
+    if (best_meta[other]) ACameraMetadata_free(best_meta[other]);
+    if (w->metadata) ACameraMetadata_free(w->metadata);
+    w->metadata = best_meta[chosen];
+    snprintf(id, 128, "%s", best_id[chosen]);
+    w->preview_width = best_pw[chosen]; w->preview_height = best_ph[chosen];
+    w->current_front = (chosen == 1);
+    atomic_store(&w->capture->front_camera, w->current_front);
+
+    ACameraMetadata_const_entry flash = {0};
+    const bool torch_avail = ACameraMetadata_getConstEntry(w->metadata, ACAMERA_FLASH_INFO_AVAILABLE, &flash) == ACAMERA_OK &&
+        flash.type == ACAMERA_TYPE_BYTE && flash.count == 1 && flash.data.u8[0] != 0;
+    atomic_store(&w->capture->torch_available, torch_avail);
+    if (!torch_avail) atomic_store(&w->capture->torch_enabled, false);
+
     ACameraMetadata_const_entry orientation = {0}, fps = {0}, source = {0};
     if (ACameraMetadata_getConstEntry(w->metadata, ACAMERA_SENSOR_ORIENTATION, &orientation) != ACAMERA_OK ||
         orientation.type != ACAMERA_TYPE_INT32 || orientation.count != 1) {
         fail(w, "missing camera orientation metadata"); return false;
     }
-    const int rotation = ds_video_orientation_hint(orientation.data.i32[0], w->capture->display_rotation);
+    const int rotation = ds_video_orientation_facing(orientation.data.i32[0], w->capture->display_rotation, w->current_front);
     if (rotation < 0) { fail(w, "invalid display/camera orientation"); return false; }
     atomic_store(&w->capture->preview_orientation, rotation);
+    w->fixed_30fps = false;
     if (ACameraMetadata_getConstEntry(w->metadata, ACAMERA_CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES, &fps) == ACAMERA_OK &&
         fps.type == ACAMERA_TYPE_INT32 && fps.count % 2U == 0U) {
         for (uint32_t n = 0; n < fps.count; n += 2U)
@@ -224,8 +257,9 @@ static bool select_camera(DSVideoWorker *w, char id[128]) {
     }
     w->realtime_timestamps = ACameraMetadata_getConstEntry(w->metadata, ACAMERA_SENSOR_INFO_TIMESTAMP_SOURCE, &source) == ACAMERA_OK &&
         source.type == ACAMERA_TYPE_BYTE && source.count == 1 && source.data.u8[0] == ACAMERA_SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME;
-    __android_log_print(ANDROID_LOG_INFO, DS_VIDEO_LOG, "rear camera %s YUV %dx%d orientation %d fixed30 %d",
-                        id, w->preview_width, w->preview_height, rotation, w->fixed_30fps);
+    __android_log_print(ANDROID_LOG_INFO, DS_VIDEO_LOG, "%s camera %s YUV %dx%d orientation %d torch %d fixed30 %d",
+                        w->current_front ? "front" : "rear", id, w->preview_width, w->preview_height,
+                        rotation, torch_avail ? 1 : 0, w->fixed_30fps);
     return true;
 }
 
@@ -243,6 +277,16 @@ static bool configure_camera_exposure(DSVideoWorker *w) {
     (void)ACaptureRequest_setEntry_u8(w->request, ACAMERA_CONTROL_EFFECT_MODE, 1, &effect);
     (void)ACaptureRequest_setEntry_i32(w->request, ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION, 1, &compensation);
     return true;
+}
+
+static void configure_camera_torch(DSVideoWorker *w) {
+    const bool avail = atomic_load(&w->capture->torch_available);
+    const bool enabled = avail && atomic_load(&w->capture->torch_enabled);
+    if (avail && w->request) {
+        const uint8_t mode = enabled ? ACAMERA_FLASH_MODE_TORCH : ACAMERA_FLASH_MODE_OFF;
+        (void)ACaptureRequest_setEntry_u8(w->request, ACAMERA_FLASH_MODE, 1, &mode);
+    }
+    w->current_torch = enabled;
 }
 
 static void free_session_objects(DSVideoWorker *w) {
@@ -295,6 +339,7 @@ static bool create_session(DSVideoWorker *w) {
         !w->session ||
         !camera_ok(w, ACameraDevice_createCaptureRequest(w->device, TEMPLATE_PREVIEW, &w->request), "create preview request")) return false;
     configure_camera_exposure(w);
+    configure_camera_torch(w);
     if (w->fixed_30fps) {
         const int32_t range[2] = {DS_VIDEO_FPS, DS_VIDEO_FPS};
         (void)ACaptureRequest_setEntry_i32(w->request, ACAMERA_CONTROL_AE_TARGET_FPS_RANGE, 2, range);
@@ -479,6 +524,8 @@ static bool init_encoder_gl(DSVideoWorker *w) {
     }
     w->gl_cam_img_loc = glGetUniformLocation(w->gl_cam_prog, "u_image");
     w->gl_cam_filter_loc = glGetUniformLocation(w->gl_cam_prog, "u_filter");
+    w->gl_cam_anomaly_loc = glGetUniformLocation(w->gl_cam_prog, "u_anomaly");
+    w->gl_cam_time_loc = glGetUniformLocation(w->gl_cam_prog, "u_time");
     w->gl_hud_img_loc = glGetUniformLocation(w->gl_hud_prog, "u_image");
 
     glGenTextures(1, &w->gl_cam_tex);
@@ -833,8 +880,9 @@ static void render_encoder_frame(DSVideoWorker *w) {
     w->last_enc_frame_ns = pts_ns;
 
     const int rotation = atomic_load(&w->capture->preview_orientation);
+    const float zoom = ds_video_get_zoom(w->capture);
     float uv[12];
-    if (!ds_preview_uv(fw, fh, rotation >= 0 ? rotation : 0, (float)w->enc_width, (float)w->enc_height, uv)) return;
+    if (!ds_preview_uv_zoom(fw, fh, rotation >= 0 ? rotation : 0, (float)w->enc_width, (float)w->enc_height, zoom, w->current_front, uv)) return;
 
     glViewport(0, 0, w->enc_width, w->enc_height);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -846,6 +894,8 @@ static void render_encoder_frame(DSVideoWorker *w) {
     glBindTexture(GL_TEXTURE_2D, w->gl_cam_tex);
     glUniform1i(w->gl_cam_img_loc, 0);
     glUniform1i(w->gl_cam_filter_loc, atomic_load(&w->capture->filter));
+    if (w->gl_cam_anomaly_loc >= 0) glUniform1f(w->gl_cam_anomaly_loc, hud.anomaly_fx);
+    if (w->gl_cam_time_loc >= 0) glUniform1f(w->gl_cam_time_loc, (float)(hud.time_ms % 60000ULL) * 0.001f);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, vertices);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, uv);
     glEnableVertexAttribArray(0);
@@ -981,6 +1031,31 @@ static void *video_thread(void *user_data) {
         }
         if (!preview_frame(w)) goto fatal;
         if (clock_ns(CLOCK_MONOTONIC) > w->preview_deadline) { fail(w, "camera stopped delivering fresh preview frames"); goto fatal; }
+        {
+            const bool want_torch = atomic_load(&capture->torch_available) && atomic_load(&capture->torch_enabled);
+            if (want_torch != w->current_torch && w->session && w->request) {
+                configure_camera_torch(w);
+                const camera_status_t ts = ACameraCaptureSession_setRepeatingRequest(w->session, NULL, 1, &w->request, NULL);
+                if (ts != ACAMERA_OK) __android_log_print(ANDROID_LOG_WARN, DS_VIDEO_LOG, "torch repeating request failed (%d)", (int)ts);
+            }
+            if (!recording && !wanted && atomic_load(&capture->front_camera) != w->current_front) {
+                if (!close_session(w)) goto fatal;
+                if (w->device) { ACameraDevice_close(w->device); w->device = NULL; }
+                if (w->reader) { AImageReader_delete(w->reader); w->reader = NULL; w->preview_window = NULL; }
+                pthread_mutex_lock(&w->mutex);
+                w->frame_width = 0; w->frame_height = 0;
+                w->frame_received = 0; w->last_camera_timestamp = 0;
+                w->color_logged = false;
+                pthread_mutex_unlock(&w->mutex);
+                if (!select_camera(w, id) ||
+                    !camera_ok(w, ACameraManager_openCamera(w->manager, id, &callbacks, &w->device), "reopen camera on lens switch") ||
+                    !w->device ||
+                    !media_ok(w, AImageReader_new(w->preview_width, w->preview_height, AIMAGE_FORMAT_YUV_420_888, 3, &w->reader), "recreate YUV reader") ||
+                    !w->reader ||
+                    !media_ok(w, AImageReader_getWindow(w->reader, &w->preview_window), "get YUV surface") ||
+                    !w->preview_window || !create_session(w)) goto fatal;
+            }
+        }
         if (recording) {
             render_encoder_frame(w);
             feed_audio_encoder(w, false);
@@ -1011,6 +1086,7 @@ cleanup:
     if (w->metadata) { ACameraMetadata_free(w->metadata); w->metadata = NULL; }
     if (w->manager) { ACameraManager_delete(w->manager); w->manager = NULL; }
     atomic_store(&capture->preview_ready, false); atomic_store(&capture->preview_running, false);
+    atomic_store(&capture->torch_enabled, false); atomic_store(&capture->torch_available, false);
     pthread_mutex_lock(&w->mutex);
     w->worker_finished = true; w->record_requested = false; atomic_store(&capture->active, false);
     pthread_cond_broadcast(&w->condition);
@@ -1095,6 +1171,7 @@ void ds_video_preview_stop(DSVideoCapture *capture) {
     }
     DSVideoWorker *w = capture->implementation;
     atomic_store(&capture->preview_ready, false); atomic_store(&capture->preview_running, false);
+    atomic_store(&capture->torch_enabled, false); atomic_store(&capture->torch_available, false);
     if (w) {
         pthread_mutex_lock(&w->mutex); w->record_requested = false;
         pthread_cond_broadcast(&w->condition); pthread_mutex_unlock(&w->mutex);
@@ -1191,6 +1268,50 @@ bool ds_video_copy_frame(DSVideoCapture *capture, uint8_t *rgba, size_t capacity
         if (okay) { memcpy(rgba, w->frame, bytes); w->copied_number = w->frame_number; }
     }
     pthread_mutex_unlock(&w->mutex); return okay;
+}
+
+void ds_video_set_torch(DSVideoCapture *capture, bool enabled) {
+    if (!capture) return;
+    atomic_store(&capture->torch_enabled, enabled && atomic_load(&capture->torch_available));
+    DSVideoWorker *w = acquire_worker(capture);
+    if (w) {
+        pthread_mutex_lock(&w->mutex);
+        pthread_cond_broadcast(&w->condition);
+        pthread_mutex_unlock(&w->mutex);
+        release_worker(capture);
+    }
+}
+
+bool ds_video_torch_available(const DSVideoCapture *capture) { return capture && atomic_load(&capture->torch_available); }
+bool ds_video_torch_enabled(const DSVideoCapture *capture) { return capture && atomic_load(&capture->torch_enabled); }
+
+void ds_video_set_front(DSVideoCapture *capture, bool front) {
+    if (!capture || ds_video_active(capture)) return;
+    if (front && capture->thread_created && !atomic_load(&capture->front_available)) return;
+    atomic_store(&capture->front_camera, front);
+    DSVideoWorker *w = acquire_worker(capture);
+    if (w) {
+        pthread_mutex_lock(&w->mutex);
+        pthread_cond_broadcast(&w->condition);
+        pthread_mutex_unlock(&w->mutex);
+        release_worker(capture);
+    }
+}
+
+bool ds_video_is_front(const DSVideoCapture *capture) { return capture && atomic_load(&capture->front_camera); }
+bool ds_video_front_available(const DSVideoCapture *capture) { return capture && atomic_load(&capture->front_available); }
+
+void ds_video_set_zoom(DSVideoCapture *capture, float zoom) {
+    if (!capture) return;
+    if (!isfinite(zoom) || zoom < 1.0f) zoom = 1.0f;
+    if (zoom > 4.0f) zoom = 4.0f;
+    atomic_store(&capture->zoom_milli, (uint32_t)lroundf(zoom * 1000.0f));
+}
+
+float ds_video_get_zoom(const DSVideoCapture *capture) {
+    if (!capture) return 1.0f;
+    const uint32_t milli = atomic_load(&capture->zoom_milli);
+    return milli > 0U ? (float)milli / 1000.0f : 1.0f;
 }
 
 int ds_video_preview_orientation(const DSVideoCapture *capture) { return capture ? atomic_load(&capture->preview_orientation) : -1; }

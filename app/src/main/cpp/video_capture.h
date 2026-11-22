@@ -23,6 +23,8 @@ typedef struct {
     float emf_delta;
     float signal;
     bool anomaly;
+    float anomaly_fx;
+    uint64_t time_ms;
     char word[48];
     char filter_name[16];
 } DSVideoHudState;
@@ -44,13 +46,26 @@ typedef struct {
     _Atomic bool preview_running;
     _Atomic bool preview_ready;
     _Atomic int preview_orientation;
+    _Atomic bool torch_available;
+    _Atomic bool torch_enabled;
+    _Atomic bool front_available;
+    _Atomic bool front_camera;
+    _Atomic uint32_t zoom_milli;
 } DSVideoCapture;
 
 /* Start is asynchronous. Unsupported filters/permission/device failures set failed.
- * A changed rotation restarts the preview; filter changes update in real-time. */
+ * A changed rotation restarts the preview; filter/torch/zoom update live. */
 void ds_video_preview_start(DSVideoCapture *capture, DSVideoFilter filter, int display_rotation);
 void ds_video_set_filter(DSVideoCapture *capture, DSVideoFilter filter);
 void ds_video_set_hud(DSVideoCapture *capture, const DSVideoHudState *hud);
+void ds_video_set_torch(DSVideoCapture *capture, bool enabled);
+bool ds_video_torch_available(const DSVideoCapture *capture);
+bool ds_video_torch_enabled(const DSVideoCapture *capture);
+void ds_video_set_front(DSVideoCapture *capture, bool front);
+bool ds_video_is_front(const DSVideoCapture *capture);
+bool ds_video_front_available(const DSVideoCapture *capture);
+void ds_video_set_zoom(DSVideoCapture *capture, float zoom);
+float ds_video_get_zoom(const DSVideoCapture *capture);
 bool ds_video_preview_ready(const DSVideoCapture *capture);
 /* Copies only an unseen actual frame no older than 500 ms. Unrotated RGBA8888,
  * tightly packed, <=640x480; caller should allocate 640*480*4 bytes.

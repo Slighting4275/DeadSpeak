@@ -1,8 +1,8 @@
 #ifndef DEADSPEAK_VIDEO_SHADERS_H
 #define DEADSPEAK_VIDEO_SHADERS_H
 
-/* Shared OpenGL ES 2.0 camera filter & overlay shaders used by both live preview
- * (main.c) and the hardware-backed MP4 encoder surface (video_capture.c). */
+/* Shared OpenGL ES 2.0 camera filter & anomaly overlay shaders used by both live
+ * preview (main.c) and the hardware-backed MP4 encoder surface (video_capture.c). */
 
 static const char *const DS_CAMERA_VERTEX_SHADER =
     "attribute vec2 a_position;\n"
@@ -17,9 +17,21 @@ static const char *const DS_CAMERA_FRAGMENT_SHADER =
     "precision mediump float;\n"
     "uniform sampler2D u_image;\n"
     "uniform int u_filter;\n"
+    "uniform float u_anomaly;\n"
+    "uniform float u_time;\n"
     "varying vec2 v_uv;\n"
     "void main() {\n"
-    "    vec4 c = texture2D(u_image, v_uv);\n"
+    "    vec2 uv = v_uv;\n"
+    "    vec4 c = texture2D(u_image, uv);\n"
+    "    if (u_anomaly > 0.01) {\n"
+    "        float band = sin(uv.y * 85.0 + u_time * 18.0);\n"
+    "        float jitter = (band > 0.86 ? 0.006 : 0.0015) * u_anomaly;\n"
+    "        float cr = texture2D(u_image, clamp(uv + vec2(jitter, 0.0), 0.0, 1.0)).r;\n"
+    "        float cb = texture2D(u_image, clamp(uv - vec2(jitter, 0.0), 0.0, 1.0)).b;\n"
+    "        c.rgb = mix(c.rgb, vec3(cr, c.g, cb), clamp(u_anomaly, 0.0, 1.0));\n"
+    "        float scan = 1.0 - 0.14 * u_anomaly * (0.5 + 0.5 * sin(uv.y * 240.0 + u_time * 24.0));\n"
+    "        c.rgb *= scan;\n"
+    "    }\n"
     "    float luma = dot(c.rgb, vec3(0.299, 0.587, 0.114));\n"
     "    if (u_filter == 0) {\n" /* NIGHT: Phosphor Green night vision */
     "        float g = clamp(luma * 1.55 + 0.08, 0.0, 1.0);\n"
@@ -34,14 +46,14 @@ static const char *const DS_CAMERA_FRAGMENT_SHADER =
     "        gl_FragColor = vec4(col, 1.0);\n"
     "    } else if (u_filter == 2) {\n" /* EDGE: Sobel spectral contour detection */
     "        float d = 1.0 / 480.0;\n"
-    "        float c0 = dot(texture2D(u_image, v_uv + vec2(-d, -d)).rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        float c1 = dot(texture2D(u_image, v_uv + vec2(0.0, -d)).rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        float c2 = dot(texture2D(u_image, v_uv + vec2(d, -d)).rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        float c3 = dot(texture2D(u_image, v_uv + vec2(-d, 0.0)).rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        float c5 = dot(texture2D(u_image, v_uv + vec2(d, 0.0)).rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        float c6 = dot(texture2D(u_image, v_uv + vec2(-d, d)).rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        float c7 = dot(texture2D(u_image, v_uv + vec2(0.0, d)).rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        float c8 = dot(texture2D(u_image, v_uv + vec2(d, d)).rgb, vec3(0.299, 0.587, 0.114));\n"
+    "        float c0 = dot(texture2D(u_image, uv + vec2(-d, -d)).rgb, vec3(0.299, 0.587, 0.114));\n"
+    "        float c1 = dot(texture2D(u_image, uv + vec2(0.0, -d)).rgb, vec3(0.299, 0.587, 0.114));\n"
+    "        float c2 = dot(texture2D(u_image, uv + vec2(d, -d)).rgb, vec3(0.299, 0.587, 0.114));\n"
+    "        float c3 = dot(texture2D(u_image, uv + vec2(-d, 0.0)).rgb, vec3(0.299, 0.587, 0.114));\n"
+    "        float c5 = dot(texture2D(u_image, uv + vec2(d, 0.0)).rgb, vec3(0.299, 0.587, 0.114));\n"
+    "        float c6 = dot(texture2D(u_image, uv + vec2(-d, d)).rgb, vec3(0.299, 0.587, 0.114));\n"
+    "        float c7 = dot(texture2D(u_image, uv + vec2(0.0, d)).rgb, vec3(0.299, 0.587, 0.114));\n"
+    "        float c8 = dot(texture2D(u_image, uv + vec2(d, d)).rgb, vec3(0.299, 0.587, 0.114));\n"
     "        float gx = -c0 + c2 - 2.0 * c3 + 2.0 * c5 - c6 + c8;\n"
     "        float gy = -c0 - 2.0 * c1 - c2 + c6 + 2.0 * c7 + c8;\n"
     "        float edge = clamp(sqrt(gx * gx + gy * gy) * 3.2, 0.0, 1.0);\n"

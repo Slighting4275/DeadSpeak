@@ -74,6 +74,7 @@ set(DS_CUSTOM_WORDS_OBJECT "${DS_ZIG_OBJECT_DIR}/custom_words.c.o")
 set(DS_VOICE_OBJECT "${DS_ZIG_OBJECT_DIR}/voice_synth.c.o")
 set(DS_VOICE_PLAYER_OBJECT "${DS_ZIG_OBJECT_DIR}/voice_player.c.o")
 set(DS_MEDIA_PLAYER_OBJECT "${DS_ZIG_OBJECT_DIR}/media_player.c.o")
+set(DS_SETTINGS_OBJECT "${DS_ZIG_OBJECT_DIR}/settings.c.o")
 
 function(ds_add_zig_c_object OUTPUT_OBJ SOURCE_FILE COMMENT_TEXT)
     set(options ALLOW_UNUSED_PARAM)
@@ -135,11 +136,15 @@ ds_add_zig_c_object("${DS_MEDIA_PLAYER_OBJECT}" "${CMAKE_CURRENT_SOURCE_DIR}/med
     "Compiling native MP4 A/V playback extractor with Zig cc"
     DEPENDS_LIST "${CMAKE_CURRENT_SOURCE_DIR}/media_player.h" "${CMAKE_CURRENT_SOURCE_DIR}/preview_frame.h")
 
+ds_add_zig_c_object("${DS_SETTINGS_OBJECT}" "${CMAKE_CURRENT_SOURCE_DIR}/settings.c"
+    "Compiling persistent settings store with Zig cc"
+    DEPENDS_LIST "${CMAKE_CURRENT_SOURCE_DIR}/settings.h" "${CMAKE_CURRENT_SOURCE_DIR}/camera_ui.h" "${CMAKE_CURRENT_SOURCE_DIR}/field_baseline.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.h" "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.h")
+
 ds_add_zig_c_object("${DS_MAIN_OBJECT}" "${CMAKE_CURRENT_SOURCE_DIR}/main.c"
     "Compiling DeadSpeak C platform layer with Zig cc"
     ALLOW_UNUSED_PARAM
     EXTRA_INCLUDES "${ANDROID_NDK}/sources/android/native_app_glue"
-    DEPENDS_LIST "${CMAKE_CURRENT_SOURCE_DIR}/typography.h" "${CMAKE_CURRENT_SOURCE_DIR}/voice_player.h" "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.h" "${CMAKE_CURRENT_SOURCE_DIR}/motion_filter.h" "${CMAKE_CURRENT_SOURCE_DIR}/field_baseline.h" "${CMAKE_CURRENT_SOURCE_DIR}/camera_ui.h" "${CMAKE_CURRENT_SOURCE_DIR}/custom_words.h" "${CMAKE_CURRENT_SOURCE_DIR}/sensor_state.h" "${CMAKE_CURRENT_SOURCE_DIR}/engine.h" "${CMAKE_CURRENT_SOURCE_DIR}/explore.h" "${CMAKE_CURRENT_SOURCE_DIR}/jni_scope.h" "${CMAKE_CURRENT_SOURCE_DIR}/ui_layout.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_shaders.h" "${CMAKE_CURRENT_SOURCE_DIR}/media_player.h")
+    DEPENDS_LIST "${CMAKE_CURRENT_SOURCE_DIR}/typography.h" "${CMAKE_CURRENT_SOURCE_DIR}/voice_player.h" "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.h" "${CMAKE_CURRENT_SOURCE_DIR}/motion_filter.h" "${CMAKE_CURRENT_SOURCE_DIR}/field_baseline.h" "${CMAKE_CURRENT_SOURCE_DIR}/camera_ui.h" "${CMAKE_CURRENT_SOURCE_DIR}/custom_words.h" "${CMAKE_CURRENT_SOURCE_DIR}/sensor_state.h" "${CMAKE_CURRENT_SOURCE_DIR}/engine.h" "${CMAKE_CURRENT_SOURCE_DIR}/explore.h" "${CMAKE_CURRENT_SOURCE_DIR}/jni_scope.h" "${CMAKE_CURRENT_SOURCE_DIR}/ui_layout.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_shaders.h" "${CMAKE_CURRENT_SOURCE_DIR}/media_player.h" "${CMAKE_CURRENT_SOURCE_DIR}/settings.h")
 
 ds_add_zig_c_object("${DS_GLUE_OBJECT}" "${DS_NATIVE_GLUE}"
     "Compiling Android native glue with Zig cc"
@@ -147,8 +152,8 @@ ds_add_zig_c_object("${DS_GLUE_OBJECT}" "${DS_NATIVE_GLUE}"
     EXTRA_INCLUDES "${ANDROID_NDK}/sources/android/native_app_glue"
     DEPENDS_LIST "${CMAKE_CURRENT_SOURCE_DIR}/jni_scope.h" "${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c" "${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.h")
 
-add_custom_target(ds_c_objects DEPENDS "${DS_MAIN_OBJECT}" "${DS_GLUE_OBJECT}" "${DS_VIDEO_OBJECT}" "${DS_EXPLORE_OBJECT}" "${DS_CUSTOM_WORDS_OBJECT}" "${DS_VOICE_OBJECT}" "${DS_VOICE_PLAYER_OBJECT}" "${DS_MEDIA_PLAYER_OBJECT}")
-set_source_files_properties("${DS_MAIN_OBJECT}" "${DS_GLUE_OBJECT}" "${DS_VIDEO_OBJECT}" "${DS_EXPLORE_OBJECT}" "${DS_CUSTOM_WORDS_OBJECT}" "${DS_VOICE_OBJECT}" "${DS_VOICE_PLAYER_OBJECT}" "${DS_MEDIA_PLAYER_OBJECT}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+add_custom_target(ds_c_objects DEPENDS "${DS_MAIN_OBJECT}" "${DS_GLUE_OBJECT}" "${DS_VIDEO_OBJECT}" "${DS_EXPLORE_OBJECT}" "${DS_CUSTOM_WORDS_OBJECT}" "${DS_VOICE_OBJECT}" "${DS_VOICE_PLAYER_OBJECT}" "${DS_MEDIA_PLAYER_OBJECT}" "${DS_SETTINGS_OBJECT}")
+set_source_files_properties("${DS_MAIN_OBJECT}" "${DS_GLUE_OBJECT}" "${DS_VIDEO_OBJECT}" "${DS_EXPLORE_OBJECT}" "${DS_CUSTOM_WORDS_OBJECT}" "${DS_VOICE_OBJECT}" "${DS_VOICE_PLAYER_OBJECT}" "${DS_MEDIA_PLAYER_OBJECT}" "${DS_SETTINGS_OBJECT}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
 
 add_library(deadspeak SHARED
     "${DS_MAIN_OBJECT}"
@@ -159,6 +164,7 @@ add_library(deadspeak SHARED
     "${DS_VOICE_OBJECT}"
     "${DS_VOICE_PLAYER_OBJECT}"
     "${DS_MEDIA_PLAYER_OBJECT}"
+    "${DS_SETTINGS_OBJECT}"
 )
 set_target_properties(deadspeak PROPERTIES LINKER_LANGUAGE C)
 target_include_directories(deadspeak PRIVATE

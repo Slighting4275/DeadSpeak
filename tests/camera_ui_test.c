@@ -1,5 +1,6 @@
 #undef NDEBUG
 #include "../app/src/main/cpp/camera_ui.h"
+#include "../app/src/main/cpp/video_orientation.h"
 #include <assert.h>
 #include <stdio.h>
 
@@ -57,6 +58,26 @@ int main(void) {
     assert(!ds_preview_uv(0,480,0,448,997,uv));
     assert(!ds_preview_uv(640,480,45,448,997,uv));
     assert(!ds_preview_uv(640,480,0,NAN,997,uv));
+
+    /* Verify front/rear orientation and digital zoom + horizontal mirror UV mapping */
+    assert(ds_video_orientation_facing(90, 0, false) == 90);
+    assert(ds_video_orientation_facing(90, 1, false) == 0);
+    assert(ds_video_orientation_facing(270, 0, true) == 270);
+    assert(ds_video_orientation_facing(270, 1, true) == 0);
+    assert(ds_video_orientation_facing(270, 3, true) == 180);
+    assert(ds_video_orientation_facing(45, 0, true) == -1);
+
+    float uv_zoom[12];
+    assert(ds_preview_uv_zoom(640, 480, 90, 480, 640, 1.0f, false, uv_zoom));
+    assert(ds_preview_uv(640, 480, 90, 480, 640, uv));
+    for (unsigned i = 0; i < 12; ++i) assert(fabsf(uv_zoom[i] - uv[i]) < 1e-5f);
+    assert(ds_preview_uv_zoom(640, 480, 90, 480, 640, 2.0f, false, uv_zoom));
+    for (unsigned i = 0; i < 12; ++i) assert(uv_zoom[i] >= 0.25f - 1e-5f && uv_zoom[i] <= 0.75f + 1e-5f);
+    float uv_mirror[12];
+    assert(ds_preview_uv_zoom(640, 480, 0, 640, 480, 1.0f, true, uv_mirror));
+    assert(uv_mirror[0] == 1.0f && uv_mirror[2] == 0.0f);
+    assert(!ds_preview_uv_zoom(640, 480, 0, 640, 480, 0.5f, false, uv_zoom));
+    assert(!ds_preview_uv_zoom(640, 480, 0, 640, 480, NAN, false, uv_zoom));
 
     /* Verify gesture classification */
     assert(ds_classify_gesture(-100.0f, 10.0f, 40.0f) == DS_GESTURE_SWIPE_LEFT);

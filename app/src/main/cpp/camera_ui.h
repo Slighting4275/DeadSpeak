@@ -82,27 +82,36 @@ static inline DSRect ds_camera_framing_rect(float view_w, float nav_top, DSVideo
     return (DSRect){(view_w - w) * 0.5f, (nav_top - h) * 0.5f, w, h};
 }
 
-/* Texture coordinates for an upright, centred aspect-fill view of a rear
- * camera image. Rotation is clockwise; no mirrored or stretched preview. */
-static inline bool ds_preview_uv(int source_width, int source_height, int rotation,
-                                  float view_width, float view_height, float uv[12]) {
+/* Texture coordinates for an upright, centred aspect-fill view with digital zoom
+ * [1.0, 4.0] and optional horizontal selfie mirror along the output view X-axis. */
+static inline bool ds_preview_uv_zoom(int source_width, int source_height, int rotation,
+                                        float view_width, float view_height,
+                                        float zoom, bool mirror_x, float uv[12]) {
     if (source_width <= 0 || source_height <= 0 || view_width <= 0 || view_height <= 0 ||
         !isfinite(view_width) || !isfinite(view_height) ||
+        !isfinite(zoom) || zoom < 1.0f || zoom > 4.0f ||
         (rotation != 0 && rotation != 90 && rotation != 180 && rotation != 270)) return false;
     const bool swap = rotation == 90 || rotation == 270;
     const float image_aspect = (float)(swap ? source_height : source_width) /
                                (float)(swap ? source_width : source_height);
     const float view_aspect = view_width / view_height;
-    const float span_u = image_aspect > view_aspect ? view_aspect / image_aspect : 1;
-    const float span_v = image_aspect > view_aspect ? 1 : image_aspect / view_aspect;
+    const float span_u = (image_aspect > view_aspect ? view_aspect / image_aspect : 1.0f) / zoom;
+    const float span_v = (image_aspect > view_aspect ? 1.0f : image_aspect / view_aspect) / zoom;
     const float corners[12] = {0,0, 1,0, 0,1, 0,1, 1,0, 1,1};
     for (size_t i = 0; i < 6; ++i) {
-        const float u = (1 - span_u) * 0.5f + corners[i * 2] * span_u;
-        const float v = (1 - span_v) * 0.5f + corners[i * 2 + 1] * span_v;
-        uv[i * 2] = rotation == 90 ? v : rotation == 180 ? 1 - u : rotation == 270 ? 1 - v : u;
-        uv[i * 2 + 1] = rotation == 90 ? 1 - u : rotation == 180 ? 1 - v : rotation == 270 ? u : v;
+        const float cx = mirror_x ? (1.0f - corners[i * 2]) : corners[i * 2];
+        const float cy = corners[i * 2 + 1];
+        const float u = (1.0f - span_u) * 0.5f + cx * span_u;
+        const float v = (1.0f - span_v) * 0.5f + cy * span_v;
+        uv[i * 2] = rotation == 90 ? v : rotation == 180 ? 1.0f - u : rotation == 270 ? 1.0f - v : u;
+        uv[i * 2 + 1] = rotation == 90 ? 1.0f - u : rotation == 180 ? 1.0f - v : rotation == 270 ? u : v;
     }
     return true;
+}
+
+static inline bool ds_preview_uv(int source_width, int source_height, int rotation,
+                                  float view_width, float view_height, float uv[12]) {
+    return ds_preview_uv_zoom(source_width, source_height, rotation, view_width, view_height, 1.0f, false, uv);
 }
 
 #include <stdint.h>
