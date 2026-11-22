@@ -12,12 +12,12 @@ DeadSpeak is a native Android fieldwork and evidence-recording app for paranorma
   - `DYNAMIC`: Reactive acoustic modulation dynamically shifting pitch and playback rate according to real-time magnetic anomaly intensity ($|\Delta\mu\text{T}|$).
   - `SPIRIT BOX`: Swept formant modulation combined with burst radio static.
 - **3D Adaptive Baseline & Environmental Drift Tracking**: Continuously monitors ambient geomagnetic flux across all 3 spatial axes ($B_x, B_y, B_z$) using an exponential moving average (EWMA, $\alpha = 0.015, \tau \approx 7\,\text{s}$). Naturally absorbs slow room drift, building settling, and temperature fluctuations without requiring constant manual calibration.
-- **Event-Driven Transient Anomaly Trigger**: Completely silent in calm ambient environments (no random or periodic timer-based word spitting). Anomalies require a sustained transient flux deviation ($\ge 200\,\text{ms}$) exceeding the threshold. Fires exactly once at the peak of the anomaly, then disarms until the field returns below reset threshold ($0.5\times\text{Threshold}$) and a $2.5\,\text{s}$ cooldown window elapses, preventing repetitive loops near stationary metal or electrical fixtures.
+- **Event-Driven Transient Anomaly Trigger**: Completely silent in calm ambient environments (no random or periodic timer-based word spitting). Anomalies require a sustained transient flux deviation ($\ge 2$ samples / $\ge 200\,\text{ms}$) exceeding the threshold and peaking before triggering. Fires once per resolved peak, then disarms until the field returns below the reset threshold ($0.5\times\text{Threshold}$) and the sensitivity cooldown window ($1.5\,\text{s}$ / $2.5\,\text{s}$ / $4.0\,\text{s}$) elapses, preventing repetitive loops near stationary metal or electrical fixtures.
 - **Deterministic 3D Magnetic Vector Dictionary Mapping**: Maps spatial perturbation vectors $(\Delta B_x, \Delta B_y, \Delta B_z)$ deterministically to the dictionary using 64-bit spatial FNV-1a hashing across quantized spherical coordinates (horizontal azimuth $\theta$, vertical elevation $\phi$, and flux magnitude $\Delta||\vec{B}||$). Zero clock-based RNG or sample counters; identical physical field perturbations yield identical dictionary words.
 - **Adjustable Sensitivity Presets**: Cycle live in the sensor details overlay:
-  - `SENS: HI` ($4.0\,\mu\text{T}$ threshold): Maximum sensitivity for magnetically quiet, remote fieldwork locations.
-  - `SENS: MED` ($8.0\,\mu\text{T}$ threshold, default): Balanced signal-to-noise ratio for standard paranormal investigations.
-  - `SENS: LO` ($15.0\,\mu\text{T}$ threshold): Robust filtering for locations with high background electromagnetic interference (EMI).
+  - `SENS: HI` ($4.0\,\mu\text{T}$ threshold, $1.5\,\text{s}$ cooldown, default): Maximum sensitivity for magnetically quiet, remote fieldwork locations.
+  - `SENS: MED` ($8.0\,\mu\text{T}$ threshold, $2.5\,\text{s}$ cooldown): Balanced signal-to-noise ratio for standard paranormal investigations.
+  - `SENS: LO` ($15.0\,\mu\text{T}$ threshold, $4.0\,\text{s}$ cooldown): Robust filtering for locations with high background electromagnetic interference (EMI).
 - **Acoustic EMF Geiger Ticks**: Scaled live click telemetry through `AAudio` when magnetic field deviations occur above baseline, accelerating dynamically with anomaly intensity ($\Delta\text{EMF}$) for hands-free audible tracking.
 - **DSP Schroeder Reverb & Multi-Tap Echo**: Atmospheric spatial resonance, 3-tap parallel comb delay lines, and all-pass diffusion for decaying ghost echoes on synthesized words.
 - **6-DOF IMU Motion Rejection Filter**: Low-pass filtered angular velocity ($\text{rad/s}$) and linear acceleration deviation from $1g$ ($9.80665\,\text{m/s}^2$). Rejects false magnetic anomalies caused by user hand movement, instantly flushes partial transient accumulation, and enforces a 1.2-second settling hold before re-enabling baseline triggers.
@@ -55,16 +55,16 @@ DeadSpeak is a native Android fieldwork and evidence-recording app for paranorma
 - **Dual-Tier DictionaryView Word Announcer & 10-Second Hold**:
   - High-visibility primary detected word card with secondary real-time telemetry subtitle ($\mu\text{T}$, baseline delta, coordinates, and whisper indicator).
   - 10-second hold display window with graceful automatic reversion to "LISTENING..." and 3-second pulsing cyan anomaly border during active spikes.
-- **Companion File Triad & Interactive Scrubbable Tag Timeline**:
-  - During recording, automatically generates 3 synchronized companion files alongside media:
+- **Companion File Quartet & Interactive Scrubbable Tag Timeline**:
+  - During recording, automatically generates 4 synchronized companion files alongside media:
     - `<recording>.txt`: Chronological list of words triggered during the session.
-    - `<recording>_tags.txt`: Anomaly event CSV (`<timestamp_ms>,<tag_id>`) with Tag 1 (Word trigger, Green), Tag 2 (Anomaly alert: EMF spike, Sub-bass EVP burst, Proximity trigger, Orange), and Tag 3 (Manual bookmark via `[+TAG]` HUD button, Purple).
+    - `<recording>_tags.txt`: Anomaly event CSV (`<timestamp_ms>,<tag_id>`) with Tag 1 (Word trigger, Green), Tag 2 (Anomaly alert: EMF spike, Sub-bass EVP burst, Proximity trigger, Orange), and Tag 3 (Manual bookmark via live `+TAG` or Log `+BOOKMARK`, Purple).
     - `<recording>_waveform.txt`: RMS audio amplitude telemetry sampled every 250 ms.
-    - `<recording>.srt`: 1-second timestamped subtitle telemetry cue points tracking $\mu\text{T}$, baseline delta, IMU stability, and triggered words.
-  - In-app Log gallery displays companion status badges (`[TXT] [TAGS] [WAVE] [SRT]`), inline BMP snapshot viewer (`ZOOM: 1X/2X`), inline hardware-decoded MP4 video + AAC audio playback, and atomic delete (`[DEL]`) unlinking primary captures and all 4 companion files synchronously.
-  - Interactive scrubbable player with real-time waveform progress bar, tag marker dots along the timeline, `[<< TAG]` / `[TAG >>]` instantaneous tag seeking, `[SPD]` variable speed (`0.5X` / `0.75X` / `1.0X` / `1.5X`), `[LOOP A / LOOP B / CLR A-B]` segment looping, and `[+BOOKMARK]` live Tag 3 insertion.
+    - `<recording>.srt`: 1-second timestamped subtitle telemetry cue points tracking $\mu\text{T}$, baseline delta, IMU stability, triggered words, and available ambient lux / barometric pressure readings.
+  - In-app Log gallery displays companion status badges (`TXT`, `TAGS`, `WF`, `SRT`), inline BMP snapshot viewer (`ZOOM: 1X/2X`), inline hardware-decoded MP4 video + AAC audio playback, and atomic delete (`DEL`) unlinking primary captures and all 4 companion files synchronously.
+  - Interactive scrubbable player with real-time waveform progress bar, tag marker dots along the timeline, `<< TAG` / `TAG >>` instantaneous tag seeking (300 ms debounce), `SPD` variable speed (`0.5X` / `0.75X` / `1.0X` / `1.5X`), `LOOP A / LOOP B / CLR A-B` segment looping, and `+BOOKMARK` live Tag 3 insertion.
 - **Dynamic Voice Modulation**:
-  - Dynamically modulates voice pitch multiplier $[0.50, 1.30]$ and speed $[0.80, 1.10]$ per triggered word, combined with microtonal vibrato and Schroeder comb-filter atmospheric reverb.
+  - In `DYNAMIC` mode, modulates the user's configured `pitch_hz` by $\times(1.0 + 0.45\cdot\Delta_{\text{factor}})$ clamped to $[60, 300]\,\text{Hz}$ and `speed` by $+0.35\cdot\Delta_{\text{factor}}$ clamped to $[0.50, 2.50]\times$ (where $\Delta_{\text{factor}} = \min(|\Delta\text{EMF}|/40, 1.5)$), combined with microtonal vibrato and Schroeder comb-filter atmospheric reverb.
 - **HUD Live Controls & Bookmarking**:
   - `+TAG` one-tap manual bookmarking button during active recording to tag anomalous investigation events.
   - Transient toast status banners for export and bookmark confirmation.
@@ -82,7 +82,7 @@ Audio (`EVP_*.wav`), muxed filtered A/V video (`VIDEO_*.mp4`), and filtered snap
 
 ## Requirements and language boundary
 
-DeadSpeak and its build contain no Java/Kotlin code, bytecode, DEX, JARs, or JVM-based tools. Application logic is C23 and Zig; binary assets contain data, not disguised bytecode. Android's operating-system framework remains a platform dependency: C uses JNI for system permissions, window APIs, and platform network/JSON services. No app-defined Java classes are compiled or packaged. The manifest explicitly sets `android:hasCode="false"`.
+DeadSpeak and its build contain **no C++** (`.cpp`/`.cc`/`.hpp`) and **no Java, Kotlin, bytecode, DEX, JARs, or JVM-based tools**. All application, UI, camera, audio, storage, and build/test driver code is written in **ISO C23** (`26` `.c` files + `23` `.h` C headers compiled with `zig cc -std=c23`), paired with the deterministic **Zig** signal/vector engine (`src/engine.zig`). OpenGL ES 2 shaders are embedded as C string literals (`app/src/main/cpp/video_shaders.h`), and build/test orchestration uses POSIX shell, CMake, and Python (`tools/gen_font_atlas.py`). A root `.gitattributes` rule (`*.h linguist-language=C`) ensures Git hosting language statistics classify C headers accurately as C rather than C++. Android's operating-system framework remains a platform dependency: C uses JNI for system permissions, window APIs, and platform network/JSON services. No app-defined Java classes are compiled or packaged, and the manifest explicitly sets `android:hasCode="false"`.
 
 - Linux build host with Zig, CMake 3.25+, Ninja, pkg-config, libarchive, libxml2, and OpenSSL 3 development headers.
 - Installed Android NDK 30.0.16248370, SDK platform 37.2 (including its raw `data/res` directory), and native build tools 37.0.0. Versions are pinned in `tools/build_config.h`.
