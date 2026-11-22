@@ -119,6 +119,29 @@ int main(void) {
     const float high_energy = ds_engine_sub_bass_energy(samples, 4800, 48000);
     assert(isfinite(high_energy) && high_energy < sub_energy * 0.25f);
 
+    /* 9. Hann-windowed dB spectrum & speech-band energy ratio */
+    float hann_bins[24];
+    memset(samples, 0, sizeof(samples));
+    ds_engine_spectrum_hann_db(samples, 1024, 48000, hann_bins, 24);
+    for (unsigned i = 0; i < 24; ++i) assert(hann_bins[i] == 0.0f);
+    assert(ds_engine_speech_ratio(samples, 1024, 48000) == 0.0f);
+    assert(ds_engine_speech_ratio(NULL, 1024, 48000) == 0.0f);
+
+    for (unsigned i = 0; i < 1024; ++i)
+        samples[i] = (int16_t)(16000 * sin(6.283185307179586 * 913.5 * i / 48000.0));
+    ds_engine_spectrum_hann_db(samples, 1024, 48000, hann_bins, 24);
+    assert(hann_bins[11] > 0.6f && hann_bins[0] < 0.05f && hann_bins[23] < 0.05f);
+
+    for (unsigned i = 0; i < 1024; ++i)
+        samples[i] = (int16_t)(16000 * sin(6.283185307179586 * 1000.0 * i / 48000.0));
+    /* Hann-windowed 1024-sample 1000 Hz tone has negligible sub-bass sidelobe leakage and high speech ratio */
+    assert(ds_engine_sub_bass_energy(samples, 1024, 48000) < 10.0f);
+    assert(ds_engine_speech_ratio(samples, 1024, 48000) > 2.0f);
+
+    for (unsigned i = 0; i < 1024; ++i)
+        samples[i] = (int16_t)(16000 * sin(6.283185307179586 * 160.0 * i / 48000.0));
+    assert(ds_engine_speech_ratio(samples, 1024, 48000) < 0.5f);
+
     puts("PASS: measured calibration, deviation-only word triggers, debounce, real spectrum bins and invalid-field guards");
     return 0;
 }

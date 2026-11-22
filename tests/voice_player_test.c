@@ -61,8 +61,11 @@ int main(void) {
         .enabled = true
     };
     ds_voice_player_speak(p, "HELLO", &config);
+    assert(ds_voice_player_is_speaking(p));
+    assert(!ds_voice_player_is_speaking(NULL));
     nanosleep(&(struct timespec){.tv_sec = 0, .tv_nsec = 50000000L}, NULL); /* 50ms */
     ds_voice_player_stop(p);
+    assert(!ds_voice_player_is_speaking(p));
 
     /* 3. WAV playback */
     const char *wav_path_48k = "/data/local/tmp/test_48k.wav";

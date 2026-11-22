@@ -15,6 +15,7 @@ void ds_voice_player_destroy(DSVoicePlayer *p);
 
 /* Queues a text string to be synthesized and spoken. Non-blocking. */
 void ds_voice_player_speak(DSVoicePlayer *p, const char *text, const DSVoiceConfig *config);
+bool ds_voice_player_is_speaking(const DSVoicePlayer *p);
 
 /* Set acoustic Geiger EMF tick frequency (0.0 to 100.0 clicks/sec). */
 void ds_voice_player_set_geiger_rate(DSVoicePlayer *p, float clicks_per_sec);

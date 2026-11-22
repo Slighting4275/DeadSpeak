@@ -3,8 +3,15 @@
 
 #include "ui_layout.h"
 
+typedef enum {
+    DS_ASPECT_16_9 = 0,
+    DS_ASPECT_9_16 = 1,
+    DS_ASPECT_4_5 = 2,
+    DS_ASPECT_COUNT = 3,
+} DSVideoAspect;
+
 typedef struct {
-    DSRect viewport, tools[5], audio, magnetic, word, record, navigation;
+    DSRect viewport, tools[5], audio, magnetic, word, record, aspect_btn, hud_btn, navigation;
 } DSCameraUI;
 
 static inline DSCameraUI ds_camera_ui(float width, float height) {
@@ -18,10 +25,61 @@ static inline DSCameraUI ds_camera_ui(float width, float height) {
         ui.tools[i] = (DSRect){width - 60.0f, 66.0f + (float)i * (tool_height + 6.0f), 44.0f, tool_height};
     const float bottom = ui.navigation.y - 10;
     ui.record = (DSRect){width * 0.5f - 30, bottom - 60, 60, 60};
+    const float pill_h = 38.0f;
+    const float pill_y = ui.record.y + (ui.record.h - pill_h) * 0.5f;
+    const float left_max_x = ui.record.x - 10.0f;
+    const float left_w = fmaxf(44.0f, fminf(92.0f, left_max_x - left));
+    ui.aspect_btn = (DSRect){fmaxf(0.0f, left_max_x - left_w), pill_y, left_w, pill_h};
+    const float right_min_x = ui.record.x + ui.record.w + 10.0f;
+    const float right_max_x = ui.tools[0].x - 8.0f;
+    const float right_w = fmaxf(44.0f, fminf(92.0f, right_max_x - right_min_x));
+    ui.hud_btn = (DSRect){right_min_x, pill_y, right_w, pill_h};
     ui.word = (DSRect){left, bottom - 112, right - left, 40};
     ui.magnetic = (DSRect){left, ui.word.y - 40, right - left, 32};
     ui.audio = (DSRect){left, ui.magnetic.y - 44, right - left, 36};
     return ui;
+}
+
+static inline float ds_video_aspect_ratio(DSVideoAspect aspect) {
+    switch (aspect) {
+        case DS_ASPECT_16_9: return 16.0f / 9.0f;
+        case DS_ASPECT_9_16: return 9.0f / 16.0f;
+        case DS_ASPECT_4_5: return 4.0f / 5.0f;
+        default: return 16.0f / 9.0f;
+    }
+}
+
+static inline bool ds_video_encode_dimensions(DSVideoAspect aspect, int *out_w, int *out_h) {
+    if (!out_w || !out_h) return false;
+    switch (aspect) {
+        case DS_ASPECT_16_9:
+            *out_w = 1920;
+            *out_h = 1080;
+            return true;
+        case DS_ASPECT_9_16:
+            *out_w = 1080;
+            *out_h = 1920;
+            return true;
+        case DS_ASPECT_4_5:
+            *out_w = 1088;
+            *out_h = 1360;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static inline DSRect ds_camera_framing_rect(float view_w, float nav_top, DSVideoAspect aspect) {
+    if (view_w <= 0.0f || nav_top <= 0.0f) return (DSRect){0};
+    const float target = ds_video_aspect_ratio(aspect);
+    const float avail = view_w / nav_top;
+    float w = view_w, h = nav_top;
+    if (avail > target) {
+        w = nav_top * target;
+    } else {
+        h = view_w / target;
+    }
+    return (DSRect){(view_w - w) * 0.5f, (nav_top - h) * 0.5f, w, h};
 }
 
 /* Texture coordinates for an upright, centred aspect-fill view of a rear

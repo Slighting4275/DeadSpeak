@@ -23,9 +23,28 @@ int main(void) {
             assert(ui.audio.y + ui.audio.h < ui.magnetic.y);
             assert(ui.magnetic.y + ui.magnetic.h < ui.word.y);
             assert(ui.word.y + ui.word.h < ui.record.y);
+            /* Framing & HUD quick toggles must sit cleanly flanking the record button */
+            assert(ui.aspect_btn.x >= 0 && ui.aspect_btn.w >= 44 && ui.aspect_btn.h >= 36);
+            assert(ui.aspect_btn.x + ui.aspect_btn.w < ui.record.x);
+            assert(ui.aspect_btn.y >= ui.word.y + ui.word.h && ui.aspect_btn.y + ui.aspect_btn.h <= ui.navigation.y);
+            assert(ui.hud_btn.w >= 44 && ui.hud_btn.h >= 36);
+            assert(ui.hud_btn.x > ui.record.x + ui.record.w);
+            assert(ui.hud_btn.x + ui.hud_btn.w < ui.tools[0].x);
+            assert(ui.hud_btn.y >= ui.word.y + ui.word.h && ui.hud_btn.y + ui.hud_btn.h <= ui.navigation.y);
+            for (int a = 0; a < DS_ASPECT_COUNT; ++a) {
+                const DSRect frame = ds_camera_framing_rect((float)width, ui.navigation.y, (DSVideoAspect)a);
+                assert(frame.x >= 0.0f && frame.y >= 0.0f && frame.w > 0.0f && frame.h > 0.0f);
+                assert(frame.x + frame.w <= (float)width + 0.01f && frame.y + frame.h <= ui.navigation.y + 0.01f);
+            }
             ++layouts;
         }
     }
+    int ew = 0, eh = 0;
+    assert(ds_video_encode_dimensions(DS_ASPECT_16_9, &ew, &eh) && ew == 1920 && eh == 1080);
+    assert(ds_video_encode_dimensions(DS_ASPECT_9_16, &ew, &eh) && ew == 1080 && eh == 1920);
+    assert(ds_video_encode_dimensions(DS_ASPECT_4_5, &ew, &eh) && ew == 1088 && eh == 1360 && (ew % 16) == 0 && (eh % 16) == 0);
+    assert(!ds_video_encode_dimensions((DSVideoAspect)99, &ew, &eh));
+    assert(!ds_video_encode_dimensions(DS_ASPECT_16_9, NULL, &eh));
     float uv[12];
     for (int rotation = 0; rotation < 360; rotation += 90) {
         assert(ds_preview_uv(640, 480, rotation, 448, 997, uv));

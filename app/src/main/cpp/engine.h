@@ -12,7 +12,9 @@ float ds_engine_smooth(float previous, float current, float alpha);
 float ds_engine_signal(float magnetic_field, float measured_baseline);
 void ds_engine_spectrum(const int16_t *samples, size_t count, uint32_t sample_rate, float bands[3]);
 void ds_engine_spectrum_bins(const int16_t *samples, size_t count, uint32_t sample_rate, float *bins, size_t bin_count);
+void ds_engine_spectrum_hann_db(const int16_t *samples, size_t count, uint32_t sample_rate, float *bins, size_t bin_count);
 float ds_engine_sub_bass_energy(const int16_t *samples, size_t count, uint32_t sample_rate);
+float ds_engine_speech_ratio(const int16_t *samples, size_t count, uint32_t sample_rate);
 size_t ds_engine_vector_word(float bx, float by, float bz,
                              float base_x, float base_y, float base_z,
                              const uint8_t *dictionary, size_t dictionary_size,

@@ -20,10 +20,15 @@ fn goertzel(samples: [*]const i16, count: usize, sample_rate: u32, frequency: f6
     if (count == 0 or sample_rate == 0) return 0.0;
     const omega = 6.283185307179586 * frequency / @as(f64, @floatFromInt(sample_rate));
     const coefficient: f32 = @floatCast(2.0 * @cos(omega));
+    const denom: f64 = if (count > 1) @as(f64, @floatFromInt(count - 1)) else 1.0;
     var previous: f32 = 0.0;
     var previous_two: f32 = 0.0;
     for (0..count) |i| {
-        const sample: f32 = @as(f32, @floatFromInt(samples[i])) / 32768.0;
+        const hann: f32 = if (count > 1)
+            @floatCast(1.0 - @cos(6.283185307179586 * @as(f64, @floatFromInt(i)) / denom))
+        else
+            1.0;
+        const sample: f32 = (@as(f32, @floatFromInt(samples[i])) / 32768.0) * hann;
         const current = sample + coefficient * previous - previous_two;
         previous_two = previous;
         previous = current;
@@ -53,6 +58,37 @@ export fn ds_engine_spectrum_bins(samples: [*]const i16, count: usize, sample_ra
     }
 }
 
+export fn ds_engine_spectrum_hann_db(samples: ?[*]const i16, count: usize, sample_rate: u32,
+                                    bins: ?[*]f32, bin_count: usize) void {
+    if (bin_count == 0 or bin_count > 64) return;
+    const out = bins orelse return;
+    const pcm = samples orelse {
+        for (0..bin_count) |i| out[i] = 0.0;
+        return;
+    };
+    if (count == 0 or sample_rate == 0) {
+        for (0..bin_count) |i| out[i] = 0.0;
+        return;
+    }
+    const nyquist = @as(f64, @floatFromInt(sample_rate)) * 0.5;
+    for (0..bin_count) |i| {
+        const t = if (bin_count == 1) 0.0 else @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(bin_count - 1));
+        const frequency = 125.0 * @exp(t * @log(@as(f64, 64.0)));
+        if (frequency >= nyquist) {
+            out[i] = 0.0;
+            continue;
+        }
+        const amp = goertzel(pcm, count, sample_rate, frequency);
+        if (amp <= 0.0005) {
+            out[i] = 0.0;
+            continue;
+        }
+        const db = 20.0 * @log10(@as(f64, amp));
+        const norm: f32 = @floatCast((db + 60.0) / 60.0);
+        out[i] = if (norm < 0.0) 0.0 else if (norm > 1.0) 1.0 else norm;
+    }
+}
+
 export fn ds_engine_sub_bass_energy(samples: ?[*]const i16, count: usize, sample_rate: u32) f32 {
     const pcm = samples orelse return 0.0;
     if (count == 0 or sample_rate == 0) return 0.0;
@@ -65,6 +101,26 @@ export fn ds_engine_sub_bass_energy(samples: ?[*]const i16, count: usize, sample
         }
     }
     return (total_amp / @as(f32, @floatFromInt(freqs.len))) * 1000.0;
+}
+
+export fn ds_engine_speech_ratio(samples: ?[*]const i16, count: usize, sample_rate: u32) f32 {
+    const pcm = samples orelse return 0.0;
+    if (count == 0 or sample_rate == 0) return 0.0;
+    const sub_freqs = [_]f64{ 80.0, 120.0, 160.0, 200.0, 250.0, 300.0 };
+    const speech_freqs = [_]f64{ 400.0, 700.0, 1000.0, 1400.0, 1900.0, 2400.0 };
+    const nyquist = @as(f64, @floatFromInt(sample_rate)) * 0.5;
+    var sub_sum: f32 = 0.0;
+    for (sub_freqs) |freq| {
+        if (freq < nyquist) sub_sum += goertzel(pcm, count, sample_rate, freq);
+    }
+    var speech_sum: f32 = 0.0;
+    for (speech_freqs) |freq| {
+        if (freq < nyquist) speech_sum += goertzel(pcm, count, sample_rate, freq);
+    }
+    const sub_mean = sub_sum / @as(f32, @floatFromInt(sub_freqs.len));
+    const speech_mean = speech_sum / @as(f32, @floatFromInt(speech_freqs.len));
+    if (speech_mean <= 0.00001 and sub_mean <= 0.00001) return 0.0;
+    return speech_mean / (sub_mean + 0.0005);
 }
 
 fn read_u16(bytes: [*]const u8, offset: usize) u16 {

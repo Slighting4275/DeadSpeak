@@ -1,7 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
 #include "video_capture.h"
 #include "video_orientation.h"
+#include "video_shaders.h"
 #include "preview_frame.h"
+#include "typography.h"
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <GLES2/gl2.h>
 #include <android/log.h>
 #include <android/native_window.h>
 #include <android/data_space.h>
@@ -24,15 +29,31 @@
 #include <unistd.h>
 
 #define DS_VIDEO_LOG "DeadSpeakVideo"
-#define DS_VIDEO_WIDTH 1920
-#define DS_VIDEO_HEIGHT 1080
+#define DS_VIDEO_DEFAULT_W 1920
+#define DS_VIDEO_DEFAULT_H 1080
 #define DS_VIDEO_FPS 30
 #define DS_VIDEO_BITRATE 8000000
+#define DS_AUDIO_SAMPLE_RATE 48000
+#define DS_AUDIO_BITRATE 96000
 #define DS_COLOR_FORMAT_SURFACE 0x7F000789
+#define DS_EGL_RECORDABLE_ANDROID 0x3142
+#define DS_AUDIO_RING_CAP 48000U
+#define DS_MAX_PENDING_SAMPLES 256U
+#define DS_HUD_TEX_W 640
+#define DS_HUD_TEX_H 64
 
-/* The worker alone owns Android resources. Callback context remains alive until
- * synchronous device close stops its looper. The application serializes public
- * lifecycle/copy calls; callbacks only access locked flags and atomic status. */
+typedef EGLBoolean (EGLAPIENTRYP DS_PFNEGLPRESENTATIONTIMEANDROID)(EGLDisplay dpy, EGLSurface surface, EGLnsecsANDROID time);
+
+typedef struct {
+    uint8_t *data;
+    size_t size;
+    int64_t pts_us;
+    uint32_t flags;
+    bool is_audio;
+} DSPendingSample;
+
+/* The worker alone owns Android, MediaCodec, Muxer, and its offscreen EGL resources.
+ * The application serializes public lifecycle/copy calls; audio/hud feeds acquire w->mutex briefly. */
 typedef struct {
     DSVideoCapture *capture;
     pthread_mutex_t mutex;
@@ -41,11 +62,13 @@ typedef struct {
     uint8_t *frame, *scratch;
     int frame_width, frame_height;
     int64_t frame_timestamp, frame_received, last_camera_timestamp, preview_deadline;
-    uint64_t frame_number, copied_number;
+    uint64_t frame_number, copied_number, encoded_frame_number;
     int preview_width, preview_height;
-    bool full_hd, fixed_30fps, realtime_timestamps;
+    bool fixed_30fps, realtime_timestamps;
     media_status_t (*get_dataspace)(const AImage *, int32_t *);
     bool color_logged;
+
+    /* Camera2 preview pipeline */
     ACameraManager *manager;
     ACameraMetadata *metadata;
     ACameraDevice *device;
@@ -53,17 +76,45 @@ typedef struct {
     ANativeWindow *preview_window; /* Reader-owned; do not release separately. */
     ACameraCaptureSession *session;
     ACaptureSessionOutputContainer *outputs;
-    ACaptureSessionOutput *preview_output, *encoder_output;
-    ACameraOutputTarget *preview_target, *encoder_target;
+    ACaptureSessionOutput *preview_output;
+    ACameraOutputTarget *preview_target;
     ACaptureRequest *request;
+
+    /* Offscreen GL ES encoder pipeline (H.264 video + AAC audio -> AMediaMuxer) */
+    int enc_width, enc_height;
     AMediaCodec *codec;
+    AMediaCodec *audio_codec;
     ANativeWindow *encoder_window;
     AMediaMuxer *muxer;
-    bool codec_started, muxer_started, saw_frame, saw_eos;
-    ssize_t video_track;
+    EGLDisplay egl_display;
+    EGLContext egl_context;
+    EGLSurface egl_surface;
+    DS_PFNEGLPRESENTATIONTIMEANDROID egl_presentation_time;
+    GLuint gl_cam_prog, gl_hud_prog, gl_cam_tex, gl_hud_tex;
+    GLint gl_cam_img_loc, gl_cam_filter_loc, gl_hud_img_loc;
+    uint8_t *hud_rgba;
+
+    bool codec_started, audio_started, muxer_started;
+    bool saw_video_frame, saw_video_eos, saw_audio_eos, audio_eos_sent;
+    ssize_t video_track, audio_track;
     int fd;
-    int64_t first_pts, last_pts;
+    int64_t rec_start_ns, last_enc_frame_ns;
+    int64_t first_video_pts, last_video_pts, first_audio_pts, last_audio_pts;
+    uint64_t audio_samples_submitted;
+    int64_t audio_base_offset_us;
+    bool audio_base_set;
     char video_path[640];
+
+    /* Audio PCM16 ring queue */
+    int16_t audio_ring[DS_AUDIO_RING_CAP];
+    size_t audio_head, audio_tail, audio_count;
+
+    /* Snapshot HUD telemetry updated by main/render thread */
+    DSVideoHudState hud;
+
+    /* Bounded FIFO for packets dequeued before both tracks are added & muxer starts */
+    DSPendingSample pending[DS_MAX_PENDING_SAMPLES];
+    size_t pending_count;
 } DSVideoWorker;
 
 static int64_t clock_ns(clockid_t clock_id) {
@@ -120,9 +171,7 @@ static void session_closed(void *context, ACameraCaptureSession *session) {
     pthread_mutex_unlock(&w->mutex);
 }
 
-/* Choose a genuinely advertised bounded YUV stream. Prefer 640x360 to match the
- * recording aspect, then the closest advertised size. FullHD is independent:
- * preview may work on a device that cannot record the requested resolution. */
+/* Choose a genuinely advertised bounded YUV stream (preferring 640x360..1280x720). */
 static bool select_camera(DSVideoWorker *w, char id[128]) {
     ACameraIdList *ids = NULL;
     if (!camera_ok(w, ACameraManager_getCameraIdList(w->manager, &ids), "list cameras") || !ids) return false;
@@ -136,25 +185,23 @@ static bool select_camera(DSVideoWorker *w, char id[128]) {
             facing.type == ACAMERA_TYPE_BYTE && facing.count == 1 && facing.data.u8[0] == ACAMERA_LENS_FACING_BACK;
         if (rear && ACameraMetadata_getConstEntry(metadata, ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS, &streams) == ACAMERA_OK &&
             streams.type == ACAMERA_TYPE_INT32 && streams.count % 4U == 0U) {
-            bool full_hd = false;
             int pw = 0, ph = 0;
             int64_t score = INT64_MAX;
             for (uint32_t n = 0; n < streams.count; n += 4U) {
                 const int32_t format = streams.data.i32[n], width = streams.data.i32[n + 1U];
                 const int32_t height = streams.data.i32[n + 2U], direction = streams.data.i32[n + 3U];
                 if (direction != ACAMERA_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT) continue;
-                if (format == AIMAGE_FORMAT_PRIVATE && width == DS_VIDEO_WIDTH && height == DS_VIDEO_HEIGHT) full_hd = true;
-                if (format != AIMAGE_FORMAT_YUV_420_888 || width < 1 || height < 1 || width > DS_VIDEO_WIDTH || height > DS_VIDEO_HEIGHT) continue;
+                if (format != AIMAGE_FORMAT_YUV_420_888 || width < 1 || height < 1 ||
+                    width > DS_VIDEO_DEFAULT_W || height > DS_VIDEO_DEFAULT_H) continue;
                 int64_t candidate = llabs((int64_t)width * height - INT64_C(640) * 360);
                 candidate += llabs((int64_t)width * 9 - (int64_t)height * 16) * 100;
                 if (candidate < score) { score = candidate; pw = width; ph = height; }
             }
-            if (!full_hd && score != INT64_MAX) score += INT64_C(1000000000);
             if (pw && score < best_score && strlen(ids->cameraIds[i]) < 128U) {
                 if (w->metadata) ACameraMetadata_free(w->metadata);
                 w->metadata = metadata; metadata = NULL;
                 snprintf(id, 128, "%s", ids->cameraIds[i]);
-                w->preview_width = pw; w->preview_height = ph; w->full_hd = full_hd;
+                w->preview_width = pw; w->preview_height = ph;
                 best_score = score; selected = true;
             }
         }
@@ -177,47 +224,36 @@ static bool select_camera(DSVideoWorker *w, char id[128]) {
     }
     w->realtime_timestamps = ACameraMetadata_getConstEntry(w->metadata, ACAMERA_SENSOR_INFO_TIMESTAMP_SOURCE, &source) == ACAMERA_OK &&
         source.type == ACAMERA_TYPE_BYTE && source.count == 1 && source.data.u8[0] == ACAMERA_SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME;
-    __android_log_print(ANDROID_LOG_INFO, DS_VIDEO_LOG, "rear camera %s YUV %dx%d orientation %d FullHD %d fixed30 %d",
-                        id, w->preview_width, w->preview_height, rotation, w->full_hd, w->fixed_30fps);
+    __android_log_print(ANDROID_LOG_INFO, DS_VIDEO_LOG, "rear camera %s YUV %dx%d orientation %d fixed30 %d",
+                        id, w->preview_width, w->preview_height, rotation, w->fixed_30fps);
     return true;
 }
 
-static bool configure_filter(DSVideoWorker *w) {
-    const DSVideoFilter filter = w->capture->filter;
-    if (filter < DS_VIDEO_FILTER_NIGHT || filter > DS_VIDEO_FILTER_RAW) return false;
-    uint8_t effect = ACAMERA_CONTROL_EFFECT_MODE_OFF;
+static bool configure_camera_exposure(DSVideoWorker *w) {
+    const DSVideoFilter filter = (DSVideoFilter)atomic_load(&w->capture->filter);
+    const uint8_t effect = ACAMERA_CONTROL_EFFECT_MODE_OFF;
     int32_t compensation = 0;
     if (filter == DS_VIDEO_FILTER_NIGHT) {
         ACameraMetadata_const_entry range = {0};
-        if (ACameraMetadata_getConstEntry(w->metadata, ACAMERA_CONTROL_AE_COMPENSATION_RANGE, &range) != ACAMERA_OK ||
-            range.type != ACAMERA_TYPE_INT32 || range.count != 2 || range.data.i32[1] <= 0) return false;
-        compensation = range.data.i32[1] < 6 ? range.data.i32[1] : 6;
-    } else if (filter == DS_VIDEO_FILTER_MONO || filter == DS_VIDEO_FILTER_SEPIA) {
-        ACameraMetadata_const_entry effects = {0};
-        if (ACameraMetadata_getConstEntry(w->metadata, ACAMERA_CONTROL_AVAILABLE_EFFECTS, &effects) != ACAMERA_OK || effects.type != ACAMERA_TYPE_BYTE) return false;
-        effect = filter == DS_VIDEO_FILTER_MONO ? ACAMERA_CONTROL_EFFECT_MODE_MONO : ACAMERA_CONTROL_EFFECT_MODE_SEPIA;
-        bool found = false;
-        for (uint32_t i = 0; i < effects.count; ++i) if (effects.data.u8[i] == effect) found = true;
-        if (!found) return false;
+        if (ACameraMetadata_getConstEntry(w->metadata, ACAMERA_CONTROL_AE_COMPENSATION_RANGE, &range) == ACAMERA_OK &&
+            range.type == ACAMERA_TYPE_INT32 && range.count == 2 && range.data.i32[1] > 0) {
+            compensation = range.data.i32[1] < 6 ? range.data.i32[1] : 6;
+        }
     }
-    return camera_ok(w, ACaptureRequest_setEntry_u8(w->request, ACAMERA_CONTROL_EFFECT_MODE, 1, &effect), "set camera effect") &&
-        camera_ok(w, ACaptureRequest_setEntry_i32(w->request, ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION, 1, &compensation), "set exposure compensation");
+    (void)ACaptureRequest_setEntry_u8(w->request, ACAMERA_CONTROL_EFFECT_MODE, 1, &effect);
+    (void)ACaptureRequest_setEntry_i32(w->request, ACAMERA_CONTROL_AE_EXPOSURE_COMPENSATION, 1, &compensation);
+    return true;
 }
 
 static void free_session_objects(DSVideoWorker *w) {
     if (w->request) ACaptureRequest_free(w->request);
     if (w->preview_target) ACameraOutputTarget_free(w->preview_target);
-    if (w->encoder_target) ACameraOutputTarget_free(w->encoder_target);
     if (w->outputs) ACaptureSessionOutputContainer_free(w->outputs);
     if (w->preview_output) ACaptureSessionOutput_free(w->preview_output);
-    if (w->encoder_output) ACaptureSessionOutput_free(w->encoder_output);
-    w->request = NULL; w->preview_target = w->encoder_target = NULL;
-    w->outputs = NULL; w->preview_output = w->encoder_output = NULL;
+    w->request = NULL; w->preview_target = NULL;
+    w->outputs = NULL; w->preview_output = NULL;
 }
 
-/* Timeout never releases callback context early. Synchronous device close stops
- * its callback looper before freeing the worker. A close failure is fatal: do
- * not create another camera/session with an outstanding callback context. */
 static bool close_session(DSVideoWorker *w) {
     atomic_store(&w->capture->preview_ready, false);
     bool okay = true;
@@ -247,29 +283,25 @@ static bool close_session(DSVideoWorker *w) {
     return okay;
 }
 
-static bool create_session(DSVideoWorker *w, bool record) {
+static bool create_session(DSVideoWorker *w) {
     pthread_mutex_lock(&w->mutex);
     w->session_closed = false;
     pthread_mutex_unlock(&w->mutex);
     if (!camera_ok(w, ACaptureSessionOutputContainer_create(&w->outputs), "create output container") ||
         !camera_ok(w, ACaptureSessionOutput_create(w->preview_window, &w->preview_output), "create YUV output") ||
         !camera_ok(w, ACaptureSessionOutputContainer_add(w->outputs, w->preview_output), "add YUV output")) return false;
-    if (record && (!camera_ok(w, ACaptureSessionOutput_create(w->encoder_window, &w->encoder_output), "create encoder output") ||
-                   !camera_ok(w, ACaptureSessionOutputContainer_add(w->outputs, w->encoder_output), "add encoder output"))) return false;
     ACameraCaptureSession_stateCallbacks callbacks = { .context = w, .onClosed = session_closed, .onReady = session_state, .onActive = session_state };
-    if (!camera_ok(w, ACameraDevice_createCaptureSession(w->device, w->outputs, &callbacks, &w->session),
-                   record ? "create FullHD+YUV camera session" : "create YUV camera session") || !w->session ||
-        !camera_ok(w, ACameraDevice_createCaptureRequest(w->device, record ? TEMPLATE_RECORD : TEMPLATE_PREVIEW, &w->request), "create request")) return false;
-    if (!configure_filter(w)) { fail(w, "requested camera filter is unsupported; no RAW fallback"); return false; }
-    if (record) {
+    if (!camera_ok(w, ACameraDevice_createCaptureSession(w->device, w->outputs, &callbacks, &w->session), "create YUV camera session") ||
+        !w->session ||
+        !camera_ok(w, ACameraDevice_createCaptureRequest(w->device, TEMPLATE_PREVIEW, &w->request), "create preview request")) return false;
+    configure_camera_exposure(w);
+    if (w->fixed_30fps) {
         const int32_t range[2] = {DS_VIDEO_FPS, DS_VIDEO_FPS};
-        if (!camera_ok(w, ACaptureRequest_setEntry_i32(w->request, ACAMERA_CONTROL_AE_TARGET_FPS_RANGE, 2, range), "set 30fps")) return false;
+        (void)ACaptureRequest_setEntry_i32(w->request, ACAMERA_CONTROL_AE_TARGET_FPS_RANGE, 2, range);
     }
     if (!camera_ok(w, ACameraOutputTarget_create(w->preview_window, &w->preview_target), "create preview target") ||
-        !camera_ok(w, ACaptureRequest_addTarget(w->request, w->preview_target), "attach preview target")) return false;
-    if (record && (!camera_ok(w, ACameraOutputTarget_create(w->encoder_window, &w->encoder_target), "create encoder target") ||
-                   !camera_ok(w, ACaptureRequest_addTarget(w->request, w->encoder_target), "attach encoder target"))) return false;
-    if (!camera_ok(w, ACameraCaptureSession_setRepeatingRequest(w->session, NULL, 1, &w->request, NULL), "start camera repeating")) return false;
+        !camera_ok(w, ACaptureRequest_addTarget(w->request, w->preview_target), "attach preview target") ||
+        !camera_ok(w, ACameraCaptureSession_setRepeatingRequest(w->session, NULL, 1, &w->request, NULL), "start camera repeating")) return false;
     w->preview_deadline = clock_ns(CLOCK_MONOTONIC) + INT64_C(8000000000);
     return true;
 }
@@ -299,8 +331,6 @@ static bool preview_frame(DSVideoWorker *w) {
     const int range = dataspace & ADATASPACE_RANGE_MASK;
     const int transfer = dataspace & ADATASPACE_TRANSFER_MASK;
     if (okay) {
-        /* Android data_space.h specifies these defaults for unspecified YUV:
-         * BT709 >=720p, BT601 below; limited range. This is not a filter fallback. */
         yuv.bt709 = standard == ADATASPACE_STANDARD_BT709 ||
             (standard == ADATASPACE_STANDARD_UNSPECIFIED && (yuv.width >= 1280 || yuv.height >= 720));
         yuv.full_range = range == ADATASPACE_RANGE_FULL;
@@ -312,9 +342,8 @@ static bool preview_frame(DSVideoWorker *w) {
             fail(w, "unsupported preview color space/transfer; not mislabeling HDR as SDR"); okay = false;
         }
         if (okay && !w->color_logged) {
-            __android_log_print(ANDROID_LOG_INFO, DS_VIDEO_LOG, "preview dataspace 0x%x (%s %s%s)",
-                (unsigned)dataspace, yuv.bt709 ? "BT709" : "BT601", yuv.full_range ? "full" : "limited",
-                standard == ADATASPACE_STANDARD_UNSPECIFIED ? "; Android unspecified-YUV rules" : "");
+            __android_log_print(ANDROID_LOG_INFO, DS_VIDEO_LOG, "preview dataspace 0x%x (%s %s)",
+                (unsigned)dataspace, yuv.bt709 ? "BT709" : "BT601", yuv.full_range ? "full" : "limited");
             w->color_logged = true;
         }
     }
@@ -342,30 +371,261 @@ static bool preview_frame(DSVideoWorker *w) {
     return true;
 }
 
-static bool open_encoder(DSVideoWorker *w) {
-    if (!w->full_hd || !w->fixed_30fps) {
-        fail(w, "FullHD 1920x1080 at fixed 30fps unsupported; no resolution/framerate fallback"); return false;
+static GLuint compile_gl_shader(GLenum type, const char *src) {
+    GLuint s = glCreateShader(type);
+    if (!s) return 0;
+    glShaderSource(s, 1, &src, NULL);
+    glCompileShader(s);
+    GLint ok = 0;
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[256] = {0};
+        glGetShaderInfoLog(s, sizeof(log), NULL, log);
+        __android_log_print(ANDROID_LOG_ERROR, DS_VIDEO_LOG, "GL shader compile failed: %s", log);
+        glDeleteShader(s);
+        return 0;
     }
-    w->video_track = -1; w->first_pts = -1; w->last_pts = -1; w->saw_frame = w->saw_eos = false;
+    return s;
+}
+
+static GLuint link_gl_program(const char *vert_src, const char *frag_src) {
+    GLuint vs = compile_gl_shader(GL_VERTEX_SHADER, vert_src);
+    GLuint fs = compile_gl_shader(GL_FRAGMENT_SHADER, frag_src);
+    if (!vs || !fs) {
+        if (vs) glDeleteShader(vs);
+        if (fs) glDeleteShader(fs);
+        return 0;
+    }
+    GLuint prog = glCreateProgram();
+    if (prog) {
+        glAttachShader(prog, vs);
+        glAttachShader(prog, fs);
+        glBindAttribLocation(prog, 0, "a_position");
+        glBindAttribLocation(prog, 1, "a_uv");
+        glLinkProgram(prog);
+        GLint ok = 0;
+        glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+        if (!ok) {
+            glDeleteProgram(prog);
+            prog = 0;
+        }
+    }
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    return prog;
+}
+
+static void destroy_encoder_gl(DSVideoWorker *w) {
+    if (w->egl_display != EGL_NO_DISPLAY && w->egl_context != EGL_NO_CONTEXT &&
+        w->egl_surface != EGL_NO_SURFACE) {
+        eglMakeCurrent(w->egl_display, w->egl_surface, w->egl_surface, w->egl_context);
+        if (w->gl_cam_tex) { glDeleteTextures(1, &w->gl_cam_tex); w->gl_cam_tex = 0; }
+        if (w->gl_hud_tex) { glDeleteTextures(1, &w->gl_hud_tex); w->gl_hud_tex = 0; }
+        if (w->gl_cam_prog) { glDeleteProgram(w->gl_cam_prog); w->gl_cam_prog = 0; }
+        if (w->gl_hud_prog) { glDeleteProgram(w->gl_hud_prog); w->gl_hud_prog = 0; }
+    }
+    if (w->egl_display != EGL_NO_DISPLAY) {
+        eglMakeCurrent(w->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+        if (w->egl_surface != EGL_NO_SURFACE) {
+            eglDestroySurface(w->egl_display, w->egl_surface);
+            w->egl_surface = EGL_NO_SURFACE;
+        }
+        if (w->egl_context != EGL_NO_CONTEXT) {
+            eglDestroyContext(w->egl_display, w->egl_context);
+            w->egl_context = EGL_NO_CONTEXT;
+        }
+        eglTerminate(w->egl_display);
+        w->egl_display = EGL_NO_DISPLAY;
+    }
+    free(w->hud_rgba);
+    w->hud_rgba = NULL;
+}
+
+static bool init_encoder_gl(DSVideoWorker *w) {
+    w->egl_display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+    if (w->egl_display == EGL_NO_DISPLAY || !eglInitialize(w->egl_display, NULL, NULL)) {
+        fail(w, "eglInitialize failed for encoder"); return false;
+    }
+    const EGLint rec_attribs[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        DS_EGL_RECORDABLE_ANDROID, 1,
+        EGL_NONE
+    };
+    const EGLint fallback_attribs[] = {
+        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
+        EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8,
+        EGL_NONE
+    };
+    EGLConfig cfg = NULL;
+    EGLint count = 0;
+    if (!eglChooseConfig(w->egl_display, rec_attribs, &cfg, 1, &count) || count == 0) {
+        if (!eglChooseConfig(w->egl_display, fallback_attribs, &cfg, 1, &count) || count == 0) {
+            fail(w, "eglChooseConfig failed for encoder"); return false;
+        }
+    }
+    const EGLint ctx_attribs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
+    w->egl_context = eglCreateContext(w->egl_display, cfg, EGL_NO_CONTEXT, ctx_attribs);
+    w->egl_surface = eglCreateWindowSurface(w->egl_display, cfg, w->encoder_window, NULL);
+    if (w->egl_context == EGL_NO_CONTEXT || w->egl_surface == EGL_NO_SURFACE ||
+        !eglMakeCurrent(w->egl_display, w->egl_surface, w->egl_surface, w->egl_context)) {
+        fail(w, "EGL encoder surface makeCurrent failed"); return false;
+    }
+    w->egl_presentation_time = (DS_PFNEGLPRESENTATIONTIMEANDROID)eglGetProcAddress("eglPresentationTimeANDROID");
+    w->gl_cam_prog = link_gl_program(DS_CAMERA_VERTEX_SHADER, DS_CAMERA_FRAGMENT_SHADER);
+    w->gl_hud_prog = link_gl_program(DS_CAMERA_VERTEX_SHADER, DS_RGBA_OVERLAY_FRAGMENT_SHADER);
+    if (!w->gl_cam_prog || !w->gl_hud_prog) {
+        fail(w, "failed to link encoder GL shader programs"); return false;
+    }
+    w->gl_cam_img_loc = glGetUniformLocation(w->gl_cam_prog, "u_image");
+    w->gl_cam_filter_loc = glGetUniformLocation(w->gl_cam_prog, "u_filter");
+    w->gl_hud_img_loc = glGetUniformLocation(w->gl_hud_prog, "u_image");
+
+    glGenTextures(1, &w->gl_cam_tex);
+    glBindTexture(GL_TEXTURE_2D, w->gl_cam_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glGenTextures(1, &w->gl_hud_tex);
+    glBindTexture(GL_TEXTURE_2D, w->gl_hud_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    w->hud_rgba = malloc((size_t)DS_HUD_TEX_W * (size_t)DS_HUD_TEX_H * 4U);
+    return w->hud_rgba != NULL;
+}
+
+static void hud_fill_rect(uint8_t *rgba, int tex_w, int tex_h, int rx, int ry, int rw, int rh,
+                          uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    const int x0 = rx < 0 ? 0 : rx;
+    const int y0 = ry < 0 ? 0 : ry;
+    const int x1 = (rx + rw > tex_w) ? tex_w : (rx + rw);
+    const int y1 = (ry + rh > tex_h) ? tex_h : (ry + rh);
+    for (int py = y0; py < y1; ++py) {
+        for (int px = x0; px < x1; ++px) {
+            uint8_t *dst = rgba + ((size_t)py * (size_t)tex_w + (size_t)px) * 4U;
+            dst[0] = r; dst[1] = g; dst[2] = b; dst[3] = a;
+        }
+    }
+}
+
+static void hud_draw_text(uint8_t *rgba, int tex_w, int tex_h, int sx, int sy, int scale,
+                          const char *str, uint8_t r, uint8_t g, uint8_t b) {
+    if (!str) return;
+    int pen_x = sx;
+    for (size_t i = 0; str[i] != '\0'; ++i) {
+        const int gi = ds_glyph_index(str[i]);
+        if (gi >= 0 && gi < (int)DS_FONT_GLYPH_COUNT) {
+            for (int row = 0; row < (int)DS_FONT_GLYPH_ROWS; ++row) {
+                const uint8_t bits = ds_font_bitmap[gi][row];
+                for (int col = 0; col < (int)DS_FONT_GLYPH_COLS; ++col) {
+                    if ((bits & (1u << (4 - col))) != 0u) {
+                        hud_fill_rect(rgba, tex_w, tex_h, pen_x + col * scale, sy + row * scale,
+                                      scale, scale, r, g, b, 255);
+                    }
+                }
+            }
+        }
+        pen_x += 6 * scale;
+        if (pen_x >= tex_w - 8) break;
+    }
+}
+
+static void rasterize_hud_overlay(DSVideoWorker *w, const DSVideoHudState *hud, int64_t elapsed_us) {
+    uint8_t *buf = w->hud_rgba;
+    memset(buf, 0, (size_t)DS_HUD_TEX_W * (size_t)DS_HUD_TEX_H * 4U);
+    hud_fill_rect(buf, DS_HUD_TEX_W, DS_HUD_TEX_H, 0, 0, DS_HUD_TEX_W, DS_HUD_TEX_H, 8, 12, 11, 200);
+    hud_fill_rect(buf, DS_HUD_TEX_W, DS_HUD_TEX_H, 0, 0, DS_HUD_TEX_W, 2, 48, 220, 145, 220);
+
+    const unsigned total_s = (unsigned)(elapsed_us / INT64_C(1000000));
+    char top_line[80];
+    snprintf(top_line, sizeof(top_line), "REC %02u:%02u  %s  EMF %.1f UT (%+.1f)",
+             total_s / 60U, total_s % 60U, hud->filter_name[0] ? hud->filter_name : "RAW",
+             hud->emf_ut, hud->emf_delta);
+    hud_draw_text(buf, DS_HUD_TEX_W, DS_HUD_TEX_H, 14, 10, 2, top_line, 232, 248, 238);
+
+    char bot_line[80];
+    if (hud->word[0]) {
+        snprintf(bot_line, sizeof(bot_line), "VOX: %s%s", hud->word, hud->anomaly ? "  [ANOMALY]" : "");
+    } else if (hud->anomaly) {
+        snprintf(bot_line, sizeof(bot_line), "ANOMALY DETECTED");
+    } else {
+        snprintf(bot_line, sizeof(bot_line), "LISTENING...");
+    }
+    const uint8_t wr = hud->anomaly ? 255 : 140;
+    const uint8_t wg = hud->anomaly ? 140 : 240;
+    const uint8_t wb = hud->anomaly ? 45 : 195;
+    hud_draw_text(buf, DS_HUD_TEX_W, DS_HUD_TEX_H, 14, 38, 2, bot_line, wr, wg, wb);
+
+    /* Signal bar on right */
+    const int bar_x = DS_HUD_TEX_W - 150, bar_y = 38, bar_w = 132, bar_h = 14;
+    hud_fill_rect(buf, DS_HUD_TEX_W, DS_HUD_TEX_H, bar_x, bar_y, bar_w, bar_h, 30, 42, 38, 220);
+    const float cl_sig = hud->signal < 0.0f ? 0.0f : (hud->signal > 1.0f ? 1.0f : hud->signal);
+    const int fill_w = (int)((float)bar_w * cl_sig);
+    if (fill_w > 0) {
+        const uint8_t sr = cl_sig > 0.7f ? 255 : 70;
+        const uint8_t sg = cl_sig > 0.7f ? 75 : 245;
+        hud_fill_rect(buf, DS_HUD_TEX_W, DS_HUD_TEX_H, bar_x, bar_y, fill_w, bar_h, sr, sg, 95, 240);
+    }
+}
+
+static bool open_encoder(DSVideoWorker *w) {
+    if (!ds_video_encode_dimensions(w->capture->aspect, &w->enc_width, &w->enc_height)) {
+        w->enc_width = DS_VIDEO_DEFAULT_W;
+        w->enc_height = DS_VIDEO_DEFAULT_H;
+    }
+    w->video_track = -1; w->audio_track = -1;
+    w->first_video_pts = -1; w->last_video_pts = -1;
+    w->first_audio_pts = -1; w->last_audio_pts = -1;
+    w->saw_video_frame = w->saw_video_eos = w->saw_audio_eos = w->audio_eos_sent = false;
+    w->muxer_started = false; w->pending_count = 0;
+    w->rec_start_ns = 0; w->last_enc_frame_ns = 0;
+    w->audio_samples_submitted = 0; w->audio_base_offset_us = 0; w->audio_base_set = false;
+    w->encoded_frame_number = w->frame_number;
+
+    /* 1. H.264 hardware encoder configured at selected aspect dimensions */
     w->codec = AMediaCodec_createEncoderByType("video/avc");
-    AMediaFormat *format = AMediaFormat_new();
-    if (!w->codec || !format) { if (format) AMediaFormat_delete(format); return false; }
-    AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, "video/avc");
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, DS_VIDEO_WIDTH);
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, DS_VIDEO_HEIGHT);
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_BIT_RATE, DS_VIDEO_BITRATE);
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_FRAME_RATE, DS_VIDEO_FPS);
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_I_FRAME_INTERVAL, 1);
-    AMediaFormat_setInt32(format, "max-bframes", 0);
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_COLOR_STANDARD, 1); /* BT709 */
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_COLOR_TRANSFER, 3); /* SDR */
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_COLOR_RANGE, 2); /* Limited */
-    AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_COLOR_FORMAT, DS_COLOR_FORMAT_SURFACE);
-    bool okay = media_ok(w, AMediaCodec_configure(w->codec, format, NULL, NULL, AMEDIACODEC_CONFIGURE_FLAG_ENCODE), "configure FullHD AVC encoder");
-    AMediaFormat_delete(format);
-    if (!okay || !media_ok(w, AMediaCodec_createInputSurface(w->codec, &w->encoder_window), "create encoder surface") || !w->encoder_window ||
-        !media_ok(w, AMediaCodec_start(w->codec), "start encoder")) return false;
+    AMediaFormat *vfmt = AMediaFormat_new();
+    if (!w->codec || !vfmt) { if (vfmt) AMediaFormat_delete(vfmt); return false; }
+    AMediaFormat_setString(vfmt, AMEDIAFORMAT_KEY_MIME, "video/avc");
+    AMediaFormat_setInt32(vfmt, AMEDIAFORMAT_KEY_WIDTH, w->enc_width);
+    AMediaFormat_setInt32(vfmt, AMEDIAFORMAT_KEY_HEIGHT, w->enc_height);
+    AMediaFormat_setInt32(vfmt, AMEDIAFORMAT_KEY_BIT_RATE, DS_VIDEO_BITRATE);
+    AMediaFormat_setInt32(vfmt, AMEDIAFORMAT_KEY_FRAME_RATE, DS_VIDEO_FPS);
+    AMediaFormat_setInt32(vfmt, AMEDIAFORMAT_KEY_I_FRAME_INTERVAL, 1);
+    AMediaFormat_setInt32(vfmt, "max-bframes", 0);
+    AMediaFormat_setInt32(vfmt, AMEDIAFORMAT_KEY_COLOR_STANDARD, 1); /* BT709 */
+    AMediaFormat_setInt32(vfmt, AMEDIAFORMAT_KEY_COLOR_TRANSFER, 3); /* SDR */
+    AMediaFormat_setInt32(vfmt, AMEDIAFORMAT_KEY_COLOR_RANGE, 2); /* Limited */
+    AMediaFormat_setInt32(vfmt, AMEDIAFORMAT_KEY_COLOR_FORMAT, DS_COLOR_FORMAT_SURFACE);
+    bool v_ok = media_ok(w, AMediaCodec_configure(w->codec, vfmt, NULL, NULL, AMEDIACODEC_CONFIGURE_FLAG_ENCODE), "configure AVC encoder");
+    AMediaFormat_delete(vfmt);
+    if (!v_ok || !media_ok(w, AMediaCodec_createInputSurface(w->codec, &w->encoder_window), "create encoder input surface") ||
+        !w->encoder_window || !media_ok(w, AMediaCodec_start(w->codec), "start AVC encoder")) return false;
     w->codec_started = true;
+
+    if (!init_encoder_gl(w)) return false;
+
+    /* 2. AAC-LC audio encoder */
+    w->audio_codec = AMediaCodec_createEncoderByType("audio/mp4a-latm");
+    AMediaFormat *afmt = AMediaFormat_new();
+    if (!w->audio_codec || !afmt) { if (afmt) AMediaFormat_delete(afmt); return false; }
+    AMediaFormat_setString(afmt, AMEDIAFORMAT_KEY_MIME, "audio/mp4a-latm");
+    AMediaFormat_setInt32(afmt, AMEDIAFORMAT_KEY_SAMPLE_RATE, DS_AUDIO_SAMPLE_RATE);
+    AMediaFormat_setInt32(afmt, AMEDIAFORMAT_KEY_CHANNEL_COUNT, 1);
+    AMediaFormat_setInt32(afmt, AMEDIAFORMAT_KEY_BIT_RATE, DS_AUDIO_BITRATE);
+    AMediaFormat_setInt32(afmt, AMEDIAFORMAT_KEY_AAC_PROFILE, 2); /* AAC-LC */
+    AMediaFormat_setInt32(afmt, AMEDIAFORMAT_KEY_MAX_INPUT_SIZE, 8192);
+    bool a_ok = media_ok(w, AMediaCodec_configure(w->audio_codec, afmt, NULL, NULL, AMEDIACODEC_CONFIGURE_FLAG_ENCODE), "configure AAC encoder");
+    AMediaFormat_delete(afmt);
+    if (!a_ok || !media_ok(w, AMediaCodec_start(w->audio_codec), "start AAC encoder")) return false;
+    w->audio_started = true;
+
+    /* 3. MP4 output file & muxer (orientation 0 because GL rotates frames upright) */
     struct timespec now;
     struct tm local;
     char stamp[32];
@@ -376,65 +636,277 @@ static bool open_encoder(DSVideoWorker *w) {
     w->fd = open(w->video_path, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (w->fd < 0) { w->video_path[0] = '\0'; return false; }
     w->muxer = AMediaMuxer_new(w->fd, AMEDIAMUXER_OUTPUT_FORMAT_MPEG_4);
-    return w->muxer && media_ok(w, AMediaMuxer_setOrientationHint(w->muxer, atomic_load(&w->capture->preview_orientation)), "set video orientation");
+    return w->muxer && media_ok(w, AMediaMuxer_setOrientationHint(w->muxer, 0), "set MP4 orientation 0");
 }
 
-static bool pump_encoder(DSVideoWorker *w, int64_t timeout_us) {
-    AMediaCodecBufferInfo info = {0};
-    const ssize_t index = AMediaCodec_dequeueOutputBuffer(w->codec, &info, timeout_us);
-    if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
-        if (w->muxer_started) { fail(w, "encoder output format changed twice"); return false; }
-        AMediaFormat *format = AMediaCodec_getOutputFormat(w->codec);
-        int32_t width = 0, height = 0;
-        if (!format) return false;
-        const bool dimensions = AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_WIDTH, &width) &&
-            AMediaFormat_getInt32(format, AMEDIAFORMAT_KEY_HEIGHT, &height) && width == DS_VIDEO_WIDTH && height == DS_VIDEO_HEIGHT;
-        w->video_track = dimensions ? AMediaMuxer_addTrack(w->muxer, format) : -1;
-        AMediaFormat_delete(format);
-        if (w->video_track < 0) { fail(w, "encoder did not produce the requested FullHD track"); return false; }
-        if (!media_ok(w, AMediaMuxer_start(w->muxer), "start MP4 muxer")) return false;
-        w->muxer_started = true;
-        return true;
+static bool write_muxer_sample(DSVideoWorker *w, const uint8_t *data, size_t size,
+                               int64_t pts_us, uint32_t flags, bool is_audio) {
+    AMediaCodecBufferInfo info = { .offset = 0, .size = (int32_t)size, .presentationTimeUs = pts_us, .flags = flags };
+    if (info.presentationTimeUs < 0) info.presentationTimeUs = 0;
+    if (is_audio) {
+        if (w->first_audio_pts < 0) w->first_audio_pts = info.presentationTimeUs;
+        info.presentationTimeUs -= w->first_audio_pts;
+        if (w->last_audio_pts >= 0 && info.presentationTimeUs <= w->last_audio_pts) {
+            info.presentationTimeUs = w->last_audio_pts + 1;
+        }
+        w->last_audio_pts = info.presentationTimeUs;
+        return media_ok(w, AMediaMuxer_writeSampleData(w->muxer, (size_t)w->audio_track, data, &info), "write audio sample");
+    } else {
+        if (w->first_video_pts < 0) w->first_video_pts = info.presentationTimeUs;
+        info.presentationTimeUs -= w->first_video_pts;
+        if (w->last_video_pts >= 0 && info.presentationTimeUs <= w->last_video_pts) {
+            info.presentationTimeUs = w->last_video_pts + 1;
+        }
+        w->last_video_pts = info.presentationTimeUs;
+        const bool ok = media_ok(w, AMediaMuxer_writeSampleData(w->muxer, (size_t)w->video_track, data, &info), "write video sample");
+        if (ok) w->saw_video_frame = true;
+        return ok;
     }
-    if (index == AMEDIACODEC_INFO_TRY_AGAIN_LATER || index == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) return true;
-    if (index < 0) { fail(w, "encoder output dequeue failed"); return false; }
-    bool okay = info.size >= 0;
-    if ((info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0U) w->saw_eos = true;
-    if (okay && info.size > 0 && (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) == 0U) {
-        size_t capacity = 0;
-        uint8_t *buffer = AMediaCodec_getOutputBuffer(w->codec, (size_t)index, &capacity);
-        /* NDK: offsets were invalid through API35; later APIs return zero.
-         * getOutputBuffer already points at the valid encoded bytes. */
-        info.offset = 0;
-        okay = buffer && (size_t)info.size <= capacity && w->muxer_started &&
-            info.presentationTimeUs >= 0 && (w->last_pts < 0 || info.presentationTimeUs > w->last_pts);
-        if (okay) {
-            w->last_pts = info.presentationTimeUs;
-            if (w->first_pts < 0) w->first_pts = info.presentationTimeUs;
-            info.presentationTimeUs -= w->first_pts;
-            okay = media_ok(w, AMediaMuxer_writeSampleData(w->muxer, (size_t)w->video_track, buffer, &info), "write video sample");
-            if (okay) w->saw_frame = true;
+}
+
+static bool maybe_start_muxer_and_flush(DSVideoWorker *w) {
+    if (w->muxer_started || w->video_track < 0 || w->audio_track < 0) return true;
+    if (!media_ok(w, AMediaMuxer_start(w->muxer), "start A/V MP4 muxer")) return false;
+    w->muxer_started = true;
+    for (size_t i = 0; i < w->pending_count; ++i) {
+        DSPendingSample *s = &w->pending[i];
+        const bool ok = write_muxer_sample(w, s->data, s->size, s->pts_us, s->flags, s->is_audio);
+        free(s->data);
+        s->data = NULL;
+        if (!ok) {
+            for (size_t j = i + 1; j < w->pending_count; ++j) { free(w->pending[j].data); w->pending[j].data = NULL; }
+            w->pending_count = 0;
+            return false;
         }
     }
-    if (!media_ok(w, AMediaCodec_releaseOutputBuffer(w->codec, (size_t)index, false), "release encoder output")) okay = false;
+    w->pending_count = 0;
+    return true;
+}
+
+static void queue_pending_sample(DSVideoWorker *w, const uint8_t *buf, size_t size,
+                                 int64_t pts_us, uint32_t flags, bool is_audio) {
+    if (w->pending_count >= DS_MAX_PENDING_SAMPLES) {
+        /* Drop oldest sample only if queue saturates before both formats settle */
+        free(w->pending[0].data);
+        memmove(&w->pending[0], &w->pending[1], (DS_MAX_PENDING_SAMPLES - 1U) * sizeof(DSPendingSample));
+        --w->pending_count;
+    }
+    uint8_t *copy = malloc(size);
+    if (!copy) return;
+    memcpy(copy, buf, size);
+    w->pending[w->pending_count++] = (DSPendingSample){
+        .data = copy, .size = size, .pts_us = pts_us, .flags = flags, .is_audio = is_audio
+    };
+}
+
+static bool pump_codec_output(DSVideoWorker *w, bool is_audio, int64_t timeout_us) {
+    AMediaCodec *codec = is_audio ? w->audio_codec : w->codec;
+    if (!codec) return true;
+    AMediaCodecBufferInfo info = {0};
+    const ssize_t index = AMediaCodec_dequeueOutputBuffer(codec, &info, timeout_us);
+    if (index == AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED) {
+        AMediaFormat *fmt = AMediaCodec_getOutputFormat(codec);
+        if (!fmt) return false;
+        if (is_audio) {
+            if (w->audio_track < 0) w->audio_track = AMediaMuxer_addTrack(w->muxer, fmt);
+        } else {
+            if (w->video_track < 0) w->video_track = AMediaMuxer_addTrack(w->muxer, fmt);
+        }
+        AMediaFormat_delete(fmt);
+        if ((is_audio && w->audio_track < 0) || (!is_audio && w->video_track < 0)) {
+            fail(w, "AMediaMuxer_addTrack failed"); return false;
+        }
+        return maybe_start_muxer_and_flush(w);
+    }
+    if (index == AMEDIACODEC_INFO_TRY_AGAIN_LATER || index == AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED) return true;
+    if (index < 0) { fail(w, is_audio ? "AAC dequeueOutput failed" : "AVC dequeueOutput failed"); return false; }
+
+    bool okay = info.size >= 0;
+    if ((info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM) != 0U) {
+        if (is_audio) w->saw_audio_eos = true;
+        else w->saw_video_eos = true;
+    }
+    if (okay && info.size > 0 && (info.flags & AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG) == 0U) {
+        size_t cap = 0;
+        uint8_t *buf = AMediaCodec_getOutputBuffer(codec, (size_t)index, &cap);
+        okay = buf && info.offset >= 0 && (size_t)info.offset <= cap &&
+               (size_t)info.size <= cap - (size_t)info.offset && info.presentationTimeUs >= 0;
+        if (okay) {
+            const uint8_t *payload = buf + info.offset;
+            if (w->muxer_started) {
+                okay = write_muxer_sample(w, payload, (size_t)info.size, info.presentationTimeUs, info.flags, is_audio);
+            } else {
+                queue_pending_sample(w, payload, (size_t)info.size, info.presentationTimeUs, info.flags, is_audio);
+            }
+        }
+    }
+    if (!media_ok(w, AMediaCodec_releaseOutputBuffer(codec, (size_t)index, false), "release encoder output")) okay = false;
     return okay;
+}
+
+static void feed_audio_encoder(DSVideoWorker *w, bool eos) {
+    if (!w->audio_codec || !w->audio_started || w->audio_eos_sent) return;
+    for (int iter = 0; iter < 4; ++iter) {
+        int16_t chunk[1024];
+        size_t take = 0;
+        pthread_mutex_lock(&w->mutex);
+        const size_t avail = w->audio_count;
+        const bool need_prime = (w->audio_track < 0 && avail == 0 && w->audio_samples_submitted == 0);
+        if (avail > 0) {
+            take = avail > 1024U ? 1024U : avail;
+            for (size_t i = 0; i < take; ++i) {
+                chunk[i] = w->audio_ring[w->audio_head];
+                w->audio_head = (w->audio_head + 1U) % DS_AUDIO_RING_CAP;
+            }
+            w->audio_count -= take;
+        }
+        pthread_mutex_unlock(&w->mutex);
+
+        if (take == 0 && !eos && !need_prime) break;
+        const ssize_t in_idx = AMediaCodec_dequeueInputBuffer(w->audio_codec, 0);
+        if (in_idx < 0) break;
+
+        size_t cap = 0;
+        uint8_t *dst = AMediaCodec_getInputBuffer(w->audio_codec, (size_t)in_idx, &cap);
+        if (!dst) {
+            AMediaCodec_queueInputBuffer(w->audio_codec, (size_t)in_idx, 0, 0, 0, 0);
+            break;
+        }
+        if (take > 0) {
+            const size_t max_samp = cap / sizeof(int16_t);
+            if (take > max_samp) take = max_samp;
+            memcpy(dst, chunk, take * sizeof(int16_t));
+            if (!w->audio_base_set && w->rec_start_ns > 0) {
+                const int64_t diff_us = (clock_ns(CLOCK_MONOTONIC) - w->rec_start_ns) / 1000LL;
+                w->audio_base_offset_us = diff_us > 0 ? diff_us : 0;
+                w->audio_base_set = true;
+            }
+            const int64_t pts_us = w->audio_base_offset_us +
+                (int64_t)(w->audio_samples_submitted * INT64_C(1000000) / DS_AUDIO_SAMPLE_RATE);
+            w->audio_samples_submitted += take;
+            AMediaCodec_queueInputBuffer(w->audio_codec, (size_t)in_idx, 0, take * sizeof(int16_t), (uint64_t)pts_us, 0);
+        } else if (need_prime) {
+            const size_t prime_samp = cap >= 2048U ? 1024U : (cap / sizeof(int16_t));
+            memset(dst, 0, prime_samp * sizeof(int16_t));
+            const int64_t pts_us = (int64_t)(w->audio_samples_submitted * INT64_C(1000000) / DS_AUDIO_SAMPLE_RATE);
+            w->audio_samples_submitted += prime_samp;
+            AMediaCodec_queueInputBuffer(w->audio_codec, (size_t)in_idx, 0, prime_samp * sizeof(int16_t), (uint64_t)pts_us, 0);
+            break;
+        } else if (eos) {
+            const int64_t pts_us = w->audio_base_offset_us +
+                (int64_t)(w->audio_samples_submitted * INT64_C(1000000) / DS_AUDIO_SAMPLE_RATE);
+            AMediaCodec_queueInputBuffer(w->audio_codec, (size_t)in_idx, 0, 0, (uint64_t)pts_us, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM);
+            w->audio_eos_sent = true;
+            break;
+        }
+    }
+}
+
+static void render_encoder_frame(DSVideoWorker *w) {
+    if (!w->egl_surface || w->egl_context == EGL_NO_CONTEXT) return;
+    uint8_t local_copy_check = 0;
+    (void)local_copy_check;
+
+    pthread_mutex_lock(&w->mutex);
+    const bool have_new = (w->frame_width > 0 && w->frame_height > 0 && w->frame_number != w->encoded_frame_number);
+    const int fw = w->frame_width, fh = w->frame_height;
+    const uint64_t fnum = w->frame_number;
+    const DSVideoHudState hud = w->hud;
+    if (have_new) {
+        if (!eglMakeCurrent(w->egl_display, w->egl_surface, w->egl_surface, w->egl_context)) {
+            pthread_mutex_unlock(&w->mutex);
+            return;
+        }
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, w->gl_cam_tex);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, fw, fh, 0, GL_RGBA, GL_UNSIGNED_BYTE, w->frame);
+        w->encoded_frame_number = fnum;
+    }
+    pthread_mutex_unlock(&w->mutex);
+    if (!have_new) return;
+
+    const int64_t now_ns = clock_ns(CLOCK_MONOTONIC);
+    if (w->rec_start_ns == 0) w->rec_start_ns = now_ns;
+    int64_t pts_ns = now_ns - w->rec_start_ns;
+    if (pts_ns <= w->last_enc_frame_ns) pts_ns = w->last_enc_frame_ns + INT64_C(1000000);
+    w->last_enc_frame_ns = pts_ns;
+
+    const int rotation = atomic_load(&w->capture->preview_orientation);
+    float uv[12];
+    if (!ds_preview_uv(fw, fh, rotation >= 0 ? rotation : 0, (float)w->enc_width, (float)w->enc_height, uv)) return;
+
+    glViewport(0, 0, w->enc_width, w->enc_height);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    const GLfloat vertices[] = {-1,1, 1,1, -1,-1, -1,-1, 1,1, 1,-1};
+    glUseProgram(w->gl_cam_prog);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, w->gl_cam_tex);
+    glUniform1i(w->gl_cam_img_loc, 0);
+    glUniform1i(w->gl_cam_filter_loc, atomic_load(&w->capture->filter));
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, vertices);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, uv);
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    if (hud.burn_in && w->hud_rgba) {
+        rasterize_hud_overlay(w, &hud, pts_ns / 1000LL);
+        const GLfloat hud_verts[] = {-0.96f,-0.78f, 0.96f,-0.78f, -0.96f,-0.96f,
+                                     -0.96f,-0.96f, 0.96f,-0.78f, 0.96f,-0.96f};
+        const GLfloat hud_uv[] = {0,0, 1,0, 0,1, 0,1, 1,0, 1,1};
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glUseProgram(w->gl_hud_prog);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, w->gl_hud_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, DS_HUD_TEX_W, DS_HUD_TEX_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, w->hud_rgba);
+        glUniform1i(w->gl_hud_img_loc, 0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, hud_verts);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, hud_uv);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glDisable(GL_BLEND);
+    }
+    glDisableVertexAttribArray(1);
+
+    if (w->egl_presentation_time) {
+        w->egl_presentation_time(w->egl_display, w->egl_surface, (EGLnsecsANDROID)pts_ns);
+    }
+    eglSwapBuffers(w->egl_display, w->egl_surface);
 }
 
 static bool close_encoder(DSVideoWorker *w, bool finalize) {
     bool okay = false;
-    if (finalize && w->codec_started) {
-        okay = media_ok(w, AMediaCodec_signalEndOfInputStream(w->codec), "signal encoder EOS");
+    if (finalize && w->codec_started && w->audio_started) {
+        okay = media_ok(w, AMediaCodec_signalEndOfInputStream(w->codec), "signal video encoder EOS");
+        feed_audio_encoder(w, true);
         const int64_t deadline = clock_ns(CLOCK_MONOTONIC) + INT64_C(3000000000);
-        while (okay && !w->saw_eos && clock_ns(CLOCK_MONOTONIC) < deadline) okay = pump_encoder(w, 10000);
-        okay = okay && w->saw_eos && w->saw_frame && w->muxer_started;
+        while (okay && (!w->saw_video_eos || !w->saw_audio_eos) && clock_ns(CLOCK_MONOTONIC) < deadline) {
+            if (!w->audio_eos_sent) feed_audio_encoder(w, true);
+            if (!w->saw_video_eos) okay = pump_codec_output(w, false, 5000);
+            if (okay && !w->saw_audio_eos) okay = pump_codec_output(w, true, 5000);
+        }
+        okay = okay && w->saw_video_eos && w->saw_video_frame && w->muxer_started;
     }
+    for (size_t i = 0; i < w->pending_count; ++i) {
+        free(w->pending[i].data);
+        w->pending[i].data = NULL;
+    }
+    w->pending_count = 0;
+    destroy_encoder_gl(w);
     if (w->muxer) {
         if (w->muxer_started && !media_ok(w, AMediaMuxer_stop(w->muxer), "finalize MP4")) okay = false;
         AMediaMuxer_delete(w->muxer); w->muxer = NULL;
     }
     if (w->codec) {
-        if (w->codec_started && !media_ok(w, AMediaCodec_stop(w->codec), "stop encoder")) okay = false;
+        if (w->codec_started) (void)AMediaCodec_stop(w->codec);
         AMediaCodec_delete(w->codec); w->codec = NULL;
+    }
+    if (w->audio_codec) {
+        if (w->audio_started) (void)AMediaCodec_stop(w->audio_codec);
+        AMediaCodec_delete(w->audio_codec); w->audio_codec = NULL;
     }
     if (w->encoder_window) { ANativeWindow_release(w->encoder_window); w->encoder_window = NULL; }
     if (w->fd >= 0) {
@@ -446,9 +918,16 @@ static bool close_encoder(DSVideoWorker *w, bool finalize) {
         if (!okay) {
             if (unlink(w->video_path) != 0) __android_log_print(ANDROID_LOG_ERROR, DS_VIDEO_LOG, "could not remove incomplete video: %s", strerror(errno));
             fail(w, "recording failed/incomplete; incomplete MP4 removed");
-        } else __android_log_print(ANDROID_LOG_INFO, DS_VIDEO_LOG, "local FullHD video finalized");
+        } else {
+            __android_log_print(ANDROID_LOG_INFO, DS_VIDEO_LOG, "muxed A/V %dx%d MP4 finalized: %s",
+                                w->enc_width, w->enc_height, w->video_path);
+        }
     }
-    w->video_path[0] = '\0'; w->codec_started = w->muxer_started = false;
+    pthread_mutex_lock(&w->mutex);
+    w->audio_head = w->audio_tail = w->audio_count = 0;
+    pthread_mutex_unlock(&w->mutex);
+    w->video_path[0] = '\0';
+    w->codec_started = w->audio_started = w->muxer_started = false;
     return okay;
 }
 
@@ -472,7 +951,6 @@ static void *video_thread(void *user_data) {
     DSVideoCapture *capture = w->capture;
     bool recording = false;
     w->manager = ACameraManager_create();
-    /* Optional newer NDK query; no API34 symbol is imported into an API30 APK. */
     w->get_dataspace = (media_status_t (*)(const AImage *, int32_t *))dlsym(RTLD_DEFAULT, "AImage_getDataSpace");
     char id[128] = {0};
     if (!w->manager || !select_camera(w, id)) goto fatal;
@@ -480,7 +958,7 @@ static void *video_thread(void *user_data) {
     if (!camera_ok(w, ACameraManager_openCamera(w->manager, id, &callbacks, &w->device), "open rear camera (requires CAMERA permission)") || !w->device ||
         !media_ok(w, AImageReader_new(w->preview_width, w->preview_height, AIMAGE_FORMAT_YUV_420_888, 3, &w->reader), "create YUV reader") || !w->reader ||
         !media_ok(w, AImageReader_getWindow(w->reader, &w->preview_window), "get YUV surface") || !w->preview_window ||
-        !create_session(w, false)) goto fatal;
+        !create_session(w)) goto fatal;
     while (atomic_load(&capture->preview_running)) {
         if (device_failed(w)) goto fatal;
         pthread_mutex_lock(&w->mutex);
@@ -488,29 +966,30 @@ static void *video_thread(void *user_data) {
         pthread_mutex_unlock(&w->mutex);
         if (wanted && !recording) {
             if (!open_encoder(w)) {
-                fail(w, "cannot start requested FullHD recording"); close_encoder(w, false); recording_finished(w);
+                fail(w, "cannot start filtered A/V recording");
+                close_encoder(w, false);
+                recording_finished(w);
             } else {
-                if (!close_session(w)) goto fatal;
-                if (!create_session(w, true)) {
-                    fail(w, "FullHD+preview stream combination rejected; recording not started");
-                    if (!close_session(w)) goto fatal;
-                    close_encoder(w, false); recording_finished(w);
-                    if (!w->device || !create_session(w, false)) goto fatal;
-                } else recording = true;
+                recording = true;
             }
         } else if (!wanted && recording) {
-            if (!close_session(w)) goto fatal;
             if (!close_encoder(w, true)) fail(w, "video recording did not finalize successfully");
             recording = false;
-            if (!create_session(w, false)) goto fatal;
             recording_finished(w);
         } else if (!wanted && !recording && atomic_load(&capture->active)) {
-            recording_finished(w); /* Start canceled before worker observed it. */
+            recording_finished(w);
         }
         if (!preview_frame(w)) goto fatal;
         if (clock_ns(CLOCK_MONOTONIC) > w->preview_deadline) { fail(w, "camera stopped delivering fresh preview frames"); goto fatal; }
-        if (recording) for (int n = 0; n < 4; ++n) if (!pump_encoder(w, 0)) goto fatal;
-        const int64_t deadline = clock_ns(CLOCK_MONOTONIC) + INT64_C(10000000);
+        if (recording) {
+            render_encoder_frame(w);
+            feed_audio_encoder(w, false);
+            for (int n = 0; n < 4; ++n) {
+                if (!pump_codec_output(w, false, 0)) goto fatal;
+                if (!pump_codec_output(w, true, 0)) goto fatal;
+            }
+        }
+        const int64_t deadline = clock_ns(CLOCK_MONOTONIC) + INT64_C(8000000);
         const struct timespec until = { .tv_sec = (time_t)(deadline / INT64_C(1000000000)), .tv_nsec = (long)(deadline % INT64_C(1000000000)) };
         pthread_mutex_lock(&w->mutex);
         if (atomic_load(&capture->preview_running) && w->record_requested == recording && !w->camera_error)
@@ -519,13 +998,13 @@ static void *video_thread(void *user_data) {
     }
     {
         const bool closed = close_session(w);
-        if (w->codec) close_encoder(w, recording && closed && !device_failed(w));
+        if (w->codec || w->audio_codec) close_encoder(w, recording && closed && !device_failed(w));
     }
     goto cleanup;
 fatal:
     fail(w, "native camera pipeline failed; preview stopped");
     close_session(w);
-    if (w->codec) close_encoder(w, false);
+    if (w->codec || w->audio_codec) close_encoder(w, false);
 cleanup:
     if (w->device) { ACameraDevice_close(w->device); w->device = NULL; }
     if (w->reader) { AImageReader_delete(w->reader); w->reader = NULL; }
@@ -539,9 +1018,24 @@ cleanup:
     return NULL;
 }
 
+static DSVideoWorker *acquire_worker(DSVideoCapture *capture) {
+    if (!capture || !atomic_load(&capture->worker_accepting)) return NULL;
+    atomic_fetch_add(&capture->worker_users, 1);
+    if (!atomic_load(&capture->worker_accepting) || !capture->implementation) {
+        atomic_fetch_sub(&capture->worker_users, 1);
+        return NULL;
+    }
+    return capture->implementation;
+}
+
+static void release_worker(DSVideoCapture *capture) {
+    atomic_fetch_sub(&capture->worker_users, 1);
+}
+
 void ds_video_preview_start(DSVideoCapture *capture, DSVideoFilter filter, int display_rotation) {
     if (!capture) return;
-    if (capture->thread_created && atomic_load(&capture->preview_running) && capture->filter == filter && capture->display_rotation == display_rotation) return;
+    atomic_store(&capture->filter, (int)filter);
+    if (capture->thread_created && atomic_load(&capture->preview_running) && capture->display_rotation == display_rotation) return;
     ds_video_preview_stop(capture);
     atomic_store(&capture->failed, false); atomic_store(&capture->preview_orientation, -1);
     if (filter < DS_VIDEO_FILTER_NIGHT || filter > DS_VIDEO_FILTER_RAW || display_rotation < 0 || display_rotation > 3) {
@@ -550,6 +1044,9 @@ void ds_video_preview_start(DSVideoCapture *capture, DSVideoFilter filter, int d
     DSVideoWorker *w = calloc(1, sizeof(*w));
     if (!w) { atomic_store(&capture->failed, true); return; }
     w->capture = capture; w->fd = -1;
+    w->egl_display = EGL_NO_DISPLAY;
+    w->egl_context = EGL_NO_CONTEXT;
+    w->egl_surface = EGL_NO_SURFACE;
     w->frame = malloc(DS_PREVIEW_MAX_BYTES); w->scratch = malloc(DS_PREVIEW_MAX_BYTES);
     bool mutex_ready = false, condition_ready = false;
     pthread_condattr_t attr;
@@ -562,9 +1059,11 @@ void ds_video_preview_start(DSVideoCapture *capture, DSVideoFilter filter, int d
         if (mutex_ready) pthread_mutex_destroy(&w->mutex);
         free(w->frame); free(w->scratch); free(w); atomic_store(&capture->failed, true); return;
     }
-    capture->filter = filter; capture->display_rotation = display_rotation; capture->implementation = w;
+    capture->display_rotation = display_rotation; capture->implementation = w;
     atomic_store(&capture->preview_running, true);
+    atomic_store(&capture->worker_accepting, true);
     if (pthread_create(&capture->thread, NULL, video_thread, w) != 0) {
+        atomic_store(&capture->worker_accepting, false);
         atomic_store(&capture->preview_running, false); atomic_store(&capture->failed, true);
         pthread_cond_destroy(&w->condition); pthread_mutex_destroy(&w->mutex);
         free(w->frame); free(w->scratch); free(w); capture->implementation = NULL; return;
@@ -572,8 +1071,28 @@ void ds_video_preview_start(DSVideoCapture *capture, DSVideoFilter filter, int d
     capture->thread_created = true;
 }
 
+void ds_video_set_filter(DSVideoCapture *capture, DSVideoFilter filter) {
+    if (!capture || filter < DS_VIDEO_FILTER_NIGHT || filter > DS_VIDEO_FILTER_RAW) return;
+    atomic_store(&capture->filter, (int)filter);
+}
+
+void ds_video_set_hud(DSVideoCapture *capture, const DSVideoHudState *hud) {
+    if (!capture || !hud) return;
+    DSVideoWorker *w = acquire_worker(capture);
+    if (!w) return;
+    if (pthread_mutex_trylock(&w->mutex) == 0) {
+        w->hud = *hud;
+        pthread_mutex_unlock(&w->mutex);
+    }
+    release_worker(capture);
+}
+
 void ds_video_preview_stop(DSVideoCapture *capture) {
     if (!capture) return;
+    atomic_store(&capture->worker_accepting, false);
+    while (atomic_load(&capture->worker_users) > 0) {
+        nanosleep(&(struct timespec){.tv_sec = 0, .tv_nsec = 100000L}, NULL);
+    }
     DSVideoWorker *w = capture->implementation;
     atomic_store(&capture->preview_ready, false); atomic_store(&capture->preview_running, false);
     if (w) {
@@ -588,18 +1107,59 @@ void ds_video_preview_stop(DSVideoCapture *capture) {
     atomic_store(&capture->active, false);
 }
 
-void ds_video_start(DSVideoCapture *capture, const char *evidence_dir, DSVideoFilter filter, int display_rotation) {
+void ds_video_start(DSVideoCapture *capture, const char *evidence_dir, DSVideoFilter filter,
+                    DSVideoAspect aspect, int display_rotation) {
     if (!capture || ds_video_active(capture)) return;
-    if (!evidence_dir || !evidence_dir[0] || strlen(evidence_dir) >= sizeof(capture->evidence_dir)) { atomic_store(&capture->failed, true); return; }
+    if (!evidence_dir || !evidence_dir[0] || strlen(evidence_dir) >= sizeof(capture->evidence_dir)) {
+        atomic_store(&capture->failed, true); return;
+    }
+    capture->aspect = aspect;
     ds_video_preview_start(capture, filter, display_rotation);
     DSVideoWorker *w = capture->implementation;
     if (!w || !atomic_load(&capture->preview_running)) return;
     pthread_mutex_lock(&w->mutex);
     if (!w->worker_finished && !w->camera_error) {
         snprintf(capture->evidence_dir, sizeof(capture->evidence_dir), "%s", evidence_dir);
+        w->audio_head = w->audio_tail = w->audio_count = 0;
         w->record_requested = true; atomic_store(&capture->active, true); pthread_cond_broadcast(&w->condition);
     }
     pthread_mutex_unlock(&w->mutex);
+}
+
+void ds_video_push_audio(DSVideoCapture *capture, const int16_t *pcm, size_t samples, uint32_t sample_rate) {
+    if (!capture || !pcm || samples == 0 || sample_rate == 0) return;
+    if (!atomic_load(&capture->active)) return;
+    DSVideoWorker *w = acquire_worker(capture);
+    if (!w) return;
+    pthread_mutex_lock(&w->mutex);
+    if (w->record_requested) {
+        if (sample_rate == DS_AUDIO_SAMPLE_RATE) {
+            for (size_t i = 0; i < samples; ++i) {
+                if (w->audio_count >= DS_AUDIO_RING_CAP) {
+                    w->audio_head = (w->audio_head + 1U) % DS_AUDIO_RING_CAP;
+                    --w->audio_count;
+                }
+                w->audio_ring[w->audio_tail] = pcm[i];
+                w->audio_tail = (w->audio_tail + 1U) % DS_AUDIO_RING_CAP;
+                ++w->audio_count;
+            }
+        } else {
+            const size_t out_samples = (size_t)(((uint64_t)samples * DS_AUDIO_SAMPLE_RATE) / sample_rate);
+            for (size_t i = 0; i < out_samples; ++i) {
+                const size_t src = (size_t)(((uint64_t)i * sample_rate) / DS_AUDIO_SAMPLE_RATE);
+                const int16_t val = pcm[src < samples ? src : samples - 1U];
+                if (w->audio_count >= DS_AUDIO_RING_CAP) {
+                    w->audio_head = (w->audio_head + 1U) % DS_AUDIO_RING_CAP;
+                    --w->audio_count;
+                }
+                w->audio_ring[w->audio_tail] = val;
+                w->audio_tail = (w->audio_tail + 1U) % DS_AUDIO_RING_CAP;
+                ++w->audio_count;
+            }
+        }
+    }
+    pthread_mutex_unlock(&w->mutex);
+    release_worker(capture);
 }
 
 void ds_video_stop(DSVideoCapture *capture) {

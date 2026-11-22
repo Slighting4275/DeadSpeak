@@ -62,6 +62,21 @@ int main(void) {
     size_t empty_count = ds_voice_synthesize("", &config, pcm, DS_VOICE_MAX_SAMPLES);
     assert(empty_count == 0);
 
+    /* Test 7: Digraph collapsing ('OO', 'SH', 'TH'), deterministic per-call RNG, and smooth transitions */
+    int16_t pcm_a[DS_VOICE_MAX_SAMPLES], pcm_b[DS_VOICE_MAX_SAMPLES];
+    config.mode = DS_VOICE_MODE_CLASSIC;
+    config.pitch_hz = 120.0f;
+    config.speed = 1.0f;
+    const size_t boot_len = ds_voice_synthesize("BOOT", &config, pcm_a, DS_VOICE_MAX_SAMPLES);
+    /* 'B' (70ms) + 'OO' (130ms) + 'T' (60ms) + 40ms tail = 300ms = 4800 samples (< 5600 for collapsed OO) */
+    assert(boot_len > 3500 && boot_len < 5600);
+    const size_t thorn_len = ds_voice_synthesize("THORN", &config, pcm_a, DS_VOICE_MAX_SAMPLES);
+    assert(thorn_len > 3000);
+    /* Second identical CLASSIC synthesis produces identical waveform (no global RNG mutation) */
+    const size_t thorn_len_2 = ds_voice_synthesize("THORN", &config, pcm_b, DS_VOICE_MAX_SAMPLES);
+    assert(thorn_len == thorn_len_2);
+    assert(memcmp(pcm_a, pcm_b, thorn_len * sizeof(int16_t)) == 0);
+
     puts("PASS: voice synthesis classic, whisper, dynamic, spirit box, disabled, and empty guards");
     return 0;
 }

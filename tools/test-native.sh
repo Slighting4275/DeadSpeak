@@ -55,3 +55,20 @@ zig cc -target aarch64-linux-android.30 --sysroot="$ndk_tools/sysroot" \
     -Wl,--gc-sections -llog -lm -laaudio -o "$test_build_dir/voice_player_test" || exit 1
 adb push "$test_build_dir/voice_player_test" /data/local/tmp/deadspeak-voice-player-test || exit 1
 adb shell /data/local/tmp/deadspeak-voice-player-test || exit 1
+
+zig cc -target aarch64-linux-android.30 --sysroot="$ndk_tools/sysroot" \
+    -isystem "$ndk_tools/sysroot/usr/include" \
+    -isystem "$ndk_tools/sysroot/usr/include/aarch64-linux-android" \
+    -I"$project_dir/app/src/main/cpp" \
+    -std=c23 -O1 -Wall -Wextra -Werror -fPIC -ffunction-sections -fdata-sections \
+    -c "$project_dir/tests/media_player_test.c" -o "$test_build_dir/mptest.o" || exit 1
+zig cc -target aarch64-linux-android.30 --sysroot="$ndk_tools/sysroot" \
+    -isystem "$ndk_tools/sysroot/usr/include" \
+    -isystem "$ndk_tools/sysroot/usr/include/aarch64-linux-android" \
+    -I"$project_dir/app/src/main/cpp" \
+    -std=c23 -O1 -Wall -Wextra -Werror -fPIC -ffunction-sections -fdata-sections \
+    -c "$project_dir/app/src/main/cpp/media_player.c" -o "$test_build_dir/mp.o" || exit 1
+"$ndk_tools/bin/aarch64-linux-android30-clang" "$test_build_dir/mptest.o" "$test_build_dir/mp.o" \
+    -Wl,--gc-sections -llog -lm -laaudio -lmediandk -o "$test_build_dir/media_player_test" || exit 1
+adb push "$test_build_dir/media_player_test" /data/local/tmp/deadspeak-media-player-test || exit 1
+adb shell /data/local/tmp/deadspeak-media-player-test || exit 1

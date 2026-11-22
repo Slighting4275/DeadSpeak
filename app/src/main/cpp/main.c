@@ -25,6 +25,8 @@
 #include "explore.h"
 #include "jni_scope.h"
 #include "video_capture.h"
+#include "video_shaders.h"
+#include "media_player.h"
 #include "ui_layout.h"
 #include "sensor_state.h"
 #include "camera_ui.h"
@@ -183,9 +185,17 @@ typedef struct {
     _Atomic int16_t oscilloscope[DS_OSCILLOSCOPE_SAMPLES];
     DSVoiceConfig voice_config;
     DSVoicePlayer *voice_player;
+    DSMediaPlayer *media_player;
+    GLuint mp4_texture;
+    uint8_t *mp4_rgba;
+    int mp4_width, mp4_height, mp4_rotation;
     DSVideoCapture video;
     DSVideoFilter video_filter;
+    DSVideoAspect video_aspect;
+    bool hud_burn_in;
     uint64_t filter_hud_deadline;
+    uint64_t guide_voice_last_ms;
+    char guide_voice_label[48];
     DSExplore explore;
     char explore_cache_path[512];
     char explore_query[48];
@@ -200,6 +210,7 @@ typedef struct {
     uint64_t last_anomaly_tag_ms;
     _Atomic bool sub_bass_anomaly;
     uint64_t sub_bass_anomaly_expiry_ms;
+    float sub_bass_baseline;
     float sub_bass_level;
     DSThemeMode theme_mode;
     uint8_t hud_tint_step;
@@ -592,13 +603,46 @@ static void unlink_recording_set(const char *dir, const char *stem) {
     }
 }
 
+static bool active_media_status(const DeadSpeak *state, char *out_name, size_t max_name,
+                                float *out_progress, uint64_t *out_pos_ms, uint64_t *out_dur_ms, bool *out_is_mp4) {
+    if (!state) return false;
+    if (ds_media_player_is_playing(state->media_player, out_name, max_name, out_progress)) {
+        if (out_pos_ms) *out_pos_ms = ds_media_player_get_position_ms(state->media_player);
+        if (out_dur_ms) *out_dur_ms = ds_media_player_get_duration_ms(state->media_player);
+        if (out_is_mp4) *out_is_mp4 = true;
+        return true;
+    }
+    if (ds_voice_player_is_playing_wav(state->voice_player, out_name, max_name, out_progress)) {
+        if (out_pos_ms) *out_pos_ms = ds_voice_player_get_wav_position_ms(state->voice_player);
+        if (out_dur_ms) *out_dur_ms = ds_voice_player_get_wav_duration_ms(state->voice_player);
+        if (out_is_mp4) *out_is_mp4 = false;
+        return true;
+    }
+    if (out_is_mp4) *out_is_mp4 = false;
+    return false;
+}
+
+static void active_media_stop(DeadSpeak *state, bool stop_wav, bool stop_mp4) {
+    if (!state) return;
+    if (stop_wav && state->voice_player) ds_voice_player_stop_wav(state->voice_player);
+    if (stop_mp4 && state->media_player) ds_media_player_stop(state->media_player);
+}
+
+static void active_media_seek_ms(DeadSpeak *state, uint64_t ms) {
+    if (!state) return;
+    if (ds_media_player_is_playing(state->media_player, NULL, 0, NULL)) {
+        ds_media_player_seek_ms(state->media_player, ms);
+    } else if (ds_voice_player_is_playing_wav(state->voice_player, NULL, 0, NULL)) {
+        ds_voice_player_seek_wav_ms(state->voice_player, ms);
+    }
+}
+
 static void delete_recording_and_companions(DeadSpeak *state, const char *filename) {
     if (!state || !filename || !filename[0]) return;
     char curr_playing[96] = {0};
-    float prog = 0.0f;
-    if (ds_voice_player_is_playing_wav(state->voice_player, curr_playing, sizeof(curr_playing), &prog) &&
+    if (active_media_status(state, curr_playing, sizeof(curr_playing), NULL, NULL, NULL, NULL) &&
         strcmp(curr_playing, filename) == 0) {
-        ds_voice_player_stop_wav(state->voice_player);
+        active_media_stop(state, true, true);
     }
     char primary_path[640];
     snprintf(primary_path, sizeof(primary_path), "%s/%s", state->evidence_dir, filename);
@@ -643,6 +687,38 @@ static FILE *open_companion_file(const DeadSpeak *state, const char *filename, c
         len > 4 && (strcmp(filename + len - 4, ".wav") == 0 || strcmp(filename + len - 4, ".mp4") == 0)) {
         snprintf(path, sizeof(path), "%s/Movies/%.*s%s", state->app->activity->externalDataPath, (int)(len - 4), filename, suffix);
         f = fopen(path, "r");
+    }
+    /* Pair VIDEO_YYYYMMDD_HHMMSS...mp4 with its concurrent EVP_YYYYMMDD_HHMMSS... companion file */
+    if (!f && strncmp(filename, "VIDEO_", 6) == 0 && len > 21 && filename[14] == '_') {
+        char date_prefix[16];
+        snprintf(date_prefix, sizeof(date_prefix), "EVP_%.8s_", filename + 6);
+        const long v_hh = strtol((char[3]){filename[15], filename[16], 0}, NULL, 10);
+        const long v_mm = strtol((char[3]){filename[17], filename[18], 0}, NULL, 10);
+        const long v_ss = strtol((char[3]){filename[19], filename[20], 0}, NULL, 10);
+        const long v_sec = v_hh * 3600L + v_mm * 60L + v_ss;
+        const size_t slen = strlen(suffix);
+        long best_diff = 4L;
+        char best_path[640] = {0};
+        DIR *dir = opendir(state->evidence_dir);
+        if (dir) {
+            struct dirent *ent;
+            while ((ent = readdir(dir)) != NULL) {
+                const size_t nlen = strlen(ent->d_name);
+                if (nlen > 19 + slen && strncmp(ent->d_name, date_prefix, 13) == 0 &&
+                    strcmp(ent->d_name + nlen - slen, suffix) == 0) {
+                    const long e_hh = strtol((char[3]){ent->d_name[13], ent->d_name[14], 0}, NULL, 10);
+                    const long e_mm = strtol((char[3]){ent->d_name[15], ent->d_name[16], 0}, NULL, 10);
+                    const long e_ss = strtol((char[3]){ent->d_name[17], ent->d_name[18], 0}, NULL, 10);
+                    const long diff = labs(v_sec - (e_hh * 3600L + e_mm * 60L + e_ss));
+                    if (diff < best_diff) {
+                        best_diff = diff;
+                        snprintf(best_path, sizeof(best_path), "%s/%s", state->evidence_dir, ent->d_name);
+                    }
+                }
+            }
+            closedir(dir);
+        }
+        if (best_path[0]) f = fopen(best_path, "r");
     }
     return f;
 }
@@ -702,22 +778,22 @@ static void load_recording_tags(DeadSpeak *state, const char *filename) {
 }
 
 static void jump_to_tag(DeadSpeak *state, bool forward) {
-    if (!state || !state->voice_player || state->loaded_tags_count == 0) return;
+    if (!state || state->loaded_tags_count == 0) return;
     const uint64_t now = now_millis();
-    if (state->last_tag_seek_ms && now < state->last_tag_seek_ms + 1000ULL) return;
+    if (state->last_tag_seek_ms && now < state->last_tag_seek_ms + 300ULL) return;
     state->last_tag_seek_ms = now;
 
-    const uint64_t cur_ms = ds_voice_player_get_wav_position_ms(state->voice_player);
-    const uint64_t dur_ms = ds_voice_player_get_wav_duration_ms(state->voice_player);
+    uint64_t cur_ms = 0, dur_ms = 0;
+    if (!active_media_status(state, NULL, 0, NULL, &cur_ms, &dur_ms, NULL)) return;
 
     if (forward) {
         for (size_t i = 0; i < state->loaded_tags_count; ++i) {
             if (state->loaded_tags[i].timestamp_ms >= cur_ms + 50ULL) {
-                ds_voice_player_seek_wav_ms(state->voice_player, state->loaded_tags[i].timestamp_ms);
+                active_media_seek_ms(state, state->loaded_tags[i].timestamp_ms);
                 return;
             }
         }
-        if (dur_ms > 0) ds_voice_player_seek_wav_ms(state->voice_player, dur_ms);
+        if (dur_ms > 0) active_media_seek_ms(state, dur_ms);
     } else {
         const uint64_t target_cur = cur_ms > 1000ULL ? (cur_ms - 1000ULL) : 0ULL;
         int found_idx = -1;
@@ -729,9 +805,9 @@ static void jump_to_tag(DeadSpeak *state, bool forward) {
             }
         }
         if (found_idx >= 0) {
-            ds_voice_player_seek_wav_ms(state->voice_player, state->loaded_tags[found_idx].timestamp_ms);
+            active_media_seek_ms(state, state->loaded_tags[found_idx].timestamp_ms);
         } else {
-            ds_voice_player_seek_wav_ms(state->voice_player, 0ULL);
+            active_media_seek_ms(state, 0ULL);
         }
     }
 }
@@ -896,12 +972,34 @@ static void *audio_capture_thread(void *user_data) {
     capture_ok = true;
 
     int16_t samples[480];
+    int16_t dsp_ring[1024] = {0};
+    int16_t dsp_linear[1024] = {0};
+    size_t dsp_head = 0;
+    size_t dsp_filled = 0;
+    state->sub_bass_baseline = 15.0f;
     uint32_t last_srt_sec = UINT32_MAX, srt_cue_index = 0, last_wf_ms = 0;
 
     while (atomic_load(&state->audio_active)) {
         const aaudio_result_t frames = AAudioStream_read(stream, samples, 480, 100000000LL);
         if (frames < 0) { atomic_store(&state->audio_failed, true); break; }
         if (frames == 0) continue;
+
+        /* Feed live microphone frames into muxed MP4 AAC audio encoder */
+        ds_video_push_audio(&state->video, samples, (size_t)frames, sample_rate);
+
+        /* Update 1024-sample Hann analysis ring buffer */
+        for (aaudio_result_t i = 0; i < frames; ++i) {
+            dsp_ring[dsp_head] = samples[i];
+            dsp_head = (dsp_head + 1U) & 1023U;
+            if (dsp_filled < 1024U) ++dsp_filled;
+        }
+        const size_t n_win = dsp_filled;
+        if (n_win > 0) {
+            const size_t oldest = (dsp_head + 1024U - n_win) & 1023U;
+            for (size_t i = 0; i < n_win; ++i) {
+                dsp_linear[i] = dsp_ring[(oldest + i) & 1023U];
+            }
+        }
 
         /* Update oscilloscope ring buffer */
         const int step = (int)frames / DS_OSCILLOSCOPE_SAMPLES;
@@ -920,24 +1018,28 @@ static void *audio_capture_thread(void *user_data) {
         const unsigned level = (unsigned)(rms * 1000.0f);
         atomic_store(&state->audio_level_milli, level > 1000U ? 1000U : level);
         float bands[3] = {0};
-        ds_engine_spectrum(samples, (size_t)frames, sample_rate, bands);
+        ds_engine_spectrum(dsp_linear, n_win, sample_rate, bands);
         for (unsigned band = 0; band < 3; ++band) {
             const unsigned band_level = (unsigned)(bands[band] * 4000.0f);
             atomic_store(&state->spectrum_milli[band], band_level > 1000U ? 1000U : band_level);
         }
         float bins[DS_SPECTRUM_BINS];
-        ds_engine_spectrum_bins(samples, (size_t)frames, sample_rate, bins, DS_SPECTRUM_BINS);
+        ds_engine_spectrum_hann_db(dsp_linear, n_win, sample_rate, bins, DS_SPECTRUM_BINS);
         for (unsigned band = 0; band < DS_SPECTRUM_BINS; ++band)
-            atomic_store(&state->spectrum_bins[band], (uint32_t)fminf(1000, bins[band] * 6000));
+            atomic_store(&state->spectrum_bins[band], (uint32_t)fminf(1000, bins[band] * 1000.0f));
 
-        /* Sub-Bass EVP Anomaly Evaluator (80-300 Hz) via Zig signal engine */
-        static float sub_bass_baseline = 15.0f;
-        const float sub_energy = ds_engine_sub_bass_energy(samples, (size_t)frames, sample_rate);
-        sub_bass_baseline = sub_bass_baseline * 0.98f + sub_energy * 0.02f;
+        /* Sub-Bass EVP Anomaly Evaluator (80-300 Hz) with Hann window, speech-band rejection, & self-Vox gating */
+        const float sub_energy = ds_engine_sub_bass_energy(dsp_linear, n_win, sample_rate);
+        const float speech_ratio = ds_engine_speech_ratio(dsp_linear, n_win, sample_rate);
+        const bool vox_speaking = ds_voice_player_is_speaking(state->voice_player);
+        if (!vox_speaking) {
+            state->sub_bass_baseline = state->sub_bass_baseline * 0.98f + sub_energy * 0.02f;
+        }
         state->sub_bass_level = sub_energy;
 
         const uint64_t cap_now = now_millis();
-        if (sub_energy > 15.0f && sub_energy > sub_bass_baseline * 2.0f) {
+        if (!vox_speaking && speech_ratio < 1.35f &&
+            sub_energy > 15.0f && sub_energy > state->sub_bass_baseline * 2.0f) {
             atomic_store(&state->sub_bass_anomaly, true);
             state->sub_bass_anomaly_expiry_ms = cap_now + 2000U;
             /* Emit tag 2 (ORANGE / ANOMALY) to _tags.txt */
@@ -1071,55 +1173,6 @@ static const char *text_fragment_shader_source =
     "    float a = texture2D(u_atlas, v_uv).a;\n"
     "    gl_FragColor = vec4(u_color.rgb, u_color.a * a);\n"
     "}\n";
-
-static const char *camera_vertex_shader =
-    "attribute vec2 a_position;attribute vec2 a_uv;varying vec2 v_uv;"
-    "void main(){v_uv=a_uv;gl_Position=vec4(a_position,0.0,1.0);}";
-static const char *camera_fragment_shader =
-    "precision mediump float;\n"
-    "uniform sampler2D u_image;\n"
-    "uniform int u_filter;\n"
-    "varying vec2 v_uv;\n"
-    "void main(){\n"
-    "    vec4 c = texture2D(u_image, v_uv);\n"
-    "    float luma = dot(c.rgb, vec3(0.299, 0.587, 0.114));\n"
-    "    if (u_filter == 0) {\n" /* NIGHT: Phosphor Green night vision */
-    "        float g = clamp(luma * 1.55 + 0.08, 0.0, 1.0);\n"
-    "        gl_FragColor = vec4(g * 0.12, g * 1.08, g * 0.22, 1.0);\n"
-    "    } else if (u_filter == 1) {\n" /* THERMAL: False-Color Heatmap */
-    "        float t = clamp(luma, 0.0, 1.0);\n"
-    "        vec3 col;\n"
-    "        if (t < 0.25) col = mix(vec3(0.05, 0.0, 0.25), vec3(0.0, 0.2, 0.85), t / 0.25);\n"
-    "        else if (t < 0.5) col = mix(vec3(0.0, 0.2, 0.85), vec3(0.85, 0.1, 0.15), (t - 0.25) / 0.25);\n"
-    "        else if (t < 0.75) col = mix(vec3(0.85, 0.1, 0.15), vec3(1.0, 0.85, 0.0), (t - 0.5) / 0.25);\n"
-    "        else col = mix(vec3(1.0, 0.85, 0.0), vec3(1.0, 1.0, 1.0), (t - 0.75) / 0.25);\n"
-    "        gl_FragColor = vec4(col, 1.0);\n"
-    "    } else if (u_filter == 2) {\n" /* EDGE: Sobel spectral contour detection */
-    "        float d = 1.0 / 480.0;\n"
-    "        float c0 = dot(texture2D(u_image, v_uv + vec2(-d, -d)).rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        float c1 = dot(texture2D(u_image, v_uv + vec2(0.0, -d)).rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        float c2 = dot(texture2D(u_image, v_uv + vec2(d, -d)).rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        float c3 = dot(texture2D(u_image, v_uv + vec2(-d, 0.0)).rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        float c5 = dot(texture2D(u_image, v_uv + vec2(d, 0.0)).rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        float c6 = dot(texture2D(u_image, v_uv + vec2(-d, d)).rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        float c7 = dot(texture2D(u_image, v_uv + vec2(0.0, d)).rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        float c8 = dot(texture2D(u_image, v_uv + vec2(d, d)).rgb, vec3(0.299, 0.587, 0.114));\n"
-    "        float gx = -c0 + c2 - 2.0 * c3 + 2.0 * c5 - c6 + c8;\n"
-    "        float gy = -c0 - 2.0 * c1 - c2 + c6 + 2.0 * c7 + c8;\n"
-    "        float edge = clamp(sqrt(gx * gx + gy * gy) * 3.2, 0.0, 1.0);\n"
-    "        gl_FragColor = vec4(edge * 0.1, edge * 1.0, edge * 0.75, 1.0);\n"
-    "    } else if (u_filter == 3) {\n" /* MONO: High Contrast IR */
-    "        float m = clamp((luma - 0.08) * 1.25, 0.0, 1.0);\n"
-    "        gl_FragColor = vec4(vec3(m), 1.0);\n"
-    "    } else if (u_filter == 4) {\n" /* SEPIA: Vintage */
-    "        vec3 s = vec3(dot(c.rgb, vec3(0.393, 0.769, 0.189)),\n"
-    "                      dot(c.rgb, vec3(0.349, 0.686, 0.168)),\n"
-    "                      dot(c.rgb, vec3(0.272, 0.534, 0.131)));\n"
-    "        gl_FragColor = vec4(clamp(s, 0.0, 1.0), 1.0);\n"
-    "    } else {\n" /* RAW */
-    "        gl_FragColor = c;\n"
-    "    }\n"
-    "}";
 
 static uint64_t now_millis(void) {
     struct timespec ts;
@@ -1274,8 +1327,8 @@ static bool setup_display(DeadSpeak *state) {
     glUseProgram(state->program);
     glDeleteShader(vertex);
     glDeleteShader(fragment);
-    vertex = compile_shader(GL_VERTEX_SHADER, camera_vertex_shader);
-    fragment = compile_shader(GL_FRAGMENT_SHADER, camera_fragment_shader);
+    vertex = compile_shader(GL_VERTEX_SHADER, DS_CAMERA_VERTEX_SHADER);
+    fragment = compile_shader(GL_FRAGMENT_SHADER, DS_CAMERA_FRAGMENT_SHADER);
     state->camera_program = glCreateProgram();
     glAttachShader(state->camera_program, vertex);
     glAttachShader(state->camera_program, fragment);
@@ -1288,6 +1341,13 @@ static bool setup_display(DeadSpeak *state) {
     state->camera_image_loc = glGetUniformLocation(state->camera_program, "u_image");
     glGenTextures(1, &state->camera_texture);
     glBindTexture(GL_TEXTURE_2D, state->camera_texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+    glGenTextures(1, &state->mp4_texture);
+    glBindTexture(GL_TEXTURE_2D, state->mp4_texture);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -1341,6 +1401,7 @@ static void teardown_display(DeadSpeak *state) {
     state->surface = EGL_NO_SURFACE;
     state->context = EGL_NO_CONTEXT;
     state->camera_texture = 0;
+    state->mp4_texture = 0;
     state->camera_program = 0;
     state->program = 0;
     state->text_texture = 0;
@@ -1522,6 +1583,7 @@ static void circle(DeadSpeak *state, float cx, float cy, float radius, float r, 
 }
 
 static void filled_circle(DeadSpeak *state, float x, float y, float radius, float r, float g, float b, float a) {
+    if (state->body_drawing) y -= state->scroll[state->tab];
     for (int i = 0; i < 40; ++i) {
         const float p = i * 6.2831853f / 40, q = (i + 1) * 6.2831853f / 40;
         const GLfloat vertices[] = {
@@ -1536,9 +1598,12 @@ static void filled_circle(DeadSpeak *state, float x, float y, float radius, floa
 static float body_content_height(const DeadSpeak *state) {
     if (state->tab == 0) return state->ui.scan_height;
     if (state->tab == 2) return state->ui.explore_height;
-    if (state->tab == 3) return 650.0f;
+    if (state->tab == 3) return 720.0f;
     const float words = state->log_count ? 70.0f + (float)state->log_count * 42.0f : 130.0f;
-    const float media = 36.0f + (float)(state->media_count ? state->media_count : 1) * 34.0f + 16.0f;
+    const bool playing_mp4 = ds_media_player_is_playing(state->media_player, NULL, 0, NULL);
+    const bool playing_wav = ds_voice_player_is_playing_wav(state->voice_player, NULL, 0, NULL);
+    const float extra = playing_mp4 ? 236.0f : (playing_wav ? 48.0f : 0.0f);
+    const float media = 36.0f + (float)(state->media_count ? state->media_count : 1) * 36.0f + extra + 20.0f;
     return state->ui.wide ? fmaxf(words, 22.0f + media) : fmaxf(140.0f, words + 20.0f) + media;
 }
 
@@ -1570,10 +1635,23 @@ static DSLogLayout log_layout(const DeadSpeak *state) {
 }
 
 typedef struct {
-    DSRect prev_tag, next_tag, stop, del_active, scrubber, del_idle, item_row;
+    DSRect prev_tag, next_tag, pause_btn, stop, del_active, scrubber, del_idle, item_row, video_box;
 } DSMediaItemLayout;
 
-static DSMediaItemLayout media_item_layout(DSLogLayout log, float cur_item_y) {
+static DSMediaItemLayout media_item_layout(DSLogLayout log, float cur_item_y, bool is_mp4) {
+    if (is_mp4) {
+        return (DSMediaItemLayout){
+            .video_box  = {log.media_x, cur_item_y + 22.0f, log.column_width - 32.0f, 172.0f},
+            .scrubber   = {log.media_x + 4.0f, cur_item_y + 200.0f, log.column_width - 36.0f, 16.0f},
+            .prev_tag   = {log.media_x + 4.0f, cur_item_y + 224.0f, 54.0f, 26.0f},
+            .next_tag   = {log.media_x + 62.0f, cur_item_y + 224.0f, 54.0f, 26.0f},
+            .pause_btn  = {log.media_x + 120.0f, cur_item_y + 224.0f, 52.0f, 26.0f},
+            .stop       = {log.media_x + 176.0f, cur_item_y + 224.0f, 44.0f, 26.0f},
+            .del_active = {log.media_x + log.column_width - 52.0f, cur_item_y + 224.0f, 42.0f, 26.0f},
+            .del_idle   = {log.media_x + log.column_width - 48.0f, cur_item_y + 1.0f, 40.0f, 22.0f},
+            .item_row   = {log.media_x, cur_item_y - 4.0f, log.column_width - 52.0f, 36.0f},
+        };
+    }
     return (DSMediaItemLayout){
         .prev_tag = {log.media_x + 4.0f, cur_item_y + 42.0f, 64.0f, 26.0f},
         .next_tag = {log.media_x + 74.0f, cur_item_y + 42.0f, 64.0f, 26.0f},
@@ -1583,6 +1661,50 @@ static DSMediaItemLayout media_item_layout(DSLogLayout log, float cur_item_y) {
         .del_idle = {log.media_x + log.column_width - 48.0f, cur_item_y + 1.0f, 40.0f, 22.0f},
         .item_row = {log.media_x, cur_item_y - 4.0f, log.column_width - 52.0f, 36.0f},
     };
+}
+
+static void draw_mp4_quad(DeadSpeak *state, DSRect box) {
+    if (!state->mp4_rgba || !state->mp4_texture || !state->camera_program) return;
+    if (ds_media_player_copy_frame(state->media_player, state->mp4_rgba, DS_PREVIEW_CAPACITY,
+                                   &state->mp4_width, &state->mp4_height)) {
+        state->mp4_rotation = ds_media_player_rotation(state->media_player);
+        glBindTexture(GL_TEXTURE_2D, state->mp4_texture);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, state->mp4_width, state->mp4_height,
+                     0, GL_RGBA, GL_UNSIGNED_BYTE, state->mp4_rgba);
+    }
+    rect(state, box.x, box.y, box.w, box.h, 0.02f, 0.03f, 0.03f, 1.0f);
+    if (state->mp4_width <= 0 || state->mp4_height <= 0) return;
+
+    const bool swap = state->mp4_rotation == 90 || state->mp4_rotation == 270;
+    const float src_aspect = (float)(swap ? state->mp4_height : state->mp4_width) /
+                             (float)(swap ? state->mp4_width : state->mp4_height);
+    float draw_w = box.w, draw_h = box.h;
+    if (box.w / box.h > src_aspect) draw_w = box.h * src_aspect;
+    else draw_h = box.w / src_aspect;
+    const float dx = box.x + (box.w - draw_w) * 0.5f;
+    float dy = box.y + (box.h - draw_h) * 0.5f;
+    if (state->body_drawing) dy -= state->scroll[state->tab];
+
+    float uv[12];
+    if (!ds_preview_uv(state->mp4_width, state->mp4_height, state->mp4_rotation, draw_w, draw_h, uv)) return;
+    const float x1 = (dx / state->width) * 2.0f - 1.0f;
+    const float x2 = ((dx + draw_w) / state->width) * 2.0f - 1.0f;
+    const float y1 = 1.0f - (dy / state->height) * 2.0f;
+    const float y2 = 1.0f - ((dy + draw_h) / state->height) * 2.0f;
+    const GLfloat vertices[] = {x1,y1, x2,y1, x1,y2, x1,y2, x2,y1, x2,y2};
+
+    glUseProgram(state->camera_program);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, state->mp4_texture);
+    glUniform1i(state->camera_image_loc, 0);
+    glUniform1i(state->camera_filter_loc, (int)DS_VIDEO_FILTER_RAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, vertices);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, uv);
+    glEnableVertexAttribArray(0);
+    glEnableVertexAttribArray(1);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDisableVertexAttribArray(1);
 }
 
 static void draw_log(DeadSpeak *state, const DSPalette *pal) {
@@ -1617,9 +1739,12 @@ static void draw_log(DeadSpeak *state, const DSPalette *pal) {
     custom_button(state, layout.export_btn, "EXPORT LOGS", false);
     if (state->media_count == 0U) text(state, "NO AUDIO OR VIDEO FILES", media_x, media_y + 34, fit_text_scale("NO AUDIO OR VIDEO FILES", 1.1f, column_width - 32), pal->muted.r, pal->muted.g, pal->muted.b, 1.0f);
 
-    char curr_wav[96] = {0};
-    float wav_prog = 0.0f;
-    const bool is_playing_any = ds_voice_player_is_playing_wav(state->voice_player, curr_wav, sizeof(curr_wav), &wav_prog);
+    char curr_name[96] = {0};
+    float active_prog = 0.0f;
+    uint64_t active_pos_ms = 0, active_dur_ms = 0;
+    bool active_is_mp4 = false;
+    const bool is_playing_any = active_media_status(state, curr_name, sizeof(curr_name),
+                                                    &active_prog, &active_pos_ms, &active_dur_ms, &active_is_mp4);
 
     float cur_item_y = media_y + 36.0f;
     for (unsigned i = 0; i < state->media_count; ++i) {
@@ -1628,8 +1753,8 @@ static void draw_log(DeadSpeak *state, const DSPalette *pal) {
         const bool is_wav = len > 4 && strcmp(filename + len - 4, ".wav") == 0;
         const bool is_mp4 = len > 4 && strcmp(filename + len - 4, ".mp4") == 0;
         const bool is_txt = len > 4 && strcmp(filename + len - 4, ".txt") == 0;
-        const bool is_this_playing = is_playing_any && strcmp(curr_wav, filename) == 0;
-        const DSMediaItemLayout item = media_item_layout(layout, cur_item_y);
+        const bool is_this_playing = is_playing_any && strcmp(curr_name, filename) == 0;
+        const DSMediaItemLayout item = media_item_layout(layout, cur_item_y, is_this_playing && is_mp4);
 
         char stem[96] = {0};
         if (len > 4) snprintf(stem, sizeof(stem), "%.*s", (int)(len - 4), filename);
@@ -1647,23 +1772,27 @@ static void draw_log(DeadSpeak *state, const DSPalette *pal) {
 
         if (is_this_playing) {
             load_recording_tags(state, filename);
-            const uint64_t cur_ms = ds_voice_player_get_wav_position_ms(state->voice_player);
-            const uint64_t dur_ms = ds_voice_player_get_wav_duration_ms(state->voice_player);
-            const unsigned cur_sec = (unsigned)(cur_ms / 1000ULL);
-            const unsigned dur_sec = (unsigned)(dur_ms / 1000ULL);
+            const unsigned cur_sec = (unsigned)(active_pos_ms / 1000ULL);
+            const unsigned dur_sec = (unsigned)(active_dur_ms / 1000ULL);
+            const float card_h = is_mp4 ? 258.0f : 76.0f;
 
-            /* Interactive scrubbable playback card */
-            rect(state, media_x - 4, cur_item_y - 2, column_width - 24, 76, 0.07f, 0.18f, 0.15f, 0.95f);
+            rect(state, media_x - 4, cur_item_y - 2, column_width - 24, card_h, 0.07f, 0.18f, 0.15f, 0.95f);
 
             char label[128];
-            snprintf(label, sizeof(label), "|| %s  %02u:%02u / %02u:%02u (%u%%)",
-                     filename, cur_sec / 60, cur_sec % 60, dur_sec / 60, dur_sec % 60, (unsigned)(wav_prog * 100.0f));
+            const bool paused = is_mp4 && ds_media_player_is_paused(state->media_player);
+            snprintf(label, sizeof(label), "%s %s  %02u:%02u / %02u:%02u (%u%%)",
+                     paused ? "|>" : "||", filename, cur_sec / 60, cur_sec % 60,
+                     dur_sec / 60, dur_sec % 60, (unsigned)(active_prog * 100.0f));
             text(state, label, media_x + 4, cur_item_y + 4, fit_text_scale(label, 1.05f, column_width - 32), 0.95f, 0.98f, 0.94f, 1.0f);
+
+            if (is_mp4) {
+                draw_mp4_quad(state, item.video_box);
+            }
 
             /* Timeline waveform scrubber bar */
             const float bar_x = item.scrubber.x;
             const float bar_w = item.scrubber.w;
-            const float bar_y = cur_item_y + 24.0f;
+            const float bar_y = item.scrubber.y + 4.0f;
             if (state->loaded_waveform_count > 0) {
                 const size_t wf_n = state->loaded_waveform_count;
                 const float slot_w = bar_w / (float)wf_n;
@@ -1673,7 +1802,7 @@ static void draw_log(DeadSpeak *state, const DSPalette *pal) {
                     const float amp = fminf(1.0f, fmaxf(0.12f, state->loaded_waveform[b] * 4.0f));
                     const float bh = amp * 12.0f;
                     const float by = bar_y + (12.0f - bh) * 0.5f;
-                    const bool played = norm_x <= wav_prog;
+                    const bool played = norm_x <= active_prog;
                     rect(state, bar_x + (float)b * slot_w, by, draw_w, bh,
                          played ? pal->mint.r : 0.18f,
                          played ? pal->mint.g : 0.26f,
@@ -1682,54 +1811,57 @@ static void draw_log(DeadSpeak *state, const DSPalette *pal) {
                 }
             } else {
                 rect(state, bar_x, bar_y, bar_w, 8, 0.12f, 0.18f, 0.17f, 1.0f);
-                rect(state, bar_x, bar_y, bar_w * wav_prog, 8, pal->mint.r, pal->mint.g, pal->mint.b, 1.0f);
+                rect(state, bar_x, bar_y, bar_w * active_prog, 8, pal->mint.r, pal->mint.g, pal->mint.b, 1.0f);
             }
-            filled_circle(state, bar_x + bar_w * wav_prog, bar_y + 4.0f, 5.5f, 1.0f, 1.0f, 1.0f, 1.0f);
+            filled_circle(state, bar_x + bar_w * active_prog, bar_y + 4.0f, 5.5f, 1.0f, 1.0f, 1.0f, 1.0f);
 
             /* Tag dots along timeline */
             int active_tag_idx = -1;
             uint8_t active_tag_id = 0;
-            if (dur_ms > 0) {
+            if (active_dur_ms > 0) {
                 for (size_t t = 0; t < state->loaded_tags_count; ++t) {
                     const uint64_t t_ms = state->loaded_tags[t].timestamp_ms;
-                    if (t_ms <= dur_ms) {
-                        const float dot_x = bar_x + (float)t_ms / (float)dur_ms * bar_w;
+                    if (t_ms <= active_dur_ms) {
+                        const float dot_x = bar_x + (float)t_ms / (float)active_dur_ms * bar_w;
                         const uint8_t tid = state->loaded_tags[t].tag_id;
                         const float dr = tid == DS_TAG_WORD ? 0.2f : tid == DS_TAG_ANOMALY ? 1.0f : 0.85f;
                         const float dg = tid == DS_TAG_WORD ? 0.95f : tid == DS_TAG_ANOMALY ? 0.55f : 0.35f;
                         const float db = tid == DS_TAG_WORD ? 0.4f : tid == DS_TAG_ANOMALY ? 0.1f : 0.95f;
                         filled_circle(state, dot_x, bar_y + 4.0f, 3.2f, dr, dg, db, 1.0f);
                     }
-                    if (t_ms >= (cur_ms > 1200ULL ? cur_ms - 1200ULL : 0ULL) && t_ms <= cur_ms + 1200ULL) {
+                    if (t_ms >= (active_pos_ms > 1200ULL ? active_pos_ms - 1200ULL : 0ULL) && t_ms <= active_pos_ms + 1200ULL) {
                         active_tag_idx = (int)t + 1;
                         active_tag_id = state->loaded_tags[t].tag_id;
                     }
                 }
             }
 
-            /* Tag jump and stop buttons */
             custom_button(state, item.prev_tag, "<< TAG", false);
             custom_button(state, item.next_tag, "TAG >>", false);
+            if (is_mp4) {
+                custom_button(state, item.pause_btn, paused ? "PLAY" : "PAUSE", paused);
+            }
             custom_button(state, item.stop, "STOP", false);
 
-            char tag_status[64];
-            if (active_tag_idx > 0) {
-                const char *tname = active_tag_id == DS_TAG_WORD ? "WORD" : active_tag_id == DS_TAG_ANOMALY ? "ANOMALY" : "BOOKMARK";
-                snprintf(tag_status, sizeof(tag_status), "TAG #%d [%s]", active_tag_idx, tname);
-            } else {
-                snprintf(tag_status, sizeof(tag_status), "TAGS: %zu", state->loaded_tags_count);
+            if (!is_mp4) {
+                char tag_status[64];
+                if (active_tag_idx > 0) {
+                    const char *tname = active_tag_id == DS_TAG_WORD ? "WORD" : active_tag_id == DS_TAG_ANOMALY ? "ANOMALY" : "BOOKMARK";
+                    snprintf(tag_status, sizeof(tag_status), "TAG #%d [%s]", active_tag_idx, tname);
+                } else {
+                    snprintf(tag_status, sizeof(tag_status), "TAGS: %zu", state->loaded_tags_count);
+                }
+                text(state, tag_status, media_x + 204.0f, cur_item_y + 49.0f, 1.0f, pal->mint.r, pal->mint.g, pal->mint.b, 1.0f);
             }
-            text(state, tag_status, media_x + 204.0f, cur_item_y + 49.0f, 1.0f, pal->mint.r, pal->mint.g, pal->mint.b, 1.0f);
 
-            /* Delete Button */
             rect(state, item.del_active.x, item.del_active.y, item.del_active.w, item.del_active.h, 0.45f, 0.12f, 0.12f, 0.9f);
             text(state, "DEL", item.del_active.x + 8.0f, item.del_active.y + 7.0f, 1.0f, 1.0f, 0.8f, 0.8f, 1.0f);
 
-            cur_item_y += 82.0f;
+            cur_item_y += is_mp4 ? 264.0f : 82.0f;
         } else {
             char label[128];
             if (is_wav) snprintf(label, sizeof(label), "> %s", filename);
-            else if (is_mp4) snprintf(label, sizeof(label), "[] %s", filename);
+            else if (is_mp4) snprintf(label, sizeof(label), "> [MP4] %s", filename);
             else if (is_txt) snprintf(label, sizeof(label), "## %s", filename);
             else snprintf(label, sizeof(label), "- %s", filename);
 
@@ -1738,14 +1870,12 @@ static void draw_log(DeadSpeak *state, const DSPalette *pal) {
             const float lb = is_wav ? pal->mint.b : is_mp4 ? 0.95f : pal->muted.b;
             text(state, label, media_x, cur_item_y + 4, fit_text_scale(label, 0.95f, column_width - 150.0f), lr, lg, lb, 1.0f);
 
-            /* Companion badges */
             float badge_x = media_x + column_width - 152.0f;
             if (has_txt) { text(state, "TXT", badge_x, cur_item_y + 4, 0.8f, 0.35f, 0.85f, 0.75f, 1.0f); badge_x += 24.0f; }
             if (has_tags) { text(state, "TAGS", badge_x, cur_item_y + 4, 0.8f, 1.0f, 0.65f, 0.2f, 1.0f); badge_x += 30.0f; }
             if (has_wf) { text(state, "WF", badge_x, cur_item_y + 4, 0.8f, 0.4f, 0.8f, 1.0f, 1.0f); badge_x += 20.0f; }
             if (has_srt) text(state, "SRT", badge_x, cur_item_y + 4, 0.8f, 0.8f, 0.8f, 0.8f, 1.0f);
 
-            /* Delete Button */
             rect(state, item.del_idle.x, item.del_idle.y, item.del_idle.w, item.del_idle.h, 0.35f, 0.12f, 0.12f, 0.85f);
             text(state, "DEL", item.del_idle.x + 8.0f, item.del_idle.y + 4.0f, 0.9f, 1.0f, 0.75f, 0.75f, 1.0f);
 
@@ -1755,32 +1885,77 @@ static void draw_log(DeadSpeak *state, const DSPalette *pal) {
     }
 }
 
+typedef struct {
+    DSRect voice_btns[4];
+} DSGuideLayout;
+
+static DSGuideLayout guide_layout(const DeadSpeak *state) {
+    const float top = state->ui.body.y, x = state->ui.body.x + 16.0f;
+    const float available = state->ui.body.w - 32.0f;
+    const float btn_gap = 8.0f;
+    const float btn_w = (available - btn_gap * 3.0f) * 0.25f;
+    DSGuideLayout gl = {0};
+    for (unsigned i = 0; i < 4; ++i) {
+        gl.voice_btns[i] = (DSRect){x + (float)i * (btn_w + btn_gap), top + 122.0f, btn_w, 38.0f};
+    }
+    return gl;
+}
+
 static void draw_guide(DeadSpeak *state, const DSPalette *pal) {
     const float top = state->ui.body.y, x = state->ui.body.x + 16.0f;
     const float available = state->ui.body.w - 32.0f;
-    text(state, "FIELD NOTES", x, top + 24, 2.2f, pal->mint.r, pal->mint.g, pal->mint.b, 1.0f);
+    const DSGuideLayout gl = guide_layout(state);
+    const uint64_t now = now_millis();
+
+    text(state, "SENSOR & VOICE DIAGNOSTICS", x, top + 20, fit_text_scale("SENSOR & VOICE DIAGNOSTICS", 1.8f, available), pal->mint.r, pal->mint.g, pal->mint.b, 1.0f);
+
+    /* Live hardware sensor readiness summary */
+    rect(state, x, top + 46, available, 52, 0.06f, 0.10f, 0.10f, 0.92f);
+    const int64_t s_now = sensor_now_ns();
+    char sensor_line[128];
+    snprintf(sensor_line, sizeof(sensor_line), "MAG:%s  ACC:%s  GYR:%s  PROX:%s",
+             ds_sensor_live(&state->readings[0], s_now) ? "LIVE" : ds_sensor_status_name(state->readings[0].status),
+             ds_sensor_live(&state->readings[1], s_now) ? "LIVE" : ds_sensor_status_name(state->readings[1].status),
+             ds_sensor_live(&state->readings[2], s_now) ? "LIVE" : ds_sensor_status_name(state->readings[2].status),
+             state->sensors[3] ? (state->proximity_active ? "NEAR" : "FAR") : "N/A");
+    text(state, sensor_line, x + 10, top + 56, fit_text_scale(sensor_line, 1.05f, available - 20), pal->mint.r, pal->mint.g, pal->mint.b, 1.0f);
+
+    char baseline_line[128];
+    snprintf(baseline_line, sizeof(baseline_line), "BASELINE: %s (%.1f UT) | CAMERA:%s",
+             state->baseline.ready ? "READY" : "CALIBRATING", state->baseline.field,
+             state->camera_enabled ? "ON" : "OFF");
+    text(state, baseline_line, x + 10, top + 76, fit_text_scale(baseline_line, 1.0f, available - 20), pal->muted.r, pal->muted.g, pal->muted.b, 1.0f);
+
+    /* Interactive Formant Voice Test buttons */
+    text(state, "TAP TO TEST PHONEME SYNTHESIZER:", x, top + 106, fit_text_scale("TAP TO TEST PHONEME SYNTHESIZER:", 1.05f, available), pal->muted.r, pal->muted.g, pal->muted.b, 1.0f);
+    static const char *const vnames[4] = {"CLASSIC", "WHISPER", "DYNAMIC", "SPIRIT"};
+    for (unsigned i = 0; i < 4; ++i) {
+        const bool selected = (unsigned)state->voice_config.mode == i;
+        custom_button(state, gl.voice_btns[i], vnames[i], selected);
+    }
+    if (state->guide_voice_label[0] && now < state->guide_voice_last_ms + 4000U) {
+        text(state, state->guide_voice_label, x, top + 166, fit_text_scale(state->guide_voice_label, 1.0f, available), pal->amber.r, pal->amber.g, pal->amber.b, 1.0f);
+    }
+
+    text(state, "FIELD NOTES", x, top + 192, 1.8f, pal->mint.r, pal->mint.g, pal->mint.b, 1.0f);
     static const char *const notes[] = {
         "MAGNETIC READINGS CHANGE NEAR", "METAL ELECTRONICS AND MOVEMENT",
         "WORDS ARE SENSOR OUTPUTS", "NOT VERIFIED COMMUNICATION",
         "PAIR READINGS WITH OTHER TOOLS", "AND CHECK ORDINARY CAUSES",
         "NEVER USE OUTPUT FOR IMPORTANT", "LIFE DECISIONS",
-        "EVP CAPTURE SAVES MONO WAV AUDIO", "VIDEO SAVES MP4 UP TO 1080P",
-        "AUDIO AND VIDEO ARE SEPARATE FILES", "NIGHT BOOSTS CAMERA EXPOSURE",
-        "MONO AND SEPIA NEED CAMERA SUPPORT",
-        "CAM TO ENABLE LIVE PREVIEW",
-        "RED BUTTON STARTS AND STOPS CAPTURE",
-        "FX CHANGES THE CAMERA FILTER",
-        "WORDS EDITS YOUR LOCAL WORD BANK",
-        "INFO SHOWS AXES AND RECALIBRATION",
+        "RECORDING MUXES FILTERED VIDEO", "AND AAC AUDIO INTO MP4",
+        "TAP 16:9 / 9:16 / 4:5 FOR FRAMING", "TAP HUD / CLEAN FOR BURN-IN",
+        "LOG PLAYS BACK WAV AND MP4 CLIPS", "WITH TAG TIMELINE SCRUBBING",
+        "HANN WINDOW + SELF-VOX GATING", "REDUCES SPEECH SUB-BASS FALSE TAGS",
         "HOLD STILL FOR TWENTY REAL SAMPLES",
         "WORDS REQUIRE A FIELD DEVIATION"
     };
     for (size_t i = 0; i < sizeof(notes) / sizeof(notes[0]); ++i) {
-        const bool warning = i == 6 || i == 7 || i == 11;
-        const bool highlighted = i == 2;
+        const bool warning = i == 6 || i == 7;
+        const bool highlighted = i == 2 || i == 8 || i == 12;
         const DSColor c = warning ? pal->amber : (highlighted ? pal->mint : pal->muted);
-        text(state, notes[i], x, top + 74.0f + (float)i * 28.0f,
-             fit_text_scale(notes[i], highlighted ? 1.35f : 1.15f, available),
+        text(state, notes[i], x, top + 224.0f + (float)i * 25.0f,
+             fit_text_scale(notes[i], highlighted ? 1.25f : 1.1f, available),
              c.r, c.g, c.b, 1.0f);
     }
 }
@@ -1992,15 +2167,14 @@ typedef struct {
 static DSCameraControlsLayout camera_controls_layout(const DeadSpeak *state) {
     const float w = (float)state->width;
     const float sensor_top = state->height < 650 ? 76.0f : 142.0f;
-    const float rc_cx = state->camera_ui.record.x + state->camera_ui.record.w * 0.5f;
-    const float rc_cy = state->camera_ui.record.y + state->camera_ui.record.h * 0.5f;
+    const float fp_w = fmaxf(52.0f, state->camera_ui.aspect_btn.x - 22.0f);
     return (DSCameraControlsLayout){
         .spk = {w - 76.0f, 12.0f, 68.0f, 34.0f},
         .geiger = {w - 162.0f, 12.0f, 82.0f, 34.0f},
         .style = {w - 256.0f, 12.0f, 90.0f, 34.0f},
         .tint = {w - 336.0f, 12.0f, 76.0f, 34.0f},
-        .plus_tag = {rc_cx + 36.0f, rc_cy - 16.0f, 56.0f, 32.0f},
-        .filter_pill = {16.0f, state->camera_ui.record.y, 124.0f, 50.0f},
+        .plus_tag = state->camera_ui.hud_btn,
+        .filter_pill = {16.0f, state->camera_ui.aspect_btn.y, fp_w, state->camera_ui.aspect_btn.h},
         .cal = {20.0f, sensor_top + 84.0f, 112.0f, 40.0f},
         .sens = {138.0f, sensor_top + 84.0f, 96.0f, 40.0f},
         .sensor_top = sensor_top,
@@ -2420,6 +2594,17 @@ static void draw_camera(DeadSpeak *state) {
     text_styled(state, primary_word, ui.word.x + 10, ui.word.y + 6, card_word_scale, DS_FONT_BOLD, word_r, word_g, word_b, 1);
     text_styled(state, sub_text, ui.word.x + 10, ui.word.y + 24, ds_fit_text_scale_styled(sub_text, ds_sp_to_scale(DS_FONT_SIZE_BADGE), ui.word.w - 20, DS_FONT_STANDARD), DS_FONT_STANDARD, 0.65f, 0.85f, 0.78f, 0.9f);
 
+    /* Framing reticle showing active MP4 export aspect crop */
+    if (preview_live) {
+        const DSRect frame = ds_camera_framing_rect((float)state->width, ui.navigation.y, state->video_aspect);
+        if (frame.w > 0.0f && frame.h > 0.0f) {
+            line(state, frame.x, frame.y, frame.x + frame.w, frame.y, accent.r, accent.g, accent.b, 0.35f);
+            line(state, frame.x, frame.y + frame.h, frame.x + frame.w, frame.y + frame.h, accent.r, accent.g, accent.b, 0.35f);
+            line(state, frame.x, frame.y, frame.x, frame.y + frame.h, accent.r, accent.g, accent.b, 0.35f);
+            line(state, frame.x + frame.w, frame.y, frame.x + frame.w, frame.y + frame.h, accent.r, accent.g, accent.b, 0.35f);
+        }
+    }
+
     /* 4. RECORD SHUTTER BUTTON */
     const float cx = ui.record.x + ui.record.w / 2, cy = ui.record.y + ui.record.h / 2;
     filled_circle(state, cx, cy, 30, 0.05f, 0.05f, 0.05f, 0.85f);
@@ -2427,13 +2612,22 @@ static void draw_camera(DeadSpeak *state) {
     if (recording) rect(state, cx - 11, cy - 11, 22, 22, 1, 0.05f, 0.08f, 1);
     else filled_circle(state, cx, cy, 18, 1, 0.05f, 0.08f, 1);
 
-    /* Manual Bookmark Tag Button (+TAG) during recording */
+    /* Right pill: +TAG during recording, HUD/CLEAN burn-in toggle when idle */
     if (recording) {
         custom_button(state, ctrl.plus_tag, "+TAG", false);
+    } else {
+        custom_button(state, ui.hud_btn, state->hud_burn_in ? "HUD" : "CLEAN", state->hud_burn_in);
     }
 
+    /* Left pills: Aspect framing preset (16:9 / 9:16 / 4:5) & active Filter label */
+    static const char *const aspect_labels[] = {"16:9", "9:16", "4:5"};
+    custom_button(state, ui.aspect_btn, aspect_labels[(unsigned)state->video_aspect % DS_ASPECT_COUNT], state->video_aspect != DS_ASPECT_16_9);
+
     static const char *const filter_names[] = {"NIGHT", "THERMAL", "EDGE", "MONO", "SEPIA", "RAW"};
-    text(state, filter_names[state->video_filter], ctrl.filter_pill.x, ctrl.filter_pill.y + 24.0f, 1.2f, 0.9f, 0.95f, 0.92f, 1);
+    const char *fname = filter_names[(unsigned)state->video_filter % 6U];
+    if (ui.aspect_btn.x - 22.0f >= 44.0f) {
+        custom_button(state, ctrl.filter_pill, fname, false);
+    }
     if (atomic_load(&state->audio_failed) || ds_video_failed(&state->video))
         text_styled(state, "CAPTURE ERROR", 16, ui.record.y + 44, ds_sp_to_scale(DS_FONT_SIZE_BADGE), DS_FONT_BOLD, 1, 0.65f, 0.3f, 1);
     rect(state, ui.navigation.x, ui.navigation.y, ui.navigation.w, ui.navigation.h, 0, 0, 0, 0.82f);
@@ -2449,7 +2643,28 @@ static void draw_camera(DeadSpeak *state) {
     if (state->custom_open) draw_custom_words(state);
 }
 
+static void update_video_hud(DeadSpeak *state, uint64_t now) {
+    if (!ds_video_active(&state->video)) return;
+    static const char *const filter_names[] = {"NIGHT", "THERMAL", "EDGE", "MONO", "SEPIA", "RAW"};
+    const char *fname = filter_names[(unsigned)state->video_filter % 6U];
+    const float delta = state->baseline.ready ? (state->smoothed_field - state->baseline.field) : 0.0f;
+    const unsigned latest_slot = (state->log_next + DS_LOG_CAPACITY - 1U) % DS_LOG_CAPACITY;
+    const uint64_t latest_word_time = state->log_count > 0 ? state->word_times[latest_slot] : 0U;
+    const bool word_active = state->word[0] && (latest_word_time > 0 && (now - latest_word_time < 10000U));
+    DSVideoHudState hud_snap = {
+        .burn_in = state->hud_burn_in,
+        .emf_ut = state->magnetic_field,
+        .emf_delta = delta,
+        .signal = state->signal,
+        .anomaly = atomic_load(&state->sub_bass_anomaly),
+    };
+    snprintf(hud_snap.word, sizeof(hud_snap.word), "%s", word_active ? state->word : "");
+    snprintf(hud_snap.filter_name, sizeof(hud_snap.filter_name), "%s", fname);
+    ds_video_set_hud(&state->video, &hud_snap);
+}
+
 static void draw_frame(DeadSpeak *state) {
+    update_video_hud(state, now_millis());
     DSColor mint = {0.73f, 0.96f, 0.86f};
     if (state->hud_hue > 0.001f) {
         mint = ds_interpolate_hud_accent(state->hud_hue);
@@ -2656,6 +2871,7 @@ static void handle_cmd(struct android_app *app, int32_t cmd) {
         stop_sensors(state, DS_SENSOR_PAUSED);
         state->capture_requested = false;
         if (state->voice_player) ds_voice_player_stop(state->voice_player);
+        if (state->media_player) ds_media_player_set_paused(state->media_player, true);
         stop_audio_capture(state);
         ds_video_preview_stop(&state->video);
         state->preview_received_ms = 0;
@@ -2773,7 +2989,7 @@ static void toggle_capture(DeadSpeak *state) {
         state->camera_enabled = true;
         state->capture_started_ms = now_millis();
         start_audio_capture(state);
-        ds_video_start(&state->video, state->evidence_dir, state->video_filter, state->display_rotation);
+        ds_video_start(&state->video, state->evidence_dir, state->video_filter, state->video_aspect, state->display_rotation);
     } else {
         state->capture_requested = true;
         state->permission_deadline = now_millis() + 15000U;
@@ -2859,10 +3075,12 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
         if (state->tab == 0) {
             if (gesture == DS_GESTURE_SWIPE_LEFT) {
                 state->video_filter = (DSVideoFilter)ds_cycle_filter_index((unsigned)state->video_filter, 1, 6);
+                ds_video_set_filter(&state->video, state->video_filter);
                 state->filter_hud_deadline = now_millis() + 1300U;
                 return 1;
             } else if (gesture == DS_GESTURE_SWIPE_RIGHT) {
                 state->video_filter = (DSVideoFilter)ds_cycle_filter_index((unsigned)state->video_filter, -1, 6);
+                ds_video_set_filter(&state->video, state->video_filter);
                 state->filter_hud_deadline = now_millis() + 1300U;
                 return 1;
             } else if (gesture == DS_GESTURE_SWIPE_UP) {
@@ -2941,6 +3159,7 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
                 } else if (i == 1) { state->scanning = !state->scanning; state->word[0] = 0; }
                 else if (i == 2) {
                     state->video_filter = (DSVideoFilter)ds_cycle_filter_index((unsigned)state->video_filter, 1, 6);
+                    ds_video_set_filter(&state->video, state->video_filter);
                     state->filter_hud_deadline = now_millis() + 1300U;
                 } else if (i == 3) { state->custom_open = true; state->custom_editing = false; state->custom_message[0] = 0; }
                 else if (i == 4) state->sensor_details = !state->sensor_details;
@@ -2960,16 +3179,25 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
                 return 1;
             }
         }
-        if (ds_rect_contains(ctrl.filter_pill, x, y)) {
-            state->video_filter = (DSVideoFilter)ds_cycle_filter_index((unsigned)state->video_filter, 1, 6);
-            state->filter_hud_deadline = now_millis() + 1300U;
+        const bool recording = ds_video_active(&state->video) || atomic_load(&state->audio_active);
+        if (!recording && ds_rect_contains(state->camera_ui.aspect_btn, x, y)) {
+            state->video_aspect = (DSVideoAspect)(((unsigned)state->video_aspect + 1U) % DS_ASPECT_COUNT);
             return 1;
         }
-        const bool recording = ds_video_active(&state->video) || atomic_load(&state->audio_active);
-        if (recording && ds_rect_contains(ctrl.plus_tag, x, y)) {
-            emit_companion_tag(state, DS_TAG_BOOKMARK);
-            snprintf(state->export_status_message, sizeof(state->export_status_message), "BOOKMARK TAG #3 MARKED");
-            state->export_status_expiry_ms = now_millis() + 2500U;
+        if (ds_rect_contains(state->camera_ui.hud_btn, x, y)) {
+            if (recording) {
+                emit_companion_tag(state, DS_TAG_BOOKMARK);
+                snprintf(state->export_status_message, sizeof(state->export_status_message), "BOOKMARK TAG #3 MARKED");
+                state->export_status_expiry_ms = now_millis() + 2500U;
+            } else {
+                state->hud_burn_in = !state->hud_burn_in;
+            }
+            return 1;
+        }
+        if (state->camera_ui.aspect_btn.x - 22.0f >= 44.0f && ds_rect_contains(ctrl.filter_pill, x, y)) {
+            state->video_filter = (DSVideoFilter)ds_cycle_filter_index((unsigned)state->video_filter, 1, 6);
+            ds_video_set_filter(&state->video, state->video_filter);
+            state->filter_hud_deadline = now_millis() + 1300U;
             return 1;
         }
         if (ds_rect_contains(state->camera_ui.record, x, y)) {
@@ -2997,15 +3225,19 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
 
         char curr_playing[96] = {0};
         float cur_prog = 0.0f;
-        const bool is_playing_any = ds_voice_player_is_playing_wav(state->voice_player, curr_playing, sizeof(curr_playing), &cur_prog);
+        uint64_t cur_pos_ms = 0, dur_ms = 0;
+        bool active_is_mp4 = false;
+        const bool is_playing_any = active_media_status(state, curr_playing, sizeof(curr_playing),
+                                                        &cur_prog, &cur_pos_ms, &dur_ms, &active_is_mp4);
 
         float cur_item_y = layout.media_y + 36.0f;
         for (unsigned i = 0; i < state->media_count; ++i) {
             const char *filename = state->media_files[i];
             const size_t len = strlen(filename);
             const bool is_wav = len > 4 && strcmp(filename + len - 4, ".wav") == 0;
+            const bool is_mp4 = len > 4 && strcmp(filename + len - 4, ".mp4") == 0;
             const bool is_this_playing = is_playing_any && strcmp(curr_playing, filename) == 0;
-            const DSMediaItemLayout item = media_item_layout(layout, cur_item_y);
+            const DSMediaItemLayout item = media_item_layout(layout, cur_item_y, is_this_playing && active_is_mp4);
 
             if (is_this_playing) {
                 if (ds_rect_contains(item.prev_tag, x, y)) {
@@ -3016,8 +3248,12 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
                     jump_to_tag(state, true);
                     return 1;
                 }
+                if (active_is_mp4 && ds_rect_contains(item.pause_btn, x, y)) {
+                    ds_media_player_set_paused(state->media_player, !ds_media_player_is_paused(state->media_player));
+                    return 1;
+                }
                 if (ds_rect_contains(item.stop, x, y)) {
-                    ds_voice_player_stop_wav(state->voice_player);
+                    active_media_stop(state, !active_is_mp4, active_is_mp4);
                     return 1;
                 }
                 if (ds_rect_contains(item.del_active, x, y)) {
@@ -3025,30 +3261,58 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
                     return 1;
                 }
                 if (ds_rect_contains(item.scrubber, x, y)) {
-                    const uint64_t dur_ms = ds_voice_player_get_wav_duration_ms(state->voice_player);
                     if (dur_ms > 0 && item.scrubber.w > 0) {
                         const float pct = fmaxf(0.0f, fminf(1.0f, (x - item.scrubber.x) / item.scrubber.w));
                         const uint64_t target_ms = (uint64_t)(pct * (float)dur_ms);
-                        ds_voice_player_seek_wav_ms(state->voice_player, target_ms);
+                        active_media_seek_ms(state, target_ms);
                     }
                     return 1;
                 }
-                cur_item_y += 82.0f;
+                cur_item_y += active_is_mp4 ? 264.0f : 82.0f;
             } else {
                 if (ds_rect_contains(item.del_idle, x, y)) {
                     delete_recording_and_companions(state, filename);
                     return 1;
                 }
                 if (ds_rect_contains(item.item_row, x, y)) {
+                    char full_path[640];
+                    snprintf(full_path, sizeof(full_path), "%s/%s", state->evidence_dir, filename);
+                    if (access(full_path, F_OK) != 0 && state->app && state->app->activity &&
+                        state->app->activity->externalDataPath) {
+                        snprintf(full_path, sizeof(full_path), "%s/Movies/%s", state->app->activity->externalDataPath, filename);
+                    }
                     if (is_wav) {
-                        char full_path[640];
-                        snprintf(full_path, sizeof(full_path), "%s/%s", state->evidence_dir, filename);
+                        active_media_stop(state, false, true);
                         ds_voice_player_play_wav(state->voice_player, full_path);
+                        load_recording_tags(state, filename);
+                        return 1;
+                    }
+                    if (is_mp4) {
+                        active_media_stop(state, true, false);
+                        state->mp4_width = state->mp4_height = 0;
+                        ds_media_player_open(state->media_player, full_path);
                         load_recording_tags(state, filename);
                         return 1;
                     }
                 }
                 cur_item_y += 36.0f;
+            }
+        }
+    }
+
+    if (state->tab == DS_TAB_GUIDE) {
+        const DSGuideLayout gl = guide_layout(state);
+        static const char *const vnames[4] = {"CLASSIC", "WHISPER", "DYNAMIC", "SPIRIT BOX"};
+        for (unsigned i = 0; i < 4; ++i) {
+            if (ds_rect_contains(gl.voice_btns[i], x, y)) {
+                state->voice_config.mode = (DSVoiceMode)i;
+                if (state->voice_player) {
+                    ds_voice_player_speak(state->voice_player, "DEADSPEAK SHADOW", &state->voice_config);
+                }
+                state->guide_voice_last_ms = now_millis();
+                snprintf(state->guide_voice_label, sizeof(state->guide_voice_label),
+                         "VOICE TEST: %s (ACTIVE)", vnames[i]);
+                return 1;
             }
         }
     }
@@ -3315,7 +3579,11 @@ void android_main(struct android_app *app) {
     state->scanning = true;
     state->camera_enabled = true;
     state->preview_rgba = malloc(DS_PREVIEW_CAPACITY);
+    state->mp4_rgba = malloc(DS_PREVIEW_CAPACITY);
     state->video_filter = DS_VIDEO_FILTER_RAW;
+    state->video_aspect = DS_ASPECT_16_9;
+    state->hud_burn_in = true;
+    state->sub_bass_baseline = 15.0f;
     state->word[0] = 0;
     state->voice_config = (DSVoiceConfig){
         .enabled = true,
@@ -3324,6 +3592,7 @@ void android_main(struct android_app *app) {
         .speed = 1.0f
     };
     state->voice_player = ds_voice_player_create();
+    state->media_player = ds_media_player_create();
     ds_motion_filter_init(&state->motion_filter);
     ds_explore_init(&state->explore);
     load_dictionary(state);
@@ -3360,7 +3629,7 @@ void android_main(struct android_app *app) {
                 state->camera_enabled = true;
                 state->capture_started_ms = now_millis();
                 start_audio_capture(state);
-                ds_video_start(&state->video, state->evidence_dir, state->video_filter, state->display_rotation);
+                ds_video_start(&state->video, state->evidence_dir, state->video_filter, state->video_aspect, state->display_rotation);
             } else if (loop_time >= state->permission_deadline) {
                 state->capture_requested = false;
                 state->permission_requested = false;
@@ -3382,6 +3651,10 @@ void android_main(struct android_app *app) {
                     ds_voice_player_destroy(state->voice_player);
                     state->voice_player = NULL;
                 }
+                if (state->media_player) {
+                    ds_media_player_destroy(state->media_player);
+                    state->media_player = NULL;
+                }
                 stop_audio_capture(state);
                 ds_video_preview_stop(&state->video);
                 stop_sensors(state, DS_SENSOR_PAUSED);
@@ -3389,6 +3662,7 @@ void android_main(struct android_app *app) {
                     ASensorManager_destroyEventQueue(state->sensor_manager, state->sensor_queue);
                 free(state->dictionary);
                 free(state->preview_rgba);
+                free(state->mp4_rgba);
                 ds_explore_destroy(&state->explore);
                 teardown_display(state);
                 app->userData = NULL;

@@ -36,7 +36,14 @@ struct DSVoicePlayer {
     size_t wav_current_sample;
     uint32_t wav_sample_rate;
     _Atomic bool stop_requested;
+    _Atomic uint64_t speech_active_until_ms;
 };
+
+static uint64_t vp_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000L);
+}
 
 static inline float geiger_impulse(uint32_t sample_in_click) {
     if (sample_in_click >= 16) return 0.0f;
@@ -76,6 +83,7 @@ static void *voice_player_thread(void *arg) {
             speech_total = speech_pos = 0;
             click_phase = 100;
             p->geiger_sample_counter = 0;
+            atomic_store(&p->speech_active_until_ms, 0ULL);
         }
 
         pthread_mutex_lock(&p->mutex);
@@ -89,6 +97,10 @@ static void *voice_player_thread(void *arg) {
             if (text[0] && config.enabled) {
                 speech_total = ds_voice_synthesize(text, &config, speech_pcm, DS_VOICE_MAX_SAMPLES);
                 speech_pos = 0;
+                if (speech_total > 0) {
+                    const uint64_t speech_ms = (uint64_t)speech_total * 1000ULL / DS_VOICE_SAMPLE_RATE;
+                    atomic_store(&p->speech_active_until_ms, vp_now_ms() + speech_ms + 350ULL);
+                }
             }
         } else {
             pthread_mutex_unlock(&p->mutex);
@@ -226,8 +238,16 @@ void ds_voice_player_speak(DSVoicePlayer *p, const char *text, const DSVoiceConf
     snprintf(p->pending_text, sizeof(p->pending_text), "%s", text);
     p->pending_config = config ? *config : (DSVoiceConfig){.enabled = true, .mode = DS_VOICE_MODE_CLASSIC, .pitch_hz = 115.0f, .speed = 1.0f};
     p->has_work = true;
+    if (p->pending_config.enabled) {
+        atomic_store(&p->speech_active_until_ms, vp_now_ms() + 1200ULL);
+    }
     pthread_cond_signal(&p->cond);
     pthread_mutex_unlock(&p->mutex);
+}
+
+bool ds_voice_player_is_speaking(const DSVoicePlayer *p) {
+    if (!p) return false;
+    return vp_now_ms() < atomic_load(&p->speech_active_until_ms);
 }
 
 void ds_voice_player_set_geiger_rate(DSVoicePlayer *p, float clicks_per_sec) {
@@ -379,6 +399,7 @@ void ds_voice_player_stop(DSVoicePlayer *p) {
     if (!p) return;
     atomic_store(&p->stop_requested, true);
     atomic_store(&p->geiger_rate_milli, 0);
+    atomic_store(&p->speech_active_until_ms, 0ULL);
     pthread_mutex_lock(&p->mutex);
     p->has_work = false;
     p->pending_text[0] = '\0';
