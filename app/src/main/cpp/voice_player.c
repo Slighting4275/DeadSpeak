@@ -30,7 +30,7 @@ struct DSVoicePlayer {
 
     /* Hardware cue chime */
     DSCueType pending_cue;
-    int16_t cue_pcm[4096];
+    int16_t cue_pcm[16384];
     size_t cue_total;
     size_t cue_pos;
 

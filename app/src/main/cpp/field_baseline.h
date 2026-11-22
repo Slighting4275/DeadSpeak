@@ -189,4 +189,48 @@ static inline bool ds_baseline_word_trigger_3d(DSFieldBaseline *b, float x, floa
     return false;
 }
 
+#define DS_SPARKLINE_CAPACITY 48U
+
+typedef struct {
+    float samples[DS_SPARKLINE_CAPACITY];
+    float baseline;
+    size_t count;
+    size_t next;
+} DSEmfSparkline;
+
+static inline void ds_sparkline_init(DSEmfSparkline *sp) {
+    if (!sp) return;
+    *sp = (DSEmfSparkline){0};
+}
+
+static inline void ds_sparkline_push(DSEmfSparkline *sp, float field_ut, float baseline_ut) {
+    if (!sp || !isfinite(field_ut)) return;
+    sp->samples[sp->next] = field_ut;
+    sp->next = (sp->next + 1U) % DS_SPARKLINE_CAPACITY;
+    if (sp->count < DS_SPARKLINE_CAPACITY) ++sp->count;
+    if (isfinite(baseline_ut) && baseline_ut > 0.0f) sp->baseline = baseline_ut;
+}
+
+static inline void ds_sparkline_min_max(const DSEmfSparkline *sp, float *out_min, float *out_max) {
+    if (!sp || !out_min || !out_max || sp->count == 0U) {
+        if (out_min) *out_min = 0.0f;
+        if (out_max) *out_max = 1.0f;
+        return;
+    }
+    float mn = sp->baseline > 0.0f ? sp->baseline : sp->samples[0];
+    float mx = mn;
+    for (size_t i = 0U; i < sp->count; ++i) {
+        const float v = sp->samples[i];
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+    }
+    if (mx - mn < 4.0f) {
+        const float mid = 0.5f * (mn + mx);
+        mn = mid - 2.0f;
+        mx = mid + 2.0f;
+    }
+    *out_min = mn;
+    *out_max = mx;
+}
+
 #endif

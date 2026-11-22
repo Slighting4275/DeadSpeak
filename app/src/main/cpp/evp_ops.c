@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "evp_ops.h"
+#include "typography.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
@@ -40,6 +41,9 @@ size_t ds_synthesize_cue(DSCueType cue, uint32_t sample_rate, int16_t *out, size
             seg1_end = total;
             f0 = 980.0f; f1 = 980.0f;
             break;
+        case DS_CUE_PROX_FADE:
+            total = (size_t)((sample_rate * 55U) / 100U); /* 550ms rising/fading spatial swell */
+            break;
         default:
             return 0;
     }
@@ -48,6 +52,19 @@ size_t ds_synthesize_cue(DSCueType cue, uint32_t sample_rate, int16_t *out, size
     if (total == 0) return 0;
 
     const float sr = (float)sample_rate;
+    if (cue == DS_CUE_PROX_FADE) {
+        double phase = 0.0;
+        for (size_t i = 0; i < total; ++i) {
+            const float norm = (float)i / (float)total;
+            const float env = sinf(DS_PI_F * norm);
+            const float freq = 280.0f + 260.0f * sinf(DS_PI_F * norm);
+            phase += 2.0 * (double)DS_PI_F * (double)freq / (double)sr;
+            const float shimmer = 0.65f * sinf((float)phase) + 0.35f * sinf((float)(phase * 1.5));
+            const float sample = 11500.0f * env * env * shimmer;
+            out[i] = (int16_t)fmaxf(-32000.0f, fminf(32000.0f, sample));
+        }
+        return total;
+    }
     const size_t attack = sample_rate / 250U;
     const size_t release = sample_rate / 120U;
     for (size_t i = 0; i < total; ++i) {
@@ -559,7 +576,56 @@ DSSnapEditParams ds_snap_edit_defaults(void) {
         .brightness = 0.0f,
         .contrast = 1.0f,
         .filter = DS_VIDEO_FILTER_RAW,
+        .crop = DS_CROP_FULL,
+        .stamp_telemetry = false,
+        .stamp_text = {0},
     };
+}
+
+void ds_downsample_spectrum_16(const uint32_t *bins, size_t bin_count, float out16[16]) {
+    if (!out16) return;
+    for (size_t i = 0U; i < 16U; ++i) out16[i] = 0.0f;
+    if (!bins || bin_count == 0U) return;
+    for (size_t i = 0U; i < 16U; ++i) {
+        const size_t start = (i * bin_count) / 16U;
+        size_t end = ((i + 1U) * bin_count) / 16U;
+        if (end <= start) end = start + 1U;
+        if (end > bin_count) end = bin_count;
+        float peak = 0.0f;
+        for (size_t b = start; b < end; ++b) {
+            const float v = fmaxf(0.0f, fminf(1.0f, (float)bins[b] / 1000.0f));
+            if (v > peak) peak = v;
+        }
+        out16[i] = peak;
+    }
+}
+
+void ds_snap_crop_dimensions(int src_w, int src_h, DSSnapCropPreset crop, int *out_w, int *out_h) {
+    if (!out_w || !out_h) return;
+    if (src_w <= 0 || src_h <= 0) {
+        *out_w = 0;
+        *out_h = 0;
+        return;
+    }
+    if (crop == DS_CROP_FULL || (unsigned)crop >= DS_CROP_COUNT) {
+        *out_w = src_w;
+        *out_h = src_h;
+        return;
+    }
+    const float target = (crop == DS_CROP_SQUARE_1_1) ? 1.0f :
+                         (crop == DS_CROP_PORTRAIT_4_5) ? 0.8f : (16.0f / 9.0f);
+    const float src_aspect = (float)src_w / (float)src_h;
+    if (src_aspect > target) {
+        *out_h = src_h;
+        *out_w = (int)lroundf((float)src_h * target);
+    } else {
+        *out_w = src_w;
+        *out_h = (int)lroundf((float)src_w / target);
+    }
+    if (*out_w < 1) *out_w = 1;
+    if (*out_h < 1) *out_h = 1;
+    if (*out_w > src_w) *out_w = src_w;
+    if (*out_h > src_h) *out_h = src_h;
 }
 
 void ds_snap_edit_clamp(DSSnapEditParams *p) {
@@ -587,6 +653,30 @@ void ds_snap_edit_clamp(DSSnapEditParams *p) {
     if ((int)p->filter < DS_VIDEO_FILTER_NIGHT || (int)p->filter > DS_VIDEO_FILTER_RAW) {
         p->filter = DS_VIDEO_FILTER_RAW;
     }
+    if ((int)p->crop < DS_CROP_FULL || (int)p->crop >= DS_CROP_COUNT) {
+        p->crop = DS_CROP_FULL;
+    }
+    p->stamp_text[sizeof(p->stamp_text) - 1U] = '\0';
+}
+
+bool ds_snap_compute_crop_uv(int img_w, int img_h, const DSSnapEditParams *p,
+                             float uv[12], int *out_w, int *out_h) {
+    if (!uv || img_w <= 0 || img_h <= 0) return false;
+    DSSnapEditParams ed = p ? *p : ds_snap_edit_defaults();
+    ds_snap_edit_clamp(&ed);
+    int cw = img_w, ch = img_h;
+    ds_snap_crop_dimensions(img_w, img_h, ed.crop, &cw, &ch);
+    if (out_w) *out_w = cw;
+    if (out_h) *out_h = ch;
+    const float span_u = ((float)cw / (float)img_w) / ed.zoom;
+    const float span_v = ((float)ch / (float)img_h) / ed.zoom;
+    const float u0 = fmaxf(0.0f, fminf(1.0f - span_u, 0.5f + ed.pan_x - span_u * 0.5f));
+    const float v0 = fmaxf(0.0f, fminf(1.0f - span_v, 0.5f + ed.pan_y - span_v * 0.5f));
+    const float u1 = u0 + span_u;
+    const float v1 = v0 + span_v;
+    const float coords[12] = {u0, v0, u1, v0, u0, v1, u0, v1, u1, v0, u1, v1};
+    memcpy(uv, coords, sizeof(coords));
+    return true;
 }
 
 bool ds_snap_compute_uv(const DSSnapEditParams *p, float uv[12]) {
@@ -649,6 +739,46 @@ bool ds_apply_snap_edit_rgba(const uint8_t *src_rgba, uint8_t *dst_rgba, int w, 
     return true;
 }
 
+static void stamp_rgba_text(uint8_t *rgba, int w, int h, const char *text) {
+    if (!rgba || w < 16 || h < 12 || !text || !text[0]) return;
+    const int scale = (w >= 320 && h >= 200) ? 2 : 1;
+    const int bar_h = 9 * scale + 4;
+    if (bar_h > h) return;
+    const int y0 = h - bar_h;
+    for (int y = y0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            uint8_t *p = rgba + ((size_t)y * (size_t)w + (size_t)x) * 4U;
+            p[0] = (uint8_t)(p[0] / 3U);
+            p[1] = (uint8_t)(p[1] / 3U);
+            p[2] = (uint8_t)(p[2] / 3U);
+        }
+    }
+    int px = 4 * scale;
+    const int py = y0 + 2 * scale;
+    for (size_t i = 0U; text[i] && px + (int)DS_FONT_GLYPH_COLS * scale < w - 2; ++i) {
+        const int gi = ds_glyph_index(text[i]);
+        if (gi >= 0) {
+            for (size_t r = 0U; r < DS_FONT_GLYPH_ROWS; ++r) {
+                const uint8_t bits = ds_font_bitmap[gi][r];
+                for (size_t c = 0U; c < DS_FONT_GLYPH_COLS; ++c) {
+                    if (!((bits >> (4U - c)) & 1U)) continue;
+                    for (int sy = 0; sy < scale; ++sy) {
+                        for (int sx = 0; sx < scale; ++sx) {
+                            const int dx = px + (int)c * scale + sx;
+                            const int dy = py + (int)r * scale + sy;
+                            if (dx >= 0 && dx < w && dy >= 0 && dy < h) {
+                                uint8_t *p = rgba + ((size_t)dy * (size_t)w + (size_t)dx) * 4U;
+                                p[0] = 210U; p[1] = 250U; p[2] = 225U; p[3] = 255U;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        px += 6 * scale;
+    }
+}
+
 bool ds_edit_and_save_bmp(const char *src_path, const char *dst_path, const DSSnapEditParams *p) {
     if (!src_path || !dst_path || !dst_path[0]) return false;
     const size_t cap = 1280U * 720U * 4U;
@@ -660,24 +790,27 @@ bool ds_edit_and_save_bmp(const char *src_path, const char *dst_path, const DSSn
         return false;
     }
     int w = 0, h = 0;
+    int ow = 0, oh = 0;
     bool ok = ds_load_bmp_rgba(src_path, src, cap, &w, &h);
     if (ok) ok = ds_apply_snap_edit_rgba(src, dst, w, h, p);
     DSSnapEditParams ed = p ? *p : ds_snap_edit_defaults();
     ds_snap_edit_clamp(&ed);
-    if (ok && ed.zoom > 1.01f && w > 1 && h > 1) {
-        /* Bilinear pan+zoom crop matching GPU GL_LINEAR preview */
-        const float span = 1.0f / ed.zoom;
-        const float u0 = 0.5f + ed.pan_x - span * 0.5f;
-        const float v0 = 0.5f + ed.pan_y - span * 0.5f;
+    ow = w; oh = h;
+    float crop_uv[12];
+    if (ok && (ed.zoom > 1.01f || ed.crop != DS_CROP_FULL) && w > 1 && h > 1 &&
+        ds_snap_compute_crop_uv(w, h, &ed, crop_uv, &ow, &oh)) {
+        const float u0 = crop_uv[0], v0 = crop_uv[1];
+        const float span_u = crop_uv[2] - crop_uv[0];
+        const float span_v = crop_uv[5] - crop_uv[1];
         uint8_t *cropped = src;
-        for (int y = 0; y < h; ++y) {
-            const float sv = v0 + ((float)y + 0.5f) / (float)h * span;
+        for (int y = 0; y < oh; ++y) {
+            const float sv = v0 + ((float)y + 0.5f) / (float)oh * span_v;
             const float fy = fmaxf(0.0f, fminf((float)(h - 1), sv * (float)(h - 1)));
             const int y0 = (int)fy;
             const int y1 = (y0 + 1 < h) ? (y0 + 1) : y0;
             const float ty = fy - (float)y0;
-            for (int x = 0; x < w; ++x) {
-                const float su = u0 + ((float)x + 0.5f) / (float)w * span;
+            for (int x = 0; x < ow; ++x) {
+                const float su = u0 + ((float)x + 0.5f) / (float)ow * span_u;
                 const float fx = fmaxf(0.0f, fminf((float)(w - 1), su * (float)(w - 1)));
                 const int x0 = (int)fx;
                 const int x1 = (x0 + 1 < w) ? (x0 + 1) : x0;
@@ -686,7 +819,7 @@ bool ds_edit_and_save_bmp(const char *src_path, const char *dst_path, const DSSn
                 const uint8_t *p10 = dst + ((size_t)y0 * (size_t)w + (size_t)x1) * 4U;
                 const uint8_t *p01 = dst + ((size_t)y1 * (size_t)w + (size_t)x0) * 4U;
                 const uint8_t *p11 = dst + ((size_t)y1 * (size_t)w + (size_t)x1) * 4U;
-                uint8_t *out_p = cropped + ((size_t)y * (size_t)w + (size_t)x) * 4U;
+                uint8_t *out_p = cropped + ((size_t)y * (size_t)ow + (size_t)x) * 4U;
                 for (int c = 0; c < 3; ++c) {
                     const float top = (float)p00[c] * (1.0f - tx) + (float)p10[c] * tx;
                     const float bot = (float)p01[c] * (1.0f - tx) + (float)p11[c] * tx;
@@ -695,9 +828,12 @@ bool ds_edit_and_save_bmp(const char *src_path, const char *dst_path, const DSSn
                 out_p[3] = 255U;
             }
         }
-        memcpy(dst, cropped, (size_t)w * (size_t)h * 4U);
+        memcpy(dst, cropped, (size_t)ow * (size_t)oh * 4U);
     }
-    if (ok) ok = ds_write_filtered_bmp(dst_path, dst, w, h, 0, false, 1.0f, DS_VIDEO_FILTER_RAW);
+    if (ok && ed.stamp_telemetry && ed.stamp_text[0]) {
+        stamp_rgba_text(dst, ow, oh, ed.stamp_text);
+    }
+    if (ok) ok = ds_write_filtered_bmp(dst_path, dst, ow, oh, 0, false, 1.0f, DS_VIDEO_FILTER_RAW);
     free(src);
     free(dst);
     return ok;

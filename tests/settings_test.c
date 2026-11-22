@@ -28,6 +28,7 @@ int main(void) {
     assert(s.emf_alerts == true);
     assert(s.hud_layout == DS_HUD_LAYOUT_FULL);
     assert(s.audio_visual_mode == DS_AUDIO_VIS_WAVE);
+    assert(s.tutorial_seen == false);
 
     /* 2. Clamp invalid / out-of-range fields safely */
     DSSettings dirty = {
@@ -96,7 +97,8 @@ int main(void) {
     custom.mute_on_vox = false;
     custom.audio_shader = false;
     custom.hud_layout = DS_HUD_LAYOUT_COMPACT;
-    custom.audio_visual_mode = DS_AUDIO_VIS_EQ;
+    custom.audio_visual_mode = DS_AUDIO_VIS_RIBBON;
+    custom.tutorial_seen = true;
 
     assert(ds_settings_save(path, &custom));
 
@@ -122,7 +124,8 @@ int main(void) {
     assert(loaded.mute_on_vox == false);
     assert(loaded.audio_shader == true);
     assert(loaded.hud_layout == DS_HUD_LAYOUT_COMPACT);
-    assert(loaded.audio_visual_mode == DS_AUDIO_VIS_EQ);
+    assert(loaded.audio_visual_mode == DS_AUDIO_VIS_RIBBON);
+    assert(loaded.tutorial_seen == true);
 
     /* Legacy audio_shader=0 without audio_visual_mode key maps to DS_AUDIO_VIS_OFF */
     const char *legacy_path = "build/host/settings_legacy_audio.tmp";

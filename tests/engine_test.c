@@ -142,6 +142,20 @@ int main(void) {
         samples[i] = (int16_t)(16000 * sin(6.283185307179586 * 160.0 * i / 48000.0));
     assert(ds_engine_speech_ratio(samples, 1024, 48000) < 0.5f);
 
+    /* 10. EMF scrolling sparkline ring buffer & bounds */
+    DSEmfSparkline sp;
+    ds_sparkline_init(&sp);
+    assert(sp.count == 0U && DS_SPARKLINE_CAPACITY == 48U);
+    ds_sparkline_push(&sp, 50.0f, 50.0f);
+    ds_sparkline_push(&sp, 62.0f, 50.0f);
+    ds_sparkline_push(&sp, NAN, 50.0f);
+    assert(sp.count == 2U);
+    float mn = 0.0f, mx = 0.0f;
+    ds_sparkline_min_max(&sp, &mn, &mx);
+    assert(mn <= 50.0f && mx >= 62.0f);
+    for (unsigned k = 0; k < 60; ++k) ds_sparkline_push(&sp, 50.0f + (float)k * 0.25f, 50.0f);
+    assert(sp.count == DS_SPARKLINE_CAPACITY);
+
     puts("PASS: measured calibration, deviation-only word triggers, debounce, real spectrum bins and invalid-field guards");
     return 0;
 }

@@ -143,7 +143,7 @@ typedef struct {
     GLuint camera_program, camera_texture;
     GLint camera_filter_loc, camera_image_loc, camera_anomaly_loc, camera_time_loc;
     GLuint wave_program;
-    GLint wave_time_loc, wave_amp_loc, wave_bands_loc, wave_peaks_loc, wave_color_loc, wave_theme_loc, wave_mode_loc;
+    GLint wave_time_loc, wave_amp_loc, wave_bands_loc, wave_bands16_loc, wave_peaks_loc, wave_color_loc, wave_theme_loc, wave_mode_loc;
     GLuint text_program, text_texture;
     GLint text_pos_loc, text_uv_loc, text_color_loc, text_sampler_loc;
     bool text_engine_ready;
@@ -167,6 +167,7 @@ typedef struct {
     float emf_peak_signal;
     uint64_t emf_peak_decay_ms;
     DSFieldBaseline baseline;
+    DSEmfSparkline emf_sparkline;
     DSMotionFilter motion_filter;
     uint32_t sample_count;
     char word[32];
@@ -204,6 +205,7 @@ typedef struct {
     uint64_t timer_last_tick_sec;
     bool emf_alerts_enabled;
     uint64_t last_emf_alert_ms;
+    uint64_t last_prox_cue_ms;
     _Atomic bool hpf_enabled;
     _Atomic bool mute_on_vox;
     DSAudioVisualMode audio_visual_mode;
@@ -278,6 +280,8 @@ typedef struct {
     size_t custom_blob_size, custom_page;
     char custom_path[512], custom_input[32], custom_message[64];
     bool custom_open, custom_selected, custom_editing;
+    bool tutorial_open, tutorial_seen;
+    unsigned tutorial_step;
     unsigned log_count;
     unsigned log_next;
     DSTab tab;
@@ -307,6 +311,7 @@ static void save_settings(const DeadSpeak *state) {
         .audio_shader = state->audio_visual_mode != DS_AUDIO_VIS_OFF,
         .hud_layout = state->hud_layout,
         .audio_visual_mode = state->audio_visual_mode,
+        .tutorial_seen = state->tutorial_seen,
     };
     (void)ds_settings_save(state->settings_path, &s);
 }
@@ -1433,6 +1438,7 @@ static bool setup_display(DeadSpeak *state) {
     state->wave_time_loc = glGetUniformLocation(state->wave_program, "u_time");
     state->wave_amp_loc = glGetUniformLocation(state->wave_program, "u_amp");
     state->wave_bands_loc = glGetUniformLocation(state->wave_program, "u_bands");
+    state->wave_bands16_loc = glGetUniformLocation(state->wave_program, "u_bands16");
     state->wave_peaks_loc = glGetUniformLocation(state->wave_program, "u_peaks");
     state->wave_color_loc = glGetUniformLocation(state->wave_program, "u_color");
     state->wave_theme_loc = glGetUniformLocation(state->wave_program, "u_theme");
@@ -1700,7 +1706,7 @@ static void filled_circle(DeadSpeak *state, float x, float y, float radius, floa
     }
 }
 
-#define DS_LOG_SNAP_CARD_H 278.0f
+#define DS_LOG_SNAP_CARD_H 308.0f
 #define DS_LOG_MP4_CARD_H  296.0f
 #define DS_LOG_WAV_CARD_H  116.0f
 
@@ -1721,7 +1727,7 @@ static float cycle_float_step(float cur, const float *steps, size_t count) {
 static float body_content_height(const DeadSpeak *state) {
     if (state->tab == 0) return state->ui.scan_height;
     if (state->tab == 2) return state->ui.explore_height;
-    if (state->tab == 3) return 824.0f;
+    if (state->tab == 3) return 862.0f;
     const float words = state->log_count ? 70.0f + (float)state->log_count * 42.0f : 130.0f;
     const bool playing_mp4 = ds_media_player_is_playing(state->media_player, NULL, 0, NULL);
     const bool playing_wav = ds_voice_player_is_playing_wav(state->voice_player, NULL, 0, NULL);
@@ -1763,7 +1769,7 @@ static DSLogLayout log_layout(const DeadSpeak *state) {
 typedef struct {
     DSRect prev_tag, next_tag, pause_btn, stop, del_active, scrubber, del_idle, item_row, video_box;
     DSRect speed_btn, ab_btn, mark_btn;
-    DSRect bright_btn, contrast_btn, filter_btn, save_btn;
+    DSRect bright_btn, contrast_btn, filter_btn, crop_btn, stamp_btn, save_btn;
 } DSMediaItemLayout;
 
 static DSMediaItemLayout media_item_layout(DSLogLayout log, float cur_item_y, bool is_mp4, bool is_bmp) {
@@ -1771,15 +1777,18 @@ static DSMediaItemLayout media_item_layout(DSLogLayout log, float cur_item_y, bo
     const float r2_w = (inner_w - 12.0f) / 3.0f;
     const float r4_w = (inner_w - 12.0f) * 0.25f;
     if (is_bmp) {
+        const float half_row_w = (inner_w - 4.0f) * 0.5f;
         return (DSMediaItemLayout){
             .video_box    = {log.media_x, cur_item_y + 22.0f, inner_w, 178.0f},
             .speed_btn    = {log.media_x + 4.0f, cur_item_y + 206.0f, r4_w, 26.0f},
             .bright_btn   = {log.media_x + 4.0f + (r4_w + 4.0f), cur_item_y + 206.0f, r4_w, 26.0f},
             .contrast_btn = {log.media_x + 4.0f + 2.0f * (r4_w + 4.0f), cur_item_y + 206.0f, r4_w, 26.0f},
             .filter_btn   = {log.media_x + 4.0f + 3.0f * (r4_w + 4.0f), cur_item_y + 206.0f, r4_w, 26.0f},
-            .save_btn     = {log.media_x + 4.0f, cur_item_y + 236.0f, 100.0f, 26.0f},
-            .stop         = {log.media_x + 110.0f, cur_item_y + 236.0f, 76.0f, 26.0f},
-            .del_active   = {log.media_x + log.column_width - 74.0f, cur_item_y + 236.0f, 42.0f, 26.0f},
+            .crop_btn     = {log.media_x + 4.0f, cur_item_y + 236.0f, half_row_w, 24.0f},
+            .stamp_btn    = {log.media_x + 4.0f + half_row_w + 4.0f, cur_item_y + 236.0f, half_row_w, 24.0f},
+            .save_btn     = {log.media_x + 4.0f, cur_item_y + 266.0f, 100.0f, 26.0f},
+            .stop         = {log.media_x + 110.0f, cur_item_y + 266.0f, 76.0f, 26.0f},
+            .del_active   = {log.media_x + log.column_width - 74.0f, cur_item_y + 266.0f, 42.0f, 26.0f},
             .del_idle     = {log.media_x + log.column_width - 72.0f, cur_item_y + 1.0f, 40.0f, 22.0f},
             .item_row     = {log.media_x, cur_item_y - 4.0f, log.column_width - 76.0f, 36.0f},
         };
@@ -1891,8 +1900,13 @@ static void draw_mp4_quad(DeadSpeak *state, DSRect box) {
 }
 
 static void draw_bmp_quad(DeadSpeak *state, DSRect box) {
-    if (state->snap_width > 0 && state->snap_height > 0 && box.w > 0.0f && box.h > 0.0f) {
-        const float src_aspect = (float)state->snap_width / (float)state->snap_height;
+    float uv[12];
+    int crop_w = state->snap_width;
+    int crop_h = state->snap_height;
+    const bool has_uv = ds_snap_compute_crop_uv(state->snap_width, state->snap_height,
+                                                &state->snap_edit, uv, &crop_w, &crop_h);
+    if (crop_w > 0 && crop_h > 0 && box.w > 0.0f && box.h > 0.0f) {
+        const float src_aspect = (float)crop_w / (float)crop_h;
         float draw_w = box.w, draw_h = box.h;
         if (box.w / box.h > src_aspect) draw_w = box.h * src_aspect;
         else draw_h = box.w / src_aspect;
@@ -1905,12 +1919,11 @@ static void draw_bmp_quad(DeadSpeak *state, DSRect box) {
     } else {
         state->active_snap_box = box;
     }
-    float uv[12];
-    if (!ds_snap_compute_uv(&state->snap_edit, uv)) {
+    if (!has_uv) {
         draw_textured_quad(state, box, state->snap_width, state->snap_height, 0, 1.0f);
         return;
     }
-    draw_textured_quad_uv(state, box, state->snap_width, state->snap_height, uv);
+    draw_textured_quad_uv(state, box, crop_w, crop_h, uv);
 }
 
 static void draw_log(DeadSpeak *state, const DSPalette *pal) {
@@ -1984,21 +1997,26 @@ static void draw_log(DeadSpeak *state, const DSPalette *pal) {
 
         if (is_this_snap) {
             static const char *const flt_short[6] = {"NGT", "THM", "EDG", "IR", "SEP", "RAW"};
-            rect(state, media_x - 4, cur_item_y - 2, column_width - 24, 272.0f, 0.07f, 0.18f, 0.15f, 0.95f);
+            static const char *const crop_short[4] = {"FULL", "1:1", "4:5", "16:9"};
+            rect(state, media_x - 4, cur_item_y - 2, column_width - 24, DS_LOG_SNAP_CARD_H - 6.0f, 0.07f, 0.18f, 0.15f, 0.95f);
             char snap_lbl[128];
             snprintf(snap_lbl, sizeof(snap_lbl), "[IMG] %s (%dx%d) DRAG TO PAN",
                      filename, state->snap_width, state->snap_height);
             text(state, snap_lbl, media_x + 4, cur_item_y + 4, fit_text_scale(snap_lbl, 1.0f, column_width - 32), 0.95f, 0.98f, 0.94f, 1.0f);
             draw_bmp_quad(state, item.video_box);
-            char z_lbl[16], b_lbl[16], c_lbl[16], f_lbl[16];
+            char z_lbl[16], b_lbl[16], c_lbl[16], f_lbl[16], cr_lbl[20];
             snprintf(z_lbl, sizeof(z_lbl), "ZM %.0fX", state->snap_edit.zoom);
             snprintf(b_lbl, sizeof(b_lbl), "BR %+.0f", state->snap_edit.brightness * 100.0f);
             snprintf(c_lbl, sizeof(c_lbl), "CT %.1f", state->snap_edit.contrast);
             snprintf(f_lbl, sizeof(f_lbl), "FX:%s", flt_short[(unsigned)state->snap_edit.filter % 6U]);
+            snprintf(cr_lbl, sizeof(cr_lbl), "CROP:%s", crop_short[(unsigned)state->snap_edit.crop % DS_CROP_COUNT]);
             custom_button(state, item.speed_btn, z_lbl, state->snap_edit.zoom > 1.05f);
             custom_button(state, item.bright_btn, b_lbl, fabsf(state->snap_edit.brightness) > 0.01f);
             custom_button(state, item.contrast_btn, c_lbl, fabsf(state->snap_edit.contrast - 1.0f) > 0.05f);
             custom_button(state, item.filter_btn, f_lbl, state->snap_edit.filter != DS_VIDEO_FILTER_RAW);
+            custom_button(state, item.crop_btn, cr_lbl, state->snap_edit.crop != DS_CROP_FULL);
+            custom_button(state, item.stamp_btn, state->snap_edit.stamp_telemetry ? "STAMP: ON" : "STAMP: OFF",
+                          state->snap_edit.stamp_telemetry);
             custom_button(state, item.save_btn, "SAVE EDIT", true);
             custom_button(state, item.stop, "CLOSE", false);
             rect(state, item.del_active.x, item.del_active.y, item.del_active.w, item.del_active.h, 0.45f, 0.12f, 0.12f, 0.9f);
@@ -2146,7 +2164,7 @@ static void draw_log(DeadSpeak *state, const DSPalette *pal) {
 typedef struct {
     DSRect voice_btns[4];
     DSRect pitch_down, pitch_up, speed_down, speed_up, anom_btn, hud_layout_btn;
-    DSRect vox_gate_btn, wave_shader_btn;
+    DSRect vox_gate_btn, wave_shader_btn, tutorial_btn;
 } DSGuideLayout;
 
 static DSGuideLayout guide_layout(const DeadSpeak *state) {
@@ -2168,6 +2186,7 @@ static DSGuideLayout guide_layout(const DeadSpeak *state) {
     gl.hud_layout_btn = (DSRect){x + half_w + btn_gap, top + 228.0f, half_w, 34.0f};
     gl.vox_gate_btn = (DSRect){x, top + 268.0f, half_w, 32.0f};
     gl.wave_shader_btn = (DSRect){x + half_w + btn_gap, top + 268.0f, half_w, 32.0f};
+    gl.tutorial_btn = (DSRect){x, top + 306.0f, half_w, 28.0f};
     return gl;
 }
 
@@ -2255,15 +2274,21 @@ static void draw_guide(DeadSpeak *state, const DSPalette *pal) {
     custom_button(state, gl.hud_layout_btn, hud_lbl, state->hud_layout != DS_HUD_LAYOUT_FULL);
     const bool vox_gate_on = atomic_load(&state->mute_on_vox);
     custom_button(state, gl.vox_gate_btn, vox_gate_on ? "VOX GATE: ON" : "VOX GATE: OFF", vox_gate_on);
-    static const char *const vis_labels[3] = {"AUDIO VIS: WAVE", "AUDIO VIS: FFT EQ", "AUDIO VIS: CLASSIC"};
+    static const char *const vis_labels[4] = {
+        "AUDIO VIS: WAVE", "AUDIO VIS: FFT EQ", "AUDIO VIS: RIBBON", "AUDIO VIS: CLASSIC"
+    };
     custom_button(state, gl.wave_shader_btn, vis_labels[(unsigned)state->audio_visual_mode % DS_AUDIO_VIS_COUNT],
                   state->audio_visual_mode != DS_AUDIO_VIS_OFF);
+    custom_button(state, gl.tutorial_btn, "REPLAY TUTORIAL", false);
 
     if (state->guide_voice_label[0] && now < state->guide_voice_last_ms + 4000U) {
-        text(state, state->guide_voice_label, x, top + 308, fit_text_scale(state->guide_voice_label, 1.0f, available), pal->amber.r, pal->amber.g, pal->amber.b, 1.0f);
+        const float lbl_x = gl.tutorial_btn.x + gl.tutorial_btn.w + 8.0f;
+        const float lbl_w = x + available - lbl_x;
+        text(state, state->guide_voice_label, lbl_x, gl.tutorial_btn.y + 8.0f,
+             fit_text_scale(state->guide_voice_label, 1.0f, lbl_w), pal->amber.r, pal->amber.g, pal->amber.b, 1.0f);
     }
 
-    text(state, "FIELD NOTES", x, top + 332, 1.8f, pal->mint.r, pal->mint.g, pal->mint.b, 1.0f);
+    text(state, "FIELD NOTES", x, top + 346, 1.8f, pal->mint.r, pal->mint.g, pal->mint.b, 1.0f);
     static const char *const notes[] = {
         "MAGNETIC READINGS CHANGE NEAR", "METAL ELECTRONICS AND MOVEMENT",
         "WORDS ARE SENSOR OUTPUTS", "NOT VERIFIED COMMUNICATION",
@@ -2280,7 +2305,7 @@ static void draw_guide(DeadSpeak *state, const DSPalette *pal) {
         const bool warning = i == 6 || i == 7;
         const bool highlighted = i == 2 || i == 8 || i == 12;
         const DSColor c = warning ? pal->amber : (highlighted ? pal->mint : pal->muted);
-        text(state, notes[i], x, top + 364.0f + (float)i * 25.0f,
+        text(state, notes[i], x, top + 378.0f + (float)i * 25.0f,
              fit_text_scale(notes[i], highlighted ? 1.25f : 1.1f, available),
              c.r, c.g, c.b, 1.0f);
     }
@@ -2529,13 +2554,19 @@ static void draw_audio_wave(DeadSpeak *state, DSRect box, uint64_t now, DSColor 
     const GLfloat verts[] = {x1,y1, x2,y1, x1,y2, x1,y2, x2,y1, x2,y2};
     const GLfloat uvs[] = {0,1, 1,1, 0,0, 0,0, 1,1, 1,0};
 
+    uint32_t spec_u32[DS_SPECTRUM_BINS];
+    for (unsigned s = 0; s < DS_SPECTRUM_BINS; ++s) {
+        spec_u32[s] = atomic_load(&state->spectrum_bins[s]);
+    }
     float bands8[8];
     for (unsigned b = 0; b < 8U; ++b) {
-        const float a = (float)atomic_load(&state->spectrum_bins[b * 3U + 0U]) / 1000.0f;
-        const float c = (float)atomic_load(&state->spectrum_bins[b * 3U + 1U]) / 1000.0f;
-        const float d = (float)atomic_load(&state->spectrum_bins[b * 3U + 2U]) / 1000.0f;
+        const float a = (float)spec_u32[b * 3U + 0U] / 1000.0f;
+        const float c = (float)spec_u32[b * 3U + 1U] / 1000.0f;
+        const float d = (float)spec_u32[b * 3U + 2U] / 1000.0f;
         bands8[b] = fmaxf(a, fmaxf(c, d));
     }
+    float bands16[16];
+    ds_downsample_spectrum_16(spec_u32, DS_SPECTRUM_BINS, bands16);
     const float amp = (float)atomic_load(&state->audio_level_milli) / 1000.0f;
     const float t = (float)(now % 60000ULL) * 0.001f;
     const float dt_ms = state->eq_last_ms > 0ULL && now > state->eq_last_ms ? (float)(now - state->eq_last_ms) : 16.6f;
@@ -2549,10 +2580,13 @@ static void draw_audio_wave(DeadSpeak *state, DSRect box, uint64_t now, DSColor 
         glUniform1fv(state->wave_bands_loc, 8,
                      state->audio_visual_mode == DS_AUDIO_VIS_EQ ? state->eq_meter.levels : bands8);
     }
+    if (state->wave_bands16_loc >= 0) glUniform1fv(state->wave_bands16_loc, 16, bands16);
     if (state->wave_peaks_loc >= 0) glUniform1fv(state->wave_peaks_loc, 8, state->eq_meter.peaks);
     if (state->wave_color_loc >= 0) glUniform3f(state->wave_color_loc, accent.r, accent.g, accent.b);
     if (state->wave_theme_loc >= 0) glUniform1i(state->wave_theme_loc, (int)state->theme_mode);
-    if (state->wave_mode_loc >= 0) glUniform1i(state->wave_mode_loc, state->audio_visual_mode == DS_AUDIO_VIS_EQ ? 1 : 0);
+    const int wave_mode = state->audio_visual_mode == DS_AUDIO_VIS_EQ ? 1 :
+                          (state->audio_visual_mode == DS_AUDIO_VIS_RIBBON ? 2 : 0);
+    if (state->wave_mode_loc >= 0) glUniform1i(state->wave_mode_loc, wave_mode);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, verts);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, uvs);
     glEnableVertexAttribArray(0);
@@ -3005,6 +3039,35 @@ static void draw_camera(DeadSpeak *state) {
             }
         }
 
+        /* Scrolling EMF baseline sparkline */
+        if (magnetic_live && state->emf_sparkline.count >= 2U) {
+            float sp_min = 0.0f, sp_max = 1.0f;
+            ds_sparkline_min_max(&state->emf_sparkline, &sp_min, &sp_max);
+            const float sp_span = fmaxf(1.5f, sp_max - sp_min);
+            const float sx = meter_x;
+            const float sw = meter_width;
+            const float sy = ui.magnetic.y + 10.0f;
+            const float sh = 12.0f;
+            if (state->baseline.ready) {
+                const float base_t = fmaxf(0.0f, fminf(1.0f, (state->emf_sparkline.baseline - sp_min) / sp_span));
+                const float by = sy + sh - base_t * sh;
+                line(state, sx, by, sx + sw, by, 0.70f, 0.85f, 0.80f, 0.50f);
+            }
+            const size_t n = state->emf_sparkline.count;
+            const size_t start = n < DS_SPARKLINE_CAPACITY ? 0U : state->emf_sparkline.next;
+            for (size_t i = 0U; i + 1U < n; ++i) {
+                const size_t idx0 = (start + i) % DS_SPARKLINE_CAPACITY;
+                const size_t idx1 = (start + i + 1U) % DS_SPARKLINE_CAPACITY;
+                const float t0 = fmaxf(0.0f, fminf(1.0f, (state->emf_sparkline.samples[idx0] - sp_min) / sp_span));
+                const float t1 = fmaxf(0.0f, fminf(1.0f, (state->emf_sparkline.samples[idx1] - sp_min) / sp_span));
+                const float x0 = sx + ((float)i / (float)(n - 1U)) * sw;
+                const float x1 = sx + ((float)(i + 1U) / (float)(n - 1U)) * sw;
+                const float y0 = sy + sh - t0 * sh;
+                const float y1 = sy + sh - t1 * sh;
+                line(state, x0, y0, x1, y1, 0.92f, 1.0f, 0.94f, 0.90f);
+            }
+        }
+
         /* 300ms High-EMF Alert Flasher */
         if (magnetic_live && (delta > 4.0f || delta < -4.0f || state->magnetic_field > 75.0f)) {
             emit_companion_tag(state, DS_TAG_ANOMALY);
@@ -3104,6 +3167,50 @@ static void draw_camera(DeadSpeak *state) {
     if (state->custom_open) draw_custom_words(state);
 }
 
+static void draw_tutorial_modal(DeadSpeak *state, const DSPalette *pal) {
+    if (!state || !state->tutorial_open) return;
+    const DSTutorialModal tm = ds_tutorial_modal_layout((float)state->width, (float)state->height);
+    rect(state, 0.0f, 0.0f, (float)state->width, (float)state->height, 0.0f, 0.02f, 0.03f, 0.78f);
+    rect(state, tm.card.x, tm.card.y, tm.card.w, tm.card.h, 0.07f, 0.13f, 0.12f, 0.98f);
+    char step_hdr[32];
+    snprintf(step_hdr, sizeof(step_hdr), "STEP %u OF %u", state->tutorial_step + 1U, DS_TUTORIAL_STEPS);
+    text(state, step_hdr, tm.card.x + 16.0f, tm.card.y + 14.0f, 1.05f, pal->amber.r, pal->amber.g, pal->amber.b, 1.0f);
+    const char *title = ds_tutorial_step_title(state->tutorial_step);
+    text_styled(state, title, tm.card.x + 16.0f, tm.card.y + 36.0f,
+                ds_fit_text_scale_styled(title, 1.55f, tm.card.w - 32.0f, DS_FONT_BOLD),
+                DS_FONT_BOLD, pal->mint.r, pal->mint.g, pal->mint.b, 1.0f);
+    /* Wrap step body cleanly onto up to 4 readable lines */
+    const char *body = ds_tutorial_step_body(state->tutorial_step);
+    const float body_scale = 1.05f;
+    const float max_w = tm.card.w - 32.0f;
+    size_t pos = 0U;
+    const size_t total_len = strlen(body);
+    for (unsigned ln = 0U; ln < 4U && pos < total_len; ++ln) {
+        size_t end = pos;
+        size_t last_space = pos;
+        char chunk[96];
+        while (end < total_len && (end - pos) + 1U < sizeof(chunk)) {
+            chunk[end - pos] = body[end];
+            chunk[end - pos + 1U] = '\0';
+            if (body[end] == ' ') last_space = end;
+            if (ds_text_width(chunk, body_scale, DS_FONT_STANDARD) > max_w) break;
+            ++end;
+        }
+        size_t line_end = end;
+        if (end < total_len && last_space > pos) line_end = last_space;
+        if (line_end == pos && end > pos) line_end = end;
+        const size_t n = line_end - pos < sizeof(chunk) ? (line_end - pos) : (sizeof(chunk) - 1U);
+        memcpy(chunk, body + pos, n);
+        chunk[n] = '\0';
+        text(state, chunk, tm.card.x + 16.0f, tm.card.y + 68.0f + (float)ln * 19.0f,
+             fit_text_scale(chunk, body_scale, max_w), 0.90f, 0.96f, 0.92f, 1.0f);
+        pos = line_end;
+        while (pos < total_len && body[pos] == ' ') ++pos;
+    }
+    custom_button(state, tm.skip_btn, "SKIP", false);
+    custom_button(state, tm.next_btn, (state->tutorial_step + 1U < DS_TUTORIAL_STEPS) ? "NEXT" : "DONE", true);
+}
+
 static void update_video_hud(DeadSpeak *state, uint64_t now) {
     if (!ds_video_active(&state->video)) return;
     static const char *const filter_names[] = {"NIGHT", "THERMAL", "EDGE", "MONO", "SEPIA", "RAW"};
@@ -3149,6 +3256,7 @@ static void draw_frame(DeadSpeak *state) {
     if (state->tab == DS_TAB_SCAN) {
         state->body_drawing = false;
         draw_camera(state);
+        draw_tutorial_modal(state, &pal);
         eglSwapBuffers(state->display, state->surface);
         return;
     }
@@ -3308,6 +3416,7 @@ navigation:
                     active ? DS_FONT_BOLD : DS_FONT_STANDARD, nc.r, nc.g, nc.b, 1.0f);
     }
     text_styled(state, "SKEPTICISM IS A FEATURE", 22, h - 39, ds_sp_to_scale(DS_FONT_SIZE_BADGE), DS_FONT_STANDARD, pal.muted.r, pal.muted.g, pal.muted.b, 1.0f);
+    draw_tutorial_modal(state, &pal);
 
     eglSwapBuffers(state->display, state->surface);
 }
@@ -3563,6 +3672,25 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
     const int32_t action = AMotionEvent_getAction(event) & AMOTION_EVENT_ACTION_MASK;
     const float x = AMotionEvent_getX(event, 0) / state->ui_scale;
     float y = AMotionEvent_getY(event, 0) / state->ui_scale;
+    if (state->tutorial_open) {
+        if (action == AMOTION_EVENT_ACTION_UP) {
+            const DSTutorialModal tm = ds_tutorial_modal_layout((float)state->width, (float)state->height);
+            if (ds_rect_contains(tm.skip_btn, x, y)) {
+                state->tutorial_open = false;
+                state->tutorial_seen = true;
+                save_settings(state);
+            } else if (ds_rect_contains(tm.next_btn, x, y)) {
+                if (state->tutorial_step + 1U < DS_TUTORIAL_STEPS) {
+                    ++state->tutorial_step;
+                } else {
+                    state->tutorial_open = false;
+                    state->tutorial_seen = true;
+                    save_settings(state);
+                }
+            }
+        }
+        return 1;
+    }
     if (action == AMOTION_EVENT_ACTION_DOWN) {
         state->touch_active = state->tab == 0 || ds_rect_contains(state->ui.body, x, y);
         state->touch_dragged = false;
@@ -3799,6 +3927,7 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
             }
             if (state->sensor_details && ds_rect_contains(ctrl.cal, x, y)) {
                 ds_baseline_reset(&state->baseline);
+                ds_sparkline_init(&state->emf_sparkline);
                 state->word[0] = 0;
                 return 1;
             }
@@ -3904,6 +4033,15 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
                     refresh_snap_preview_texture(state);
                     return 1;
                 }
+                if (ds_rect_contains(item.crop_btn, x, y)) {
+                    state->snap_edit.crop = (DSSnapCropPreset)(((unsigned)state->snap_edit.crop + 1U) % DS_CROP_COUNT);
+                    ds_snap_edit_clamp(&state->snap_edit);
+                    return 1;
+                }
+                if (ds_rect_contains(item.stamp_btn, x, y)) {
+                    state->snap_edit.stamp_telemetry = !state->snap_edit.stamp_telemetry;
+                    return 1;
+                }
                 if (ds_rect_contains(item.save_btn, x, y) && state->snap_full_path[0]) {
                     struct timespec wall_time;
                     struct tm local_tm = {0};
@@ -3911,6 +4049,23 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
                     localtime_r(&wall_time.tv_sec, &local_tm);
                     char stamp[32];
                     strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &local_tm);
+                    if (state->snap_edit.stamp_telemetry) {
+                        char tbuf[24] = {0};
+                        strftime(tbuf, sizeof(tbuf), "%m/%d %I:%M%p", &local_tm);
+                        for (size_t c = 0; tbuf[c]; ++c) {
+                            tbuf[c] = (char)toupper((unsigned char)tbuf[c]);
+                        }
+                        const bool mag_ok = ds_sensor_live(&state->readings[0], sensor_now_ns());
+                        if (mag_ok) {
+                            snprintf(state->snap_edit.stamp_text, sizeof(state->snap_edit.stamp_text),
+                                     "%.1fUT %s", state->magnetic_field, tbuf);
+                        } else {
+                            snprintf(state->snap_edit.stamp_text, sizeof(state->snap_edit.stamp_text),
+                                     "N/A %s", tbuf);
+                        }
+                    } else {
+                        state->snap_edit.stamp_text[0] = '\0';
+                    }
                     char dst_path[640];
                     snprintf(dst_path, sizeof(dst_path), "%s/SNAP_%s_%03ld.bmp",
                              state->evidence_dir, stamp, wall_time.tv_nsec / 1000000L);
@@ -4104,6 +4259,10 @@ static int32_t handle_input(struct android_app *app, AInputEvent *event) {
         } else if (ds_rect_contains(gl.wave_shader_btn, x, y)) {
             cycle_audio_visual_mode(state);
             return 1;
+        } else if (ds_rect_contains(gl.tutorial_btn, x, y)) {
+            state->tutorial_step = 0U;
+            state->tutorial_open = true;
+            return 1;
         }
         if (voice_changed) {
             save_settings(state);
@@ -4182,6 +4341,12 @@ static void poll_sensor(DeadSpeak *state) {
                         "PROXIMITY TRIGGERED: distance=%.1f cm (breaks=%u)",
                         event.distance, (unsigned)state->proximity_state.break_count);
                     if (state->scanning) ds_voice_player_set_geiger_rate(state->voice_player, 25.0f);
+                    const uint64_t p_now = now_millis();
+                    if (state->scanning && state->emf_alerts_enabled && state->voice_player &&
+                        p_now >= state->last_prox_cue_ms + 2500ULL) {
+                        state->last_prox_cue_ms = p_now;
+                        ds_voice_player_play_cue(state->voice_player, DS_CUE_PROX_FADE);
+                    }
                     emit_companion_tag(state, DS_TAG_ANOMALY);
                 } else if (!state->proximity_active && was_active && state->scanning) {
                     ds_voice_player_set_geiger_rate(state->voice_player, 0.0f);
@@ -4225,6 +4390,8 @@ static void poll_sensor(DeadSpeak *state) {
             ds_engine_smooth(state->smoothed_field, reading->magnitude, 0.15f);
         const bool moving = ds_motion_is_moving(&state->motion_filter, received);
         ds_baseline_sample_3d(&state->baseline, reading->xyz[0], reading->xyz[1], reading->xyz[2], moving, reading->timestamp_ns);
+        ds_sparkline_push(&state->emf_sparkline, state->smoothed_field,
+                          state->baseline.ready ? state->baseline.field : 0.0f);
         state->signal = state->baseline.ready ? ds_engine_signal(state->smoothed_field, state->baseline.field) : 0;
         if (state->sample_count == UINT32_MAX) state->sample_count = 0;
         ++state->sample_count;
@@ -4297,6 +4464,7 @@ static void stop_sensors(DeadSpeak *state, DSSensorStatus status) {
         ds_sensor_clear(&state->readings[i], state->sensors[i] ? status : DS_SENSOR_ABSENT);
     }
     state->magnetic_field = state->smoothed_field = state->signal = 0.0f;
+    ds_sparkline_init(&state->emf_sparkline);
     state->word[0] = '\0';
 }
 
@@ -4330,6 +4498,7 @@ static void maintain_sensors(DeadSpeak *state) {
     }
     if (!ds_sensor_live(&state->readings[0], now)) {
         state->magnetic_field = state->smoothed_field = state->signal = 0.0f;
+        ds_sparkline_init(&state->emf_sparkline);
         state->word[0] = '\0';
         if (!state->baseline.ready) ds_baseline_reset(&state->baseline);
     }
@@ -4413,6 +4582,7 @@ void android_main(struct android_app *app) {
     state->snap_orig_rgba = malloc(DS_PREVIEW_CAPACITY);
     state->snap_edit = ds_snap_edit_defaults();
     ds_proximity_init(&state->proximity_state);
+    ds_sparkline_init(&state->emf_sparkline);
     state->video_filter = DS_VIDEO_FILTER_RAW;
     state->video_aspect = DS_ASPECT_16_9;
     state->hud_burn_in = true;
@@ -4459,6 +4629,9 @@ void android_main(struct android_app *app) {
         atomic_store(&state->mute_on_vox, cfg.mute_on_vox);
         state->hud_layout = cfg.hud_layout;
         state->audio_visual_mode = cfg.audio_visual_mode;
+        state->tutorial_seen = cfg.tutorial_seen;
+        state->tutorial_open = !cfg.tutorial_seen;
+        state->tutorial_step = 0U;
         state->playback_speed = 1.0f;
         ds_video_set_front(&state->video, cfg.camera_front);
         ds_video_set_zoom(&state->video, cfg.zoom);

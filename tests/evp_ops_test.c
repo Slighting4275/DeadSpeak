@@ -23,6 +23,7 @@ int main(void) {
     assert(ds_synthesize_cue(DS_CUE_STOP, 16000, cue_buf, 16000) > 500);
     assert(ds_synthesize_cue(DS_CUE_EMF_ALERT, 16000, cue_buf, 16000) > 500);
     assert(ds_synthesize_cue(DS_CUE_TICK, 16000, cue_buf, 16000) > 100);
+    assert(ds_synthesize_cue(DS_CUE_PROX_FADE, 16000, cue_buf, 16000) > 2000);
 
     /* 2. EVP 80Hz high-pass + 60Hz notch filter attenuates 50/60Hz hum while passing 1kHz tone */
     DSEvpFilterState flt = {0};
@@ -178,6 +179,35 @@ int main(void) {
     assert(ds_load_bmp_rgba(dst_bmp, edited_px, sizeof(edited_px), &ew, &eh));
     assert(ew == 2 && eh == 2 && edited_px[1] >= edited_px[0] && edited_px[1] >= edited_px[2]);
     unlink(src_bmp); unlink(dst_bmp);
+
+    /* 9. 16-band spectrum downsample + custom BMP crop aspect & telemetry stamp */
+    uint32_t bins24[24] = {0};
+    bins24[0] = 500U; bins24[23] = 1000U;
+    float bands16[16] = {0};
+    ds_downsample_spectrum_16(bins24, 24, bands16);
+    assert(fabsf(bands16[0] - 0.5f) < 0.05f && fabsf(bands16[15] - 1.0f) < 0.05f);
+
+    int cw = 0, ch = 0;
+    ds_snap_crop_dimensions(640, 480, DS_CROP_SQUARE_1_1, &cw, &ch);
+    assert(cw == 480 && ch == 480);
+    ds_snap_crop_dimensions(360, 640, DS_CROP_LANDSCAPE_16_9, &cw, &ch);
+    assert(cw == 360 && ch < 210 && ch > 195);
+
+    uint8_t big_rgba[40 * 30 * 4];
+    memset(big_rgba, 40, sizeof(big_rgba));
+    const char *crop_src = "build/host/evp_ops_crop_src.bmp";
+    const char *crop_dst = "build/host/evp_ops_crop_dst.bmp";
+    unlink(crop_src); unlink(crop_dst);
+    assert(ds_write_filtered_bmp(crop_src, big_rgba, 40, 30, 0, false, 1.0f, DS_VIDEO_FILTER_RAW));
+    ed = ds_snap_edit_defaults();
+    ed.crop = DS_CROP_SQUARE_1_1;
+    ed.stamp_telemetry = true;
+    snprintf(ed.stamp_text, sizeof(ed.stamp_text), "EMF 55.2 UT");
+    assert(ds_edit_and_save_bmp(crop_src, crop_dst, &ed));
+    uint8_t crop_px[40 * 40 * 4];
+    assert(ds_load_bmp_rgba(crop_dst, crop_px, sizeof(crop_px), &ew, &eh));
+    assert(ew == 30 && eh == 30);
+    unlink(crop_src); unlink(crop_dst);
     unlink(tags_path);
 
     puts("PASS: evp_ops cue synth, EVP highpass/notch, playback loop/speed, BMP snapshot, and tag append");

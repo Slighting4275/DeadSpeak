@@ -221,4 +221,45 @@ static inline DSHudVisibility ds_hud_visibility(DSHudLayout layout) {
     }
 }
 
+#define DS_TUTORIAL_STEPS 5U
+
+typedef struct {
+    DSRect card, skip_btn, next_btn;
+} DSTutorialModal;
+
+static inline DSTutorialModal ds_tutorial_modal_layout(float width, float height) {
+    const float cw = fminf(400.0f, fmaxf(240.0f, width - 36.0f));
+    const float ch = fminf(240.0f, fmaxf(170.0f, height - 40.0f));
+    const DSRect card = {(width - cw) * 0.5f, (height - ch) * 0.5f, cw, ch};
+    const float bw = fminf(116.0f, (cw - 36.0f) * 0.5f);
+    const float by = card.y + card.h - 46.0f;
+    return (DSTutorialModal){
+        .card = card,
+        .skip_btn = {card.x + 14.0f, by, bw, 34.0f},
+        .next_btn = {card.x + card.w - 14.0f - bw, by, bw, 34.0f},
+    };
+}
+
+static inline const char *ds_tutorial_step_title(unsigned step) {
+    static const char *const titles[DS_TUTORIAL_STEPS] = {
+        "1/5  WELCOME TO DEADSPEAK",
+        "2/5  MAGNETOMETER BASELINE",
+        "3/5  PROXIMITY FIELD BREAK",
+        "4/5  AUDIO & FFT VISUALIZER",
+        "5/5  DICTIONARY & CAPTURE",
+    };
+    return titles[step < DS_TUTORIAL_STEPS ? step : 0U];
+}
+
+static inline const char *ds_tutorial_step_body(unsigned step) {
+    static const char *const bodies[DS_TUTORIAL_STEPS] = {
+        "PURE C23 HARDWARE TELEMETRY. ALL WORDS COME FROM REAL MEASURED SENSOR DELTAS.",
+        "HOLD DEVICE STILL FOR 20 SAMPLES TO CALIBRATE AMBIENT UT BASELINE & SPARKLINE.",
+        "NEAR-FIELD IR/PROXIMITY BREAKS RAISE SURGE ALERT, CHIME FADE & ANOMALY FX.",
+        "TAP AUDIO BAR TO CYCLE WAVE, FFT EQ, SIRI RIBBON & CLASSIC. +HPF CUTS 60HZ HUM.",
+        "SWIPE CAMERA TO CYCLE FILTERS, RECORD MUXED MP4, OR EDIT SNAP_*.BMP IN LOG.",
+    };
+    return bodies[step < DS_TUTORIAL_STEPS ? step : 0U];
+}
+
 #endif

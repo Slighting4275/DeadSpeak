@@ -32,6 +32,7 @@ DSSettings ds_settings_defaults(void) {
         .audio_shader = true,
         .hud_layout = DS_HUD_LAYOUT_FULL,
         .audio_visual_mode = DS_AUDIO_VIS_WAVE,
+        .tutorial_seen = false,
     };
 }
 
@@ -121,7 +122,8 @@ bool ds_settings_save(const char *path, const DSSettings *s) {
         "mute_on_vox=%d\n"
         "audio_shader=%d\n"
         "hud_layout=%d\n"
-        "audio_visual_mode=%d\n",
+        "audio_visual_mode=%d\n"
+        "tutorial_seen=%d\n",
         (int)clean.voice_mode, clean.voice_pitch_hz, clean.voice_speed,
         clean.voice_enabled ? 1 : 0, clean.geiger_enabled ? 1 : 0,
         (int)clean.video_filter, (int)clean.video_aspect,
@@ -131,7 +133,7 @@ bool ds_settings_save(const char *path, const DSSettings *s) {
         (unsigned)clean.timer_seconds, clean.emf_alerts ? 1 : 0,
         clean.hpf_enabled ? 1 : 0, clean.mute_on_vox ? 1 : 0,
         clean.audio_shader ? 1 : 0, (int)clean.hud_layout,
-        (int)clean.audio_visual_mode);
+        (int)clean.audio_visual_mode, clean.tutorial_seen ? 1 : 0);
 
     const bool ok = wrote > 0 && fflush(f) == 0 && fsync(fileno(f)) == 0;
     if (fclose(f) != 0 || !ok) {
@@ -209,7 +211,7 @@ bool ds_settings_load(const char *path, DSSettings *out) {
         else if (strcmp(line, "audio_visual_mode") == 0) {
             saw_vis_mode = true;
             out->audio_visual_mode = (DSAudioVisualMode)strtol(val, NULL, 10);
-        }
+        } else if (strcmp(line, "tutorial_seen") == 0) out->tutorial_seen = strtol(val, NULL, 10) != 0;
     }
     fclose(f);
     ds_settings_clamp(out);

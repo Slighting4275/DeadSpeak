@@ -144,7 +144,7 @@ ds_add_zig_c_object("${DS_SETTINGS_OBJECT}" "${CMAKE_CURRENT_SOURCE_DIR}/setting
 
 ds_add_zig_c_object("${DS_EVP_OPS_OBJECT}" "${CMAKE_CURRENT_SOURCE_DIR}/evp_ops.c"
     "Compiling EVP audio/photo/tag helpers with Zig cc"
-    DEPENDS_LIST "${CMAKE_CURRENT_SOURCE_DIR}/evp_ops.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.h")
+    DEPENDS_LIST "${CMAKE_CURRENT_SOURCE_DIR}/evp_ops.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.h" "${CMAKE_CURRENT_SOURCE_DIR}/typography.h")
 
 ds_add_zig_c_object("${DS_FONT_ATLAS_OBJECT}" "${CMAKE_CURRENT_SOURCE_DIR}/font_atlas.c"
     "Compiling anti-aliased font atlas data with Zig cc"

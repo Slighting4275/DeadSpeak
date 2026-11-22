@@ -16,6 +16,7 @@ typedef enum {
     DS_CUE_STOP = 2,
     DS_CUE_EMF_ALERT = 3,
     DS_CUE_TICK = 4,
+    DS_CUE_PROX_FADE = 5,
 } DSCueType;
 
 /* Synthesizes a pure 16-bit mono PCM hardware feedback chime/tick.
@@ -72,8 +73,17 @@ typedef struct {
 } DSEqMeterState;
 
 void ds_eq_meter_update(DSEqMeterState *eq, const float raw_bands[8], float dt_ms);
+void ds_downsample_spectrum_16(const uint32_t *bins, size_t bin_count, float out16[16]);
 
-/* Post-capture BMP snapshot zoom/pan & brightness/contrast/filter editor */
+/* Post-capture BMP snapshot zoom/pan, aspect crop & brightness/contrast/filter editor */
+typedef enum {
+    DS_CROP_FULL = 0,
+    DS_CROP_SQUARE_1_1 = 1,
+    DS_CROP_PORTRAIT_4_5 = 2,
+    DS_CROP_LANDSCAPE_16_9 = 3,
+    DS_CROP_COUNT = 4,
+} DSSnapCropPreset;
+
 typedef struct {
     float zoom;
     float pan_x;
@@ -81,11 +91,16 @@ typedef struct {
     float brightness;
     float contrast;
     DSVideoFilter filter;
+    DSSnapCropPreset crop;
+    bool stamp_telemetry;
+    char stamp_text[48];
 } DSSnapEditParams;
 
 DSSnapEditParams ds_snap_edit_defaults(void);
 void ds_snap_edit_clamp(DSSnapEditParams *p);
+void ds_snap_crop_dimensions(int src_w, int src_h, DSSnapCropPreset crop, int *out_w, int *out_h);
 bool ds_snap_compute_uv(const DSSnapEditParams *p, float uv[12]);
+bool ds_snap_compute_crop_uv(int img_w, int img_h, const DSSnapEditParams *p, float uv[12], int *out_w, int *out_h);
 bool ds_apply_snap_edit_rgba(const uint8_t *src_rgba, uint8_t *dst_rgba, int w, int h, const DSSnapEditParams *p);
 bool ds_edit_and_save_bmp(const char *src_path, const char *dst_path, const DSSnapEditParams *p);
 

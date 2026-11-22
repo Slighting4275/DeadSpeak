@@ -37,6 +37,9 @@ int main(void) {
                 assert(frame.x >= 0.0f && frame.y >= 0.0f && frame.w > 0.0f && frame.h > 0.0f);
                 assert(frame.x + frame.w <= (float)width + 0.01f && frame.y + frame.h <= ui.navigation.y + 0.01f);
             }
+            const DSTutorialModal tm = ds_tutorial_modal_layout((float)width, (float)height);
+            assert(tm.card.x >= 0 && tm.card.y >= 0 && tm.card.x + tm.card.w <= width && tm.card.y + tm.card.h <= height);
+            assert(tm.skip_btn.x + tm.skip_btn.w < tm.next_btn.x);
             ++layouts;
         }
     }
@@ -119,6 +122,13 @@ int main(void) {
     assert(vis_cmp.show_top_chrome && !vis_cmp.show_quick_rows && vis_cmp.show_meters && vis_cmp.show_word_card);
     assert(!vis_min.show_top_chrome && !vis_min.show_quick_rows && !vis_min.show_meters && !vis_min.show_word_card);
     assert(ds_hud_layout_label(DS_HUD_LAYOUT_COMPACT)[0] != '\0');
+
+    /* Verify tutorial step metadata */
+    assert(DS_TUTORIAL_STEPS == 5U);
+    for (unsigned s = 0U; s < DS_TUTORIAL_STEPS; ++s) {
+        assert(ds_tutorial_step_title(s)[0] != '\0');
+        assert(ds_tutorial_step_body(s)[0] != '\0');
+    }
 
     printf("PASS: %u camera overlay layouts, shared hit regions, gestures, and filter HUD\n", layouts);
     return 0;
