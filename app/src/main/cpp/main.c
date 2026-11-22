@@ -487,9 +487,11 @@ static void append_word_log(DeadSpeak *state, const char *word) {
     /* 3. Session word history export */
     char wh_path[640];
     snprintf(wh_path, sizeof(wh_path), "%s/DeadSpeakWordHistory.txt", state->evidence_dir);
+    struct stat wh_st;
+    const bool wh_needs_hdr = (stat(wh_path, &wh_st) != 0 || wh_st.st_size == 0);
     FILE *wh_file = fopen(wh_path, "a");
     if (wh_file) {
-        if (fseek(wh_file, 0, SEEK_END) == 0 && ftell(wh_file) == 0) {
+        if (wh_needs_hdr) {
             fprintf(wh_file, "DeadSpeak session word history export\n\nDate|Time|Generated word(s)|Translated\n");
         }
         fprintf(wh_file, "%s|%s|%s|%s\n", date_buf, time_buf, word, word);
@@ -499,9 +501,11 @@ static void append_word_log(DeadSpeak *state, const char *word) {
     /* 4. DeadSpeak Session Export */
     char ds_path[640];
     snprintf(ds_path, sizeof(ds_path), "%s/DeadSpeakSessionExport.txt", state->evidence_dir);
+    struct stat ds_st;
+    const bool ds_needs_hdr = (stat(ds_path, &ds_st) != 0 || ds_st.st_size == 0);
     FILE *ds_file = fopen(ds_path, "a");
     if (ds_file) {
-        if (fseek(ds_file, 0, SEEK_END) == 0 && ftell(ds_file) == 0) {
+        if (ds_needs_hdr) {
             fprintf(ds_file, "DeadSpeak Anomaly Detection Session Export\n\nDate|Time|Word|Field_uT|Delta_uT|Vector|Mode\n");
         }
         fprintf(ds_file, "%s|%s|%s|%.1f|%+.1f|X:%.1f,Y:%.1f,Z:%.1f|%s\n",
@@ -2190,7 +2194,12 @@ static void draw_guide(DeadSpeak *state, const DSPalette *pal) {
 
     char baseline_line[128];
     const float prox_srg = ds_proximity_surge(&state->proximity_state, now);
-    if (state->sensors[3] && ds_sensor_live(&state->readings[3], s_now)) {
+    const DSSensorReading *prox_rd = &state->readings[3];
+    const bool prox_has_real = state->sensors[3] && prox_rd->count > 0U &&
+                               prox_rd->status != DS_SENSOR_ABSENT &&
+                               prox_rd->status != DS_SENSOR_BLOCKED &&
+                               prox_rd->status != DS_SENSOR_INVALID;
+    if (prox_has_real) {
         snprintf(baseline_line, sizeof(baseline_line),
                  "BASE:%.1fUT | PRX:%.1fCM (%+.1f) BRK:%u SRG:%u%% %s",
                  state->baseline.field,

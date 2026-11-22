@@ -481,7 +481,10 @@ size_t ds_resample_waveform_file(const char *path, float *out_bars, size_t max_b
         fclose(wf);
         return 0U;
     }
-    rewind(wf);
+    if (fseek(wf, 0L, SEEK_SET) != 0) {
+        fclose(wf);
+        return 0U;
+    }
     const size_t bars = total < max_bars ? total : max_bars;
     memset(out_bars, 0, bars * sizeof(float));
     size_t idx = 0U;
