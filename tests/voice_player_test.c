@@ -81,6 +81,17 @@ int main(void) {
     ds_voice_player_seek_wav_ms(p, 50);
     assert(ds_voice_player_get_wav_position_ms(p) >= 40);
 
+    ds_voice_player_set_wav_speed(p, 0.5f);
+    assert(fabsf(ds_voice_player_get_wav_speed(p) - 0.5f) < 0.01f);
+    ds_voice_player_set_wav_speed(p, 5.0f);
+    assert(fabsf(ds_voice_player_get_wav_speed(p) - 2.0f) < 0.01f);
+    ds_voice_player_set_wav_filter(p, true);
+    assert(ds_voice_player_get_wav_filter(p));
+    ds_voice_player_set_wav_filter(p, false);
+    assert(!ds_voice_player_get_wav_filter(p));
+    ds_voice_player_set_wav_loop(p, 20, 80);
+    ds_voice_player_play_cue(p, DS_CUE_START);
+
     ds_voice_player_stop_wav(p);
     assert(!ds_voice_player_is_playing_wav(p, NULL, 0, NULL));
     unlink(wav_path_48k);

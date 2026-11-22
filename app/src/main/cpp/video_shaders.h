@@ -79,4 +79,51 @@ static const char *const DS_RGBA_OVERLAY_FRAGMENT_SHADER =
     "    gl_FragColor = texture2D(u_image, v_uv);\n"
     "}\n";
 
+static const char *const DS_AUDIO_WAVE_VERTEX_SHADER =
+    "attribute vec2 a_position;\n"
+    "attribute vec2 a_uv;\n"
+    "varying vec2 v_uv;\n"
+    "void main() {\n"
+    "    v_uv = a_uv;\n"
+    "    gl_Position = vec4(a_position, 0.0, 1.0);\n"
+    "}\n";
+
+static const char *const DS_AUDIO_WAVE_FRAGMENT_SHADER =
+    "precision mediump float;\n"
+    "uniform float u_time;\n"
+    "uniform float u_amp;\n"
+    "uniform float u_bands[8];\n"
+    "uniform vec3 u_color;\n"
+    "uniform int u_theme;\n"
+    "varying vec2 v_uv;\n"
+    "void main() {\n"
+    "    float x = v_uv.x;\n"
+    "    float y = (v_uv.y - 0.5) * 2.0;\n"
+    "    float idx = clamp(x * 7.0, 0.0, 6.999);\n"
+    "    int i0 = int(floor(idx));\n"
+    "    float frac = idx - float(i0);\n"
+    "    float b0 = 0.0;\n"
+    "    float b1 = 0.0;\n"
+    "    for (int i = 0; i < 8; ++i) {\n"
+    "        if (i == i0) b0 = u_bands[i];\n"
+    "        if (i == i0 + 1) b1 = u_bands[i];\n"
+    "    }\n"
+    "    float band_energy = mix(b0, b1, frac);\n"
+    "    float env = sin(x * 3.14159265);\n"
+    "    float gain = clamp(0.10 + u_amp * 0.70 + band_energy * 0.65, 0.06, 0.92) * env;\n"
+    "    float w1 = sin(x * 18.0 + u_time * 6.5) * 0.55 * gain;\n"
+    "    float w2 = sin(x * 31.0 - u_time * 9.0 + 1.4) * 0.40 * gain;\n"
+    "    float w3 = sin(x * 46.0 + u_time * 12.0 + 2.8) * 0.25 * gain;\n"
+    "    float g1 = exp(-abs(y - w1) * 16.0);\n"
+    "    float g2 = exp(-abs(y - w2) * 14.0);\n"
+    "    float g3 = exp(-abs(y - w3) * 18.0);\n"
+    "    float axis = exp(-abs(y) * 42.0) * 0.28;\n"
+    "    vec3 col1 = u_color;\n"
+    "    vec3 col2 = (u_theme == 1) ? vec3(0.2, 1.0, 0.55) : vec3(0.3, 0.8, 1.0);\n"
+    "    vec3 col3 = (u_theme == 2) ? vec3(0.65, 0.45, 1.0) : vec3(1.0, 0.65, 0.25);\n"
+    "    vec3 sum = col1 * g1 + col2 * g2 * 0.75 + col3 * g3 * 0.65 + vec3(0.85, 0.98, 0.92) * axis;\n"
+    "    float alpha = clamp(g1 * 0.85 + g2 * 0.60 + g3 * 0.50 + axis, 0.0, 0.92);\n"
+    "    gl_FragColor = vec4(clamp(sum, 0.0, 1.0), alpha);\n"
+    "}\n";
+
 #endif /* DEADSPEAK_VIDEO_SHADERS_H */

@@ -35,4 +35,7 @@ build/host/typography-test || exit 1
 zig cc -std=c23 -O1 -Wall -Wextra -Werror tests/settings_test.c \
     app/src/main/cpp/settings.c -lm -o build/host/settings-test || exit 1
 build/host/settings-test || exit 1
+zig cc -std=c23 -O1 -Wall -Wextra -Werror tests/evp_ops_test.c \
+    app/src/main/cpp/evp_ops.c -lm -o build/host/evp-ops-test || exit 1
+build/host/evp-ops-test || exit 1
 sh tests/signing_test.sh

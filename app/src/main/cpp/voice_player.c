@@ -28,13 +28,25 @@ struct DSVoicePlayer {
     uint32_t geiger_sample_counter;
     uint32_t geiger_interval_samples;
 
+    /* Hardware cue chime */
+    DSCueType pending_cue;
+    int16_t cue_pcm[4096];
+    size_t cue_total;
+    size_t cue_pos;
+
     /* WAV playback */
     bool wav_playing;
     char wav_path[512];
     int16_t *wav_pcm;
     size_t wav_total_samples;
     size_t wav_current_sample;
+    double wav_sample_pos;
     uint32_t wav_sample_rate;
+    _Atomic uint32_t wav_speed_milli;
+    _Atomic bool wav_filter_enabled;
+    DSEvpFilterState wav_hpf;
+    uint64_t wav_loop_start_ms;
+    uint64_t wav_loop_end_ms;
     _Atomic bool stop_requested;
     _Atomic uint64_t speech_active_until_ms;
 };
@@ -87,6 +99,12 @@ static void *voice_player_thread(void *arg) {
         }
 
         pthread_mutex_lock(&p->mutex);
+        const DSCueType cue_req = p->pending_cue;
+        p->pending_cue = DS_CUE_NONE;
+        if (cue_req != DS_CUE_NONE) {
+            p->cue_total = ds_synthesize_cue(cue_req, DS_VOICE_SAMPLE_RATE, p->cue_pcm, sizeof(p->cue_pcm) / sizeof(p->cue_pcm[0]));
+            p->cue_pos = 0;
+        }
         if (p->has_work) {
             char text[64] = {0};
             DSVoiceConfig config = p->pending_config;
@@ -116,11 +134,10 @@ static void *voice_player_thread(void *arg) {
             if (interval < 32) interval = 32;
         }
 
-        /* Generate chunk */
-        bool has_audio = (speech_pos < speech_total) || (p->wav_playing && p->wav_pcm) || (interval > 0);
+        /* Generate chunk (hold mutex cleanly across idle wait check) */
+        pthread_mutex_lock(&p->mutex);
+        const bool has_audio = (speech_pos < speech_total) || (p->cue_pos < p->cue_total) || (p->wav_playing && p->wav_pcm) || (interval > 0);
         if (!has_audio) {
-            /* Idle: wait for work with 20ms timeout */
-            pthread_mutex_lock(&p->mutex);
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
             ts.tv_nsec += 20000000L;
@@ -130,7 +147,8 @@ static void *voice_player_thread(void *arg) {
             continue;
         }
 
-        pthread_mutex_lock(&p->mutex);
+        const double wav_step = (double)ds_voice_player_get_wav_speed(p);
+        const bool apply_hpf = atomic_load(&p->wav_filter_enabled);
         for (size_t i = 0; i < DS_CHUNK_SAMPLES; ++i) {
             float sample = 0.0f;
 
@@ -139,10 +157,34 @@ static void *voice_player_thread(void *arg) {
                 sample += (float)speech_pcm[speech_pos++];
             }
 
-            /* WAV file playback */
-            if (p->wav_playing && p->wav_pcm) {
-                if (p->wav_current_sample < p->wav_total_samples) {
-                    sample += (float)p->wav_pcm[p->wav_current_sample++];
+            /* Hardware feedback cue */
+            if (p->cue_pos < p->cue_total) {
+                sample += (float)p->cue_pcm[p->cue_pos++];
+            }
+
+            /* WAV file playback (with variable speed, optional A-B loop, & hum filter) */
+            if (p->wav_playing && p->wav_pcm && p->wav_total_samples > 0) {
+                const uint64_t dur_ms = (uint64_t)p->wav_total_samples * 1000ULL / DS_VOICE_SAMPLE_RATE;
+                uint64_t lstart = p->wav_loop_start_ms, lend = p->wav_loop_end_ms;
+                ds_clamp_loop_range(dur_ms, &lstart, &lend);
+                const size_t lend_smp = (lend > lstart) ? (size_t)(lend * (uint64_t)DS_VOICE_SAMPLE_RATE / 1000ULL) : 0U;
+                const size_t lstart_smp = (lend > lstart) ? (size_t)(lstart * (uint64_t)DS_VOICE_SAMPLE_RATE / 1000ULL) : 0U;
+
+                size_t idx = (size_t)p->wav_sample_pos;
+                if (lend_smp > lstart_smp && idx >= lend_smp) {
+                    p->wav_sample_pos = (double)lstart_smp;
+                    p->wav_current_sample = lstart_smp;
+                    idx = lstart_smp;
+                }
+                if (idx < p->wav_total_samples) {
+                    const double frac = p->wav_sample_pos - (double)idx;
+                    const float s0 = (float)p->wav_pcm[idx];
+                    const float s1 = (idx + 1U < p->wav_total_samples) ? (float)p->wav_pcm[idx + 1U] : s0;
+                    int16_t ws = (int16_t)(s0 + (s1 - s0) * (float)frac);
+                    if (apply_hpf) ds_evp_filter_process(&p->wav_hpf, &ws, 1U);
+                    sample += (float)ws;
+                    p->wav_sample_pos += wav_step;
+                    p->wav_current_sample = (size_t)p->wav_sample_pos;
                 } else {
                     p->wav_playing = false;
                 }
@@ -209,6 +251,9 @@ DSVoicePlayer *ds_voice_player_create(void) {
     atomic_store(&p->running, true);
     atomic_store(&p->geiger_enabled, true);
     atomic_store(&p->geiger_rate_milli, 0);
+    atomic_store(&p->wav_speed_milli, 1000U);
+    atomic_store(&p->wav_filter_enabled, false);
+    ds_evp_filter_init(&p->wav_hpf, DS_VOICE_SAMPLE_RATE);
     if (pthread_create(&p->thread, NULL, voice_player_thread, p) != 0) {
         atomic_store(&p->running, false);
         pthread_mutex_destroy(&p->mutex);
@@ -271,6 +316,14 @@ bool ds_voice_player_get_geiger_enabled(const DSVoicePlayer *p) {
     return p ? atomic_load(&p->geiger_enabled) : false;
 }
 
+void ds_voice_player_play_cue(DSVoicePlayer *p, DSCueType cue) {
+    if (!p || cue == DS_CUE_NONE) return;
+    pthread_mutex_lock(&p->mutex);
+    p->pending_cue = cue;
+    pthread_cond_signal(&p->cond);
+    pthread_mutex_unlock(&p->mutex);
+}
+
 bool ds_voice_player_play_wav(DSVoicePlayer *p, const char *wav_path) {
     if (!p || !wav_path || !wav_path[0]) return false;
     FILE *f = fopen(wav_path, "rb");
@@ -327,6 +380,10 @@ bool ds_voice_player_play_wav(DSVoicePlayer *p, const char *wav_path) {
     p->wav_pcm = final_buf;
     p->wav_total_samples = final_samples;
     p->wav_current_sample = 0;
+    p->wav_sample_pos = 0.0;
+    p->wav_loop_start_ms = 0;
+    p->wav_loop_end_ms = 0;
+    ds_evp_filter_init(&p->wav_hpf, DS_VOICE_SAMPLE_RATE);
     p->wav_sample_rate = sample_rate;
     p->wav_playing = true;
     snprintf(p->wav_path, sizeof(p->wav_path), "%s", wav_path);
@@ -341,6 +398,9 @@ void ds_voice_player_stop_wav(DSVoicePlayer *p) {
     pthread_mutex_lock(&p->mutex);
     p->wav_playing = false;
     p->wav_current_sample = 0;
+    p->wav_sample_pos = 0.0;
+    p->wav_loop_start_ms = 0;
+    p->wav_loop_end_ms = 0;
     pthread_mutex_unlock(&p->mutex);
 }
 
@@ -391,8 +451,47 @@ void ds_voice_player_seek_wav_ms(DSVoicePlayer *p, uint64_t position_ms) {
         size_t target_sample = (size_t)(position_ms * (uint64_t)DS_VOICE_SAMPLE_RATE / 1000ULL);
         if (target_sample > p->wav_total_samples) target_sample = p->wav_total_samples;
         p->wav_current_sample = target_sample;
+        p->wav_sample_pos = (double)target_sample;
     }
     pthread_mutex_unlock(&p->mutex);
+}
+
+void ds_voice_player_set_wav_speed(DSVoicePlayer *p, float speed) {
+    if (!p) return;
+    const float clamped = ds_clamp_playback_speed(speed);
+    atomic_store(&p->wav_speed_milli, (uint32_t)lroundf(clamped * 1000.0f));
+}
+
+float ds_voice_player_get_wav_speed(const DSVoicePlayer *p) {
+    if (!p) return 1.0f;
+    const uint32_t milli = atomic_load(&p->wav_speed_milli);
+    return milli > 0U ? (float)milli / 1000.0f : 1.0f;
+}
+
+void ds_voice_player_set_wav_loop(DSVoicePlayer *p, uint64_t start_ms, uint64_t end_ms) {
+    if (!p) return;
+    pthread_mutex_lock(&p->mutex);
+    const uint64_t dur_ms = (p->wav_total_samples > 0U)
+                            ? ((uint64_t)p->wav_total_samples * 1000ULL / DS_VOICE_SAMPLE_RATE)
+                            : 0ULL;
+    ds_clamp_loop_range(dur_ms, &start_ms, &end_ms);
+    p->wav_loop_start_ms = start_ms;
+    p->wav_loop_end_ms = end_ms;
+    pthread_mutex_unlock(&p->mutex);
+}
+
+void ds_voice_player_set_wav_filter(DSVoicePlayer *p, bool enabled) {
+    if (!p) return;
+    atomic_store(&p->wav_filter_enabled, enabled);
+    if (enabled) {
+        pthread_mutex_lock(&p->mutex);
+        ds_evp_filter_init(&p->wav_hpf, DS_VOICE_SAMPLE_RATE);
+        pthread_mutex_unlock(&p->mutex);
+    }
+}
+
+bool ds_voice_player_get_wav_filter(const DSVoicePlayer *p) {
+    return p && atomic_load(&p->wav_filter_enabled);
 }
 
 void ds_voice_player_stop(DSVoicePlayer *p) {

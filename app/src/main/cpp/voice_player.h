@@ -2,6 +2,7 @@
 #define DEADSPEAK_VOICE_PLAYER_H
 
 #include "voice_synth.h"
+#include "evp_ops.h"
 #include <stdbool.h>
 
 #ifdef __cplusplus
@@ -22,6 +23,9 @@ void ds_voice_player_set_geiger_rate(DSVoicePlayer *p, float clicks_per_sec);
 void ds_voice_player_set_geiger_enabled(DSVoicePlayer *p, bool enabled);
 bool ds_voice_player_get_geiger_enabled(const DSVoicePlayer *p);
 
+/* Play a pure synthesized hardware feedback cue/chime (non-blocking). */
+void ds_voice_player_play_cue(DSVoicePlayer *p, DSCueType cue);
+
 /* Play an EVP WAV file from disk. Non-blocking. */
 bool ds_voice_player_play_wav(DSVoicePlayer *p, const char *wav_path);
 void ds_voice_player_stop_wav(DSVoicePlayer *p);
@@ -29,6 +33,11 @@ bool ds_voice_player_is_playing_wav(const DSVoicePlayer *p, char *out_name, size
 uint64_t ds_voice_player_get_wav_position_ms(const DSVoicePlayer *p);
 uint64_t ds_voice_player_get_wav_duration_ms(const DSVoicePlayer *p);
 void ds_voice_player_seek_wav_ms(DSVoicePlayer *p, uint64_t position_ms);
+void ds_voice_player_set_wav_speed(DSVoicePlayer *p, float speed);
+float ds_voice_player_get_wav_speed(const DSVoicePlayer *p);
+void ds_voice_player_set_wav_loop(DSVoicePlayer *p, uint64_t start_ms, uint64_t end_ms);
+void ds_voice_player_set_wav_filter(DSVoicePlayer *p, bool enabled);
+bool ds_voice_player_get_wav_filter(const DSVoicePlayer *p);
 
 /* Stop any currently playing audio immediately. */
 void ds_voice_player_stop(DSVoicePlayer *p);

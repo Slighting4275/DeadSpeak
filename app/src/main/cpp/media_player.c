@@ -1,6 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "media_player.h"
 #include "preview_frame.h"
+#include "evp_ops.h"
+#include <math.h>
 #include <aaudio/AAudio.h>
 #include <android/log.h>
 #include <fcntl.h>
@@ -39,6 +41,9 @@ struct DSMediaPlayer {
     uint64_t position_ms;
     uint64_t duration_ms;
     int rotation;
+    _Atomic uint32_t speed_milli;
+    uint64_t loop_start_ms;
+    uint64_t loop_end_ms;
 
     uint8_t *frame_rgba;
     uint8_t *scratch_rgba;
@@ -231,15 +236,24 @@ static void play_file_session(DSMediaPlayer *mp, const char *path) {
     int64_t anchor_wall_ns = mp_clock_ns();
     int64_t anchor_media_us = 0;
     bool anchor_set = false;
+    float last_spd = ds_media_player_get_speed(mp);
+    int16_t resampled_pcm[8192];
     const bool bt709 = (vw >= 1280 || vh >= 720);
 
     while (atomic_load(&mp->running)) {
+        const float cur_spd = ds_media_player_get_speed(mp);
         pthread_mutex_lock(&mp->mutex);
         const bool want_stop = mp->stop_requested || mp->open_requested;
         const bool paused = mp->paused;
-        const bool want_seek = mp->seek_requested;
-        const uint64_t seek_ms = ds_media_clamp_seek_ms(mp->seek_target_ms, mp->duration_ms);
+        bool want_seek = mp->seek_requested;
+        uint64_t seek_ms = ds_media_clamp_seek_ms(mp->seek_target_ms, mp->duration_ms);
         mp->seek_requested = false;
+        uint64_t lstart = mp->loop_start_ms, lend = mp->loop_end_ms;
+        ds_clamp_loop_range(mp->duration_ms, &lstart, &lend);
+        if (!want_seek && !paused && lend > lstart && mp->position_ms >= lend) {
+            want_seek = true;
+            seek_ms = lstart;
+        }
         pthread_mutex_unlock(&mp->mutex);
 
         if (want_stop) break;
@@ -330,7 +344,30 @@ static void play_file_session(DSMediaPlayer *mp, const char *path) {
                         const size_t frame_bytes = sizeof(int16_t) * (size_t)(ch > 0 ? ch : 1);
                         const int32_t frames = frame_bytes > 0 ? (int32_t)((size_t)ainfo.size / frame_bytes) : 0;
                         if (frames > 0) {
-                            (void)AAudioStream_write(astream, abuf + ainfo.offset, frames, 20000000LL);
+                            if (fabsf(cur_spd - 1.0f) < 0.02f) {
+                                (void)AAudioStream_write(astream, abuf + ainfo.offset, frames, 20000000LL);
+                            } else {
+                                const int16_t *src_pcm = (const int16_t *)(abuf + ainfo.offset);
+                                const size_t c = (size_t)(ch > 0 ? ch : 1);
+                                size_t out_frames = (size_t)lroundf((float)frames / cur_spd);
+                                if (out_frames > 0U) {
+                                    if (out_frames * c > sizeof(resampled_pcm) / sizeof(resampled_pcm[0])) {
+                                        out_frames = (sizeof(resampled_pcm) / sizeof(resampled_pcm[0])) / c;
+                                    }
+                                    for (size_t of = 0; of < out_frames; ++of) {
+                                        const float sf = (float)of * cur_spd;
+                                        const size_t i0 = (size_t)sf < (size_t)frames ? (size_t)sf : (size_t)frames - 1U;
+                                        const size_t i1 = i0 + 1U < (size_t)frames ? i0 + 1U : i0;
+                                        const float frac = sf - (float)i0;
+                                        for (size_t ch_i = 0; ch_i < c; ++ch_i) {
+                                            const float s0 = (float)src_pcm[i0 * c + ch_i];
+                                            const float s1 = (float)src_pcm[i1 * c + ch_i];
+                                            resampled_pcm[of * c + ch_i] = (int16_t)(s0 + (s1 - s0) * frac);
+                                        }
+                                    }
+                                    (void)AAudioStream_write(astream, resampled_pcm, (int32_t)out_frames, 20000000LL);
+                                }
+                            }
                         }
                     }
                 }
@@ -351,13 +388,15 @@ static void play_file_session(DSMediaPlayer *mp, const char *path) {
                     const int64_t pts_us = vinfo.presentationTimeUs >= 0 ? vinfo.presentationTimeUs : 0;
                     if (!paused && !seek_preview_pending) {
                         const int64_t now_ns = mp_clock_ns();
-                        if (!anchor_set) {
+                        if (!anchor_set || fabsf(cur_spd - last_spd) >= 0.01f) {
                             anchor_media_us = pts_us;
                             anchor_wall_ns = now_ns;
                             anchor_set = true;
+                            last_spd = cur_spd;
                         }
-                        const int64_t wait_ns = anchor_wall_ns + (pts_us - anchor_media_us) * 1000LL - now_ns;
-                        if (wait_ns > INT64_C(2000000) && wait_ns < INT64_C(250000000)) {
+                        const int64_t scaled_us = (int64_t)((double)(pts_us - anchor_media_us) / (double)cur_spd);
+                        const int64_t wait_ns = anchor_wall_ns + scaled_us * 1000LL - now_ns;
+                        if (wait_ns > INT64_C(2000000) && wait_ns < INT64_C(400000000)) {
                             nanosleep(&(struct timespec){.tv_sec = 0, .tv_nsec = (long)wait_ns}, NULL);
                         }
                     }
@@ -425,6 +464,7 @@ DSMediaPlayer *ds_media_player_create(void) {
     pthread_mutex_init(&mp->mutex, NULL);
     pthread_cond_init(&mp->cond, NULL);
     atomic_store(&mp->running, true);
+    atomic_store(&mp->speed_milli, 1000U);
     if (pthread_create(&mp->thread, NULL, media_player_thread, mp) != 0) {
         atomic_store(&mp->running, false);
         pthread_cond_destroy(&mp->cond);
@@ -461,6 +501,8 @@ bool ds_media_player_open(DSMediaPlayer *mp, const char *mp4_path) {
     mp->open_requested = true;
     mp->stop_requested = false;
     mp->playing = true;
+    mp->loop_start_ms = 0;
+    mp->loop_end_ms = 0;
     mp->frame_width = mp->frame_height = 0;
     pthread_cond_broadcast(&mp->cond);
     pthread_mutex_unlock(&mp->mutex);
@@ -502,6 +544,27 @@ bool ds_media_player_is_paused(const DSMediaPlayer *mp) {
     const bool p = m->paused;
     pthread_mutex_unlock(&m->mutex);
     return p;
+}
+
+void ds_media_player_set_speed(DSMediaPlayer *mp, float speed) {
+    if (!mp) return;
+    const float clamped = ds_clamp_playback_speed(speed);
+    atomic_store(&mp->speed_milli, (uint32_t)lroundf(clamped * 1000.0f));
+}
+
+float ds_media_player_get_speed(const DSMediaPlayer *mp) {
+    if (!mp) return 1.0f;
+    const uint32_t milli = atomic_load(&mp->speed_milli);
+    return milli > 0U ? (float)milli / 1000.0f : 1.0f;
+}
+
+void ds_media_player_set_loop(DSMediaPlayer *mp, uint64_t start_ms, uint64_t end_ms) {
+    if (!mp) return;
+    pthread_mutex_lock(&mp->mutex);
+    ds_clamp_loop_range(mp->duration_ms, &start_ms, &end_ms);
+    mp->loop_start_ms = start_ms;
+    mp->loop_end_ms = end_ms;
+    pthread_mutex_unlock(&mp->mutex);
 }
 
 bool ds_media_player_is_playing(const DSMediaPlayer *mp, char *out_name, size_t max_name, float *out_progress) {

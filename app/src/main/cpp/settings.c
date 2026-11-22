@@ -25,6 +25,11 @@ DSSettings ds_settings_defaults(void) {
         .camera_front = false,
         .anomaly_fx = true,
         .zoom = 1.0f,
+        .timer_seconds = 0,
+        .emf_alerts = true,
+        .hpf_enabled = false,
+        .mute_on_vox = true,
+        .audio_shader = true,
     };
 }
 
@@ -56,6 +61,10 @@ void ds_settings_clamp(DSSettings *s) {
     if (!isfinite(s->zoom)) s->zoom = 1.0f;
     else if (s->zoom < 1.0f) s->zoom = 1.0f;
     else if (s->zoom > 3.0f) s->zoom = 3.0f;
+
+    if (s->timer_seconds >= 8U) s->timer_seconds = 10U;
+    else if (s->timer_seconds >= 3U) s->timer_seconds = 5U;
+    else s->timer_seconds = 0U;
 }
 
 bool ds_settings_save(const char *path, const DSSettings *s) {
@@ -95,13 +104,21 @@ bool ds_settings_save(const char *path, const DSSettings *s) {
         "hud_tint_step=%u\n"
         "camera_front=%d\n"
         "anomaly_fx=%d\n"
-        "zoom=%.2f\n",
+        "zoom=%.2f\n"
+        "timer_seconds=%u\n"
+        "emf_alerts=%d\n"
+        "hpf_enabled=%d\n"
+        "mute_on_vox=%d\n"
+        "audio_shader=%d\n",
         (int)clean.voice_mode, clean.voice_pitch_hz, clean.voice_speed,
         clean.voice_enabled ? 1 : 0, clean.geiger_enabled ? 1 : 0,
         (int)clean.video_filter, (int)clean.video_aspect,
         clean.hud_burn_in ? 1 : 0, (int)clean.sensitivity,
         (unsigned)clean.theme_mode, (unsigned)clean.hud_tint_step,
-        clean.camera_front ? 1 : 0, clean.anomaly_fx ? 1 : 0, clean.zoom);
+        clean.camera_front ? 1 : 0, clean.anomaly_fx ? 1 : 0, clean.zoom,
+        (unsigned)clean.timer_seconds, clean.emf_alerts ? 1 : 0,
+        clean.hpf_enabled ? 1 : 0, clean.mute_on_vox ? 1 : 0,
+        clean.audio_shader ? 1 : 0);
 
     const bool ok = wrote > 0 && fflush(f) == 0 && fsync(fileno(f)) == 0;
     if (fclose(f) != 0 || !ok) {
@@ -162,6 +179,13 @@ bool ds_settings_load(const char *path, DSSettings *out) {
         else if (strcmp(line, "camera_front") == 0) out->camera_front = strtol(val, NULL, 10) != 0;
         else if (strcmp(line, "anomaly_fx") == 0) out->anomaly_fx = strtol(val, NULL, 10) != 0;
         else if (strcmp(line, "zoom") == 0) out->zoom = strtof(val, NULL);
+        else if (strcmp(line, "timer_seconds") == 0) {
+            const unsigned long v = strtoul(val, NULL, 10);
+            out->timer_seconds = (uint8_t)(v > 255UL ? 255UL : v);
+        } else if (strcmp(line, "emf_alerts") == 0) out->emf_alerts = strtol(val, NULL, 10) != 0;
+        else if (strcmp(line, "hpf_enabled") == 0) out->hpf_enabled = strtol(val, NULL, 10) != 0;
+        else if (strcmp(line, "mute_on_vox") == 0) out->mute_on_vox = strtol(val, NULL, 10) != 0;
+        else if (strcmp(line, "audio_shader") == 0) out->audio_shader = strtol(val, NULL, 10) != 0;
     }
     fclose(f);
     ds_settings_clamp(out);

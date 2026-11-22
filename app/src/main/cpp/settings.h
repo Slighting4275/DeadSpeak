@@ -23,6 +23,11 @@ typedef struct {
     bool camera_front;
     bool anomaly_fx;
     float zoom;
+    uint8_t timer_seconds;
+    bool emf_alerts;
+    bool hpf_enabled;
+    bool mute_on_vox;
+    bool audio_shader;
 } DSSettings;
 
 /* Returns initialized default settings matching DeadSpeak's baseline behavior. */

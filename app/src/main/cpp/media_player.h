@@ -27,6 +27,9 @@ void ds_media_player_stop(DSMediaPlayer *mp);
 void ds_media_player_seek_ms(DSMediaPlayer *mp, uint64_t position_ms);
 void ds_media_player_set_paused(DSMediaPlayer *mp, bool paused);
 bool ds_media_player_is_paused(const DSMediaPlayer *mp);
+void ds_media_player_set_speed(DSMediaPlayer *mp, float speed);
+float ds_media_player_get_speed(const DSMediaPlayer *mp);
+void ds_media_player_set_loop(DSMediaPlayer *mp, uint64_t start_ms, uint64_t end_ms);
 
 bool ds_media_player_is_playing(const DSMediaPlayer *mp, char *out_name, size_t max_name, float *out_progress);
 uint64_t ds_media_player_get_position_ms(const DSMediaPlayer *mp);

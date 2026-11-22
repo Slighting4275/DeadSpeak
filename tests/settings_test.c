@@ -82,6 +82,11 @@ int main(void) {
     custom.camera_front = true;
     custom.anomaly_fx = false;
     custom.zoom = 2.0f;
+    custom.timer_seconds = 10;
+    custom.emf_alerts = false;
+    custom.hpf_enabled = true;
+    custom.mute_on_vox = false;
+    custom.audio_shader = false;
 
     assert(ds_settings_save(path, &custom));
 
@@ -101,6 +106,11 @@ int main(void) {
     assert(loaded.camera_front == true);
     assert(loaded.anomaly_fx == false);
     assert(fabsf(loaded.zoom - 2.0f) < 0.01f);
+    assert(loaded.timer_seconds == 10);
+    assert(loaded.emf_alerts == false);
+    assert(loaded.hpf_enabled == true);
+    assert(loaded.mute_on_vox == false);
+    assert(loaded.audio_shader == false);
 
     /* 4. Out-of-range uint8 parsing does not wrap modulo 256 */
     const char *overflow_path = "build/host/settings_test_overflow.tmp";

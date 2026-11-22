@@ -31,6 +31,11 @@ int main(void) {
     ds_media_player_set_paused(mp, false);
     assert(!ds_media_player_is_paused(mp));
     ds_media_player_seek_ms(mp, 500);
+    ds_media_player_set_speed(mp, 0.5f);
+    assert(fabsf(ds_media_player_get_speed(mp) - 0.5f) < 0.01f);
+    ds_media_player_set_speed(mp, 9.0f);
+    assert(fabsf(ds_media_player_get_speed(mp) - 2.0f) < 0.01f);
+    ds_media_player_set_loop(mp, 100ULL, 300ULL);
 
     uint8_t dummy[64];
     int w = 0, h = 0;
