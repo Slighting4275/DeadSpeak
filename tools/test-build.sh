@@ -30,7 +30,7 @@ zig cc -std=c23 -O1 -Wall -Wextra -Werror tests/motion_filter_test.c \
     -lm -o build/host/motion-filter-test || exit 1
 build/host/motion-filter-test || exit 1
 zig cc -std=c23 -O1 -Wall -Wextra -Werror tests/typography_test.c \
-    -lm -o build/host/typography-test || exit 1
+    app/src/main/cpp/font_atlas.c -lm -o build/host/typography-test || exit 1
 build/host/typography-test || exit 1
 zig cc -std=c23 -O1 -Wall -Wextra -Werror tests/settings_test.c \
     app/src/main/cpp/settings.c -lm -o build/host/settings-test || exit 1

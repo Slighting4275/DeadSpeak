@@ -155,7 +155,7 @@ static inline DSFilterHUD ds_filter_hud(float width, float height, uint64_t dead
     DSFilterHUD hud = {0};
     if (deadline_ms <= now_ms) return hud;
     const uint64_t remaining = deadline_ms - now_ms;
-    constexpr uint64_t FADE_DURATION_MS = 300U;
+    static const uint64_t FADE_DURATION_MS = 300U;
     hud.visible = true;
     hud.alpha = remaining > FADE_DURATION_MS ? 1.0f : ((float)remaining / (float)FADE_DURATION_MS);
     const float card_w = fminf(200.0f, width - 40.0f);

@@ -104,23 +104,23 @@ while i < n:
     rle.extend([run, b])
     i += run
 
-output_path = os.path.join(os.path.dirname(__file__), "../app/src/main/cpp/font_atlas.h")
-output_path = os.path.abspath(output_path)
+header_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../app/src/main/cpp/font_atlas.h"))
+source_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../app/src/main/cpp/font_atlas.c"))
 
-with open(output_path, "w", encoding="utf-8") as out:
+with open(header_path, "w", encoding="utf-8") as out:
     out.write("/* DeadSpeak Native Anti-Aliased Font Atlas (Auto-generated) */\n")
     out.write("#pragma once\n\n")
-    out.write("#include <stdint.h>\n")
     out.write("#include <stddef.h>\n")
-    out.write("#include <string.h>\n\n")
-    out.write(f"constexpr size_t DS_FONT_ATLAS_WIDTH = {atlas_w};\n")
-    out.write(f"constexpr size_t DS_FONT_ATLAS_HEIGHT = {atlas_h};\n")
-    out.write(f"constexpr size_t DS_FONT_ATLAS_RAW_SIZE = {len(raw)};\n")
-    out.write(f"constexpr size_t DS_FONT_ATLAS_RLE_SIZE = {len(rle)};\n")
-    out.write(f"constexpr float DS_FONT_CAP_HEIGHT = {cap_height:.1f}f;\n")
-    out.write("constexpr size_t DS_FONT_FIRST_CHAR = 32;\n")
-    out.write("constexpr size_t DS_FONT_NUM_CHARS = 95;\n\n")
-
+    out.write("#include <stdint.h>\n\n")
+    out.write("enum {\n")
+    out.write(f"    DS_FONT_ATLAS_WIDTH = {atlas_w},\n")
+    out.write(f"    DS_FONT_ATLAS_HEIGHT = {atlas_h},\n")
+    out.write(f"    DS_FONT_ATLAS_RAW_SIZE = {len(raw)},\n")
+    out.write(f"    DS_FONT_ATLAS_RLE_SIZE = {len(rle)},\n")
+    out.write("    DS_FONT_FIRST_CHAR = 32,\n")
+    out.write("    DS_FONT_NUM_CHARS = 95,\n")
+    out.write("};\n\n")
+    out.write(f"#define DS_FONT_CAP_HEIGHT {cap_height:.1f}f\n\n")
     out.write("typedef struct {\n")
     out.write("    uint16_t x;\n")
     out.write("    uint16_t y;\n")
@@ -130,8 +130,15 @@ with open(output_path, "w", encoding="utf-8") as out:
     out.write("    int8_t   oy;\n")
     out.write("    float    adv;\n")
     out.write("} DSFontGlyph;\n\n")
+    out.write("extern const DSFontGlyph ds_font_glyphs[2][DS_FONT_NUM_CHARS];\n\n")
+    out.write("void ds_font_unpack_atlas(uint8_t *dest, size_t dest_size);\n")
 
-    out.write("static const DSFontGlyph ds_font_glyphs[2][DS_FONT_NUM_CHARS] = {\n")
+with open(source_path, "w", encoding="utf-8") as out:
+    out.write("/* DeadSpeak Native Anti-Aliased Font Atlas Data (Auto-generated) */\n")
+    out.write("#include \"font_atlas.h\"\n\n")
+    out.write("#include <string.h>\n\n")
+
+    out.write("const DSFontGlyph ds_font_glyphs[2][DS_FONT_NUM_CHARS] = {\n")
     for sidx, (sname, metrics) in enumerate(glyph_metrics):
         out.write(f"    /* Style {sidx}: {sname} */\n    {{\n")
         for code, gx, gy, gw, gh, ox, oy, adv in metrics:
@@ -147,7 +154,7 @@ with open(output_path, "w", encoding="utf-8") as out:
         out.write(f"    {hex_str},\n")
     out.write("};\n\n")
 
-    out.write("static inline void ds_font_unpack_atlas(uint8_t *dest, size_t dest_size) {\n")
+    out.write("void ds_font_unpack_atlas(uint8_t *dest, size_t dest_size) {\n")
     out.write("    if (dest == nullptr || dest_size < DS_FONT_ATLAS_RAW_SIZE) return;\n")
     out.write("    size_t out_idx = 0;\n")
     out.write("    for (size_t in_idx = 0; in_idx + 1 < DS_FONT_ATLAS_RLE_SIZE && out_idx < dest_size; in_idx += 2) {\n")
@@ -159,4 +166,4 @@ with open(output_path, "w", encoding="utf-8") as out:
     out.write("    }\n")
     out.write("}\n")
 
-print(f"Generated {output_path}: {len(rle)} RLE bytes, {len(glyph_metrics[0][1]) * 2} glyph metrics.")
+print(f"Generated {header_path} and {source_path}: {len(rle)} RLE bytes, {len(glyph_metrics[0][1]) * 2} glyph metrics.")

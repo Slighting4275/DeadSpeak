@@ -14,20 +14,22 @@ typedef enum : uint8_t {
     DS_FONT_CONDENSED = 3,   /* Compact condensed for long words */
 } DSFontType;
 
-/* Standard typographic hierarchy (sp units) defined as C23 constexpr */
-[[maybe_unused]] static constexpr float DS_FONT_SIZE_DISPLAY_XL = 48.0f; /* Hero announcer: 48sp */
-[[maybe_unused]] static constexpr float DS_FONT_SIZE_DISPLAY_LG = 34.0f; /* Primary triggered word: 34sp */
-[[maybe_unused]] static constexpr float DS_FONT_SIZE_TITLE_LG   = 24.0f; /* Screen title / card header: 24sp */
-[[maybe_unused]] static constexpr float DS_FONT_SIZE_TITLE_MD   = 20.0f; /* Section title / modal title: 20sp */
-[[maybe_unused]] static constexpr float DS_FONT_SIZE_BODY_LG    = 16.0f; /* Subtitle / prominent button: 16sp */
-[[maybe_unused]] static constexpr float DS_FONT_SIZE_BODY_MD    = 14.0f; /* Standard button / navigation: 14sp */
-[[maybe_unused]] static constexpr float DS_FONT_SIZE_CAPTION    = 12.0f; /* Caption / sensor status label: 12sp */
-[[maybe_unused]] static constexpr float DS_FONT_SIZE_BADGE      = 10.0f; /* Badge / meter marker: 10sp */
-[[maybe_unused]] static constexpr float DS_FONT_SIZE_MICRO       = 8.0f; /* Micro indicator / sub-metric: 8sp */
+/* Standard typographic hierarchy (sp units) */
+[[maybe_unused]] static const float DS_FONT_SIZE_DISPLAY_XL = 48.0f; /* Hero announcer: 48sp */
+[[maybe_unused]] static const float DS_FONT_SIZE_DISPLAY_LG = 34.0f; /* Primary triggered word: 34sp */
+[[maybe_unused]] static const float DS_FONT_SIZE_TITLE_LG   = 24.0f; /* Screen title / card header: 24sp */
+[[maybe_unused]] static const float DS_FONT_SIZE_TITLE_MD   = 20.0f; /* Section title / modal title: 20sp */
+[[maybe_unused]] static const float DS_FONT_SIZE_BODY_LG    = 16.0f; /* Subtitle / prominent button: 16sp */
+[[maybe_unused]] static const float DS_FONT_SIZE_BODY_MD    = 14.0f; /* Standard button / navigation: 14sp */
+[[maybe_unused]] static const float DS_FONT_SIZE_CAPTION    = 12.0f; /* Caption / sensor status label: 12sp */
+[[maybe_unused]] static const float DS_FONT_SIZE_BADGE      = 10.0f; /* Badge / meter marker: 10sp */
+[[maybe_unused]] static const float DS_FONT_SIZE_MICRO       = 8.0f; /* Micro indicator / sub-metric: 8sp */
 
-[[maybe_unused]] static constexpr size_t DS_FONT_GLYPH_COUNT = 60;
-[[maybe_unused]] static constexpr size_t DS_FONT_GLYPH_ROWS = 7;
-[[maybe_unused]] static constexpr size_t DS_FONT_GLYPH_COLS = 5;
+enum {
+    DS_FONT_GLYPH_COUNT = 60,
+    DS_FONT_GLYPH_ROWS  = 7,
+    DS_FONT_GLYPH_COLS  = 5,
+};
 
 /* Convert sp font size to DeadSpeak native coordinate scale */
 [[nodiscard]] static inline float ds_sp_to_scale(float sp) {
