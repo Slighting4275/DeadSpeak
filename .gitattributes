@@ -1,1 +1,2 @@
 *.h linguist-language=C
+app/src/main/cpp/font_atlas.h linguist-generated=true
