@@ -589,18 +589,18 @@ bool ds_explore_init(DSExplore *explore) {
     return true;
 }
 
-void ds_explore_start(DSExplore *explore, ANativeActivity *activity, const char *cache_path) {
+static void launch_explore_thread(DSExplore *explore, ANativeActivity *activity, const char *cache_path, bool force_refresh) {
     if (!explore->places) return;
     if (explore->thread_created) {
         if (atomic_load(&explore->loading)) return;
         pthread_join(explore->thread, NULL);
         explore->thread_created = false;
     }
-    if (explore->requested_once) return;
+    if (!force_refresh && explore->requested_once) return;
     explore->activity = activity;
     snprintf(explore->cache_path, sizeof(explore->cache_path), "%s", cache_path);
     explore->requested_once = true;
-    explore->force_refresh = false;
+    explore->force_refresh = force_refresh;
     atomic_store(&explore->failed, false);
     atomic_store(&explore->loading, true);
     if (pthread_create(&explore->thread, NULL, explore_thread, explore) != 0) {
@@ -611,25 +611,12 @@ void ds_explore_start(DSExplore *explore, ANativeActivity *activity, const char 
     explore->thread_created = true;
 }
 
+void ds_explore_start(DSExplore *explore, ANativeActivity *activity, const char *cache_path) {
+    launch_explore_thread(explore, activity, cache_path, false);
+}
+
 void ds_explore_refresh(DSExplore *explore, ANativeActivity *activity, const char *cache_path) {
-    if (!explore->places) return;
-    if (explore->thread_created) {
-        if (atomic_load(&explore->loading)) return;
-        pthread_join(explore->thread, NULL);
-        explore->thread_created = false;
-    }
-    explore->activity = activity;
-    snprintf(explore->cache_path, sizeof(explore->cache_path), "%s", cache_path);
-    explore->requested_once = true;
-    explore->force_refresh = true;
-    atomic_store(&explore->failed, false);
-    atomic_store(&explore->loading, true);
-    if (pthread_create(&explore->thread, NULL, explore_thread, explore) != 0) {
-        atomic_store(&explore->loading, false);
-        atomic_store(&explore->failed, true);
-        return;
-    }
-    explore->thread_created = true;
+    launch_explore_thread(explore, activity, cache_path, true);
 }
 
 void ds_explore_stop(DSExplore *explore) {

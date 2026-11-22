@@ -161,10 +161,13 @@ static void create_identity(void) {
         !X509_gmtime_adj(X509_getm_notBefore(cert), -86400) ||
         !X509_gmtime_adj(X509_getm_notAfter(cert), 30L * 365 * 86400) || X509_set_pubkey(cert, key) != 1)
         fail("creating signing certificate failed");
-    X509_NAME *name = X509_get_subject_name(cert);
-    if (X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char *)"DeadSpeak local build", -1, -1, 0) != 1 ||
-        X509_set_issuer_name(cert, name) != 1 || X509_sign(cert, key, EVP_sha256()) <= 0)
+    X509_NAME *name = X509_NAME_new();
+    if (!name || X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, (const unsigned char *)"DeadSpeak local build", -1, -1, 0) != 1 ||
+        X509_set_subject_name(cert, name) != 1 || X509_set_issuer_name(cert, name) != 1 || X509_sign(cert, key, EVP_sha256()) <= 0) {
+        X509_NAME_free(name);
         fail("signing certificate failed");
+    }
+    X509_NAME_free(name);
     save_identity(key, cert);
     EVP_PKEY_free(key);
     X509_free(cert);
@@ -356,9 +359,9 @@ int main(int argc, char **argv) {
     RUN(aapt, "link", "-x", "--allow-reserved-package-id", "--no-compile-sdk-metadata", "--manifest", "tools/platform/AndroidManifest.xml",
         "--min-sdk-version", DS_MIN_API, "--target-sdk-version", "37", "-o", "build/native-platform/framework-res.apk",
         "build/native-platform/public-resources.zip");
-    RUN("zig", "cc", "-std=c23", "-O2", "-Wall", "-Wextra", "-Werror", "-fPIE", "-pie", "-fstack-protector-strong", "tools/make_words.c", "-o", "build/host/make-words");
+    RUN("zig", "cc", "-std=c23", "-O2", "-Wall", "-Wextra", "-Werror", "-fPIE", "-pie", "-fstack-protector-strong", "-Wl,-z,relro,-z,now", "tools/make_words.c", "-o", "build/host/make-words");
     RUN("build/host/make-words");
-    RUN("zig", "cc", "-std=c23", "-O2", "-Wall", "-Wextra", "-Werror", "-fPIE", "-pie", "-fstack-protector-strong", "tools/apk_sign.c", "-lcrypto", "-o", "build/host/apk-sign");
+    RUN("zig", "cc", "-std=c23", "-O2", "-Wall", "-Wextra", "-Werror", "-fPIE", "-pie", "-fstack-protector-strong", "-Wl,-z,relro,-z,now", "tools/apk_sign.c", "-lcrypto", "-o", "build/host/apk-sign");
     for (size_t i = 0; i < abi_count; ++i) {
         char output[PATH_MAX], toolchain[PATH_MAX], abi[PATH_MAX], android_ndk[PATH_MAX], library[PATH_MAX];
         path(output, "build/native/%s", abis[i]);

@@ -61,28 +61,28 @@ int main(void) {
 
     /* 7. Verify font advances across styles */
     constexpr float scale = 2.0f;
-    const auto adv_std = ds_text_char_advance('A', scale, DS_FONT_STANDARD);
-    const auto adv_bold = ds_text_char_advance('A', scale, DS_FONT_BOLD);
-    const auto adv_cond = ds_text_char_advance('A', scale, DS_FONT_CONDENSED);
-    const auto adv_mono = ds_text_char_advance('A', scale, DS_FONT_MONO);
+    const float adv_std = ds_text_char_advance('A', scale, DS_FONT_STANDARD);
+    const float adv_bold = ds_text_char_advance('A', scale, DS_FONT_BOLD);
+    const float adv_cond = ds_text_char_advance('A', scale, DS_FONT_CONDENSED);
+    const float adv_mono = ds_text_char_advance('A', scale, DS_FONT_MONO);
     check(adv_std > 0.0f, "standard advance positive");
     check(adv_bold > adv_std, "bold advance > standard advance");
     check(adv_cond < adv_std, "condensed advance < standard advance");
     check(adv_mono > 0.0f, "mono advance positive");
 
     /* 8. Verify monospace and proportional properties */
-    const auto adv_digit_0 = ds_text_char_advance('0', scale, DS_FONT_MONO);
-    const auto adv_digit_9 = ds_text_char_advance('9', scale, DS_FONT_MONO);
+    const float adv_digit_0 = ds_text_char_advance('0', scale, DS_FONT_MONO);
+    const float adv_digit_9 = ds_text_char_advance('9', scale, DS_FONT_MONO);
     check(fabsf(adv_digit_0 - adv_digit_9) < 1e-4f, "mono digits have identical advance");
 
-    const auto adv_W = ds_text_char_advance('W', scale, DS_FONT_STANDARD);
-    const auto adv_I = ds_text_char_advance('I', scale, DS_FONT_STANDARD);
+    const float adv_W = ds_text_char_advance('W', scale, DS_FONT_STANDARD);
+    const float adv_I = ds_text_char_advance('I', scale, DS_FONT_STANDARD);
     check(adv_W > adv_I, "proportional W > I advance");
 
     /* 9. Verify text width calculation */
     const char *sample = "DEADSPEAK";
-    const auto width_std = ds_text_width(sample, 1.0f, DS_FONT_STANDARD);
-    const auto width_cond = ds_text_width(sample, 1.0f, DS_FONT_CONDENSED);
+    const float width_std = ds_text_width(sample, 1.0f, DS_FONT_STANDARD);
+    const float width_cond = ds_text_width(sample, 1.0f, DS_FONT_CONDENSED);
     check(width_std > 0.0f, "standard width positive");
     check(width_cond < width_std, "condensed width < standard width");
     check(fabsf(ds_text_width(nullptr, 1.0f, DS_FONT_STANDARD)) < 1e-4f, "nullptr string width");

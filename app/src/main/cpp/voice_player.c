@@ -45,12 +45,7 @@ static inline float geiger_impulse(uint32_t sample_in_click) {
     return 14000.0f * decay * osc;
 }
 
-static void *voice_player_thread(void *arg) {
-    DSVoicePlayer *p = (DSVoicePlayer *)arg;
-    int16_t *speech_pcm = malloc(DS_VOICE_MAX_SAMPLES * sizeof(int16_t));
-    int16_t chunk_pcm[DS_CHUNK_SAMPLES];
-    if (!speech_pcm) return NULL;
-
+static void open_output_stream(DSVoicePlayer *p) {
     AAudioStreamBuilder *builder = NULL;
     if (AAudio_createStreamBuilder(&builder) == AAUDIO_OK && builder) {
         AAudioStreamBuilder_setDirection(builder, AAUDIO_DIRECTION_OUTPUT);
@@ -63,6 +58,15 @@ static void *voice_player_thread(void *arg) {
         }
         AAudioStreamBuilder_delete(builder);
     }
+}
+
+static void *voice_player_thread(void *arg) {
+    DSVoicePlayer *p = (DSVoicePlayer *)arg;
+    int16_t *speech_pcm = malloc(DS_VOICE_MAX_SAMPLES * sizeof(int16_t));
+    int16_t chunk_pcm[DS_CHUNK_SAMPLES];
+    if (!speech_pcm) return NULL;
+
+    open_output_stream(p);
 
     size_t speech_total = 0, speech_pos = 0;
     uint32_t click_phase = 100;
@@ -151,18 +155,7 @@ static void *voice_player_thread(void *arg) {
 
         /* Write chunk to AAudio stream */
         if (!p->stream) {
-            AAudioStreamBuilder *rebuilder = NULL;
-            if (AAudio_createStreamBuilder(&rebuilder) == AAUDIO_OK && rebuilder) {
-                AAudioStreamBuilder_setDirection(rebuilder, AAUDIO_DIRECTION_OUTPUT);
-                AAudioStreamBuilder_setSampleRate(rebuilder, DS_VOICE_SAMPLE_RATE);
-                AAudioStreamBuilder_setChannelCount(rebuilder, 1);
-                AAudioStreamBuilder_setFormat(rebuilder, AAUDIO_FORMAT_PCM_I16);
-                AAudioStreamBuilder_setPerformanceMode(rebuilder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
-                if (AAudioStreamBuilder_openStream(rebuilder, &p->stream) == AAUDIO_OK && p->stream) {
-                    AAudioStream_requestStart(p->stream);
-                }
-                AAudioStreamBuilder_delete(rebuilder);
-            }
+            open_output_stream(p);
         }
         if (p->stream) {
             size_t written = 0;
@@ -350,28 +343,25 @@ bool ds_voice_player_is_playing_wav(const DSVoicePlayer *p, char *out_name, size
     return playing;
 }
 
-uint64_t ds_voice_player_get_wav_position_ms(const DSVoicePlayer *p) {
+static uint64_t wav_samples_to_ms(const DSVoicePlayer *p, bool duration) {
     if (!p) return 0;
     DSVoicePlayer *mutable_p = (DSVoicePlayer *)p;
     pthread_mutex_lock(&mutable_p->mutex);
-    uint64_t pos_ms = 0;
+    uint64_t ms = 0;
     if (mutable_p->wav_total_samples > 0) {
-        pos_ms = (uint64_t)mutable_p->wav_current_sample * 1000ULL / DS_VOICE_SAMPLE_RATE;
+        const size_t samples = duration ? mutable_p->wav_total_samples : mutable_p->wav_current_sample;
+        ms = (uint64_t)samples * 1000ULL / DS_VOICE_SAMPLE_RATE;
     }
     pthread_mutex_unlock(&mutable_p->mutex);
-    return pos_ms;
+    return ms;
+}
+
+uint64_t ds_voice_player_get_wav_position_ms(const DSVoicePlayer *p) {
+    return wav_samples_to_ms(p, false);
 }
 
 uint64_t ds_voice_player_get_wav_duration_ms(const DSVoicePlayer *p) {
-    if (!p) return 0;
-    DSVoicePlayer *mutable_p = (DSVoicePlayer *)p;
-    pthread_mutex_lock(&mutable_p->mutex);
-    uint64_t dur_ms = 0;
-    if (mutable_p->wav_total_samples > 0) {
-        dur_ms = (uint64_t)mutable_p->wav_total_samples * 1000ULL / DS_VOICE_SAMPLE_RATE;
-    }
-    pthread_mutex_unlock(&mutable_p->mutex);
-    return dur_ms;
+    return wav_samples_to_ms(p, true);
 }
 
 void ds_voice_player_seek_wav_ms(DSVoicePlayer *p, uint64_t position_ms) {

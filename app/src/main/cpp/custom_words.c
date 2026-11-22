@@ -405,7 +405,7 @@ bool ds_custom_words_remove(DSCustomWords *bank, const char *path, size_t index)
 
     DSCustomWords candidate = *bank;
     for (size_t i = index; i + 1 < candidate.count; ++i) {
-        memcpy(candidate.words[i], candidate.words[i + 1], sizeof(candidate.words[i]));
+        memmove(candidate.words[i], candidate.words[i + 1], sizeof(candidate.words[i]));
     }
     memset(candidate.words[candidate.count - 1u], 0, sizeof(candidate.words[0]));
     --candidate.count;

@@ -13,7 +13,8 @@ if (ANDROID_ABI STREQUAL "arm64-v8a")
     set(DS_ZIG_TARGET "aarch64-linux-android.30")
     set(DS_ANDROID_INCLUDE "aarch64-linux-android")
 elseif (ANDROID_ABI STREQUAL "armeabi-v7a")
-    set(DS_ZIG_TARGET "arm-linux-androideabi.30")
+    set(DS_ZIG_TARGET "arm-linux-android.30")
+    set(DS_ZIG_ABI_FLAGS -mfloat-abi=softfp)
     set(DS_ANDROID_INCLUDE "arm-linux-androideabi")
 elseif (ANDROID_ABI STREQUAL "x86_64")
     set(DS_ZIG_TARGET "x86_64-linux-android.30")
@@ -73,136 +74,73 @@ set(DS_CUSTOM_WORDS_OBJECT "${DS_ZIG_OBJECT_DIR}/custom_words.c.o")
 set(DS_VOICE_OBJECT "${DS_ZIG_OBJECT_DIR}/voice_synth.c.o")
 set(DS_VOICE_PLAYER_OBJECT "${DS_ZIG_OBJECT_DIR}/voice_player.c.o")
 
-add_custom_command(
-    OUTPUT "${DS_VOICE_OBJECT}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${DS_ZIG_OBJECT_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E env "${DS_ZIG_ENV}"
-            ${DS_ZIG_EXECUTABLE} cc -target ${DS_ZIG_TARGET}
-            --sysroot=${CMAKE_SYSROOT}
-            -isystem ${CMAKE_SYSROOT}/usr/include
-            -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
-            -I${CMAKE_CURRENT_SOURCE_DIR}
-            -std=c23 -O3 -Wall -Wextra -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections -fstack-protector-strong
-            -DANDROID -c "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.c"
-            -o "${DS_VOICE_OBJECT}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.c" "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.h" "${DS_ZIG_EXECUTABLE}"
-    COMMENT "Compiling formant voice synthesizer with Zig cc (${DS_ZIG_TARGET})"
-    VERBATIM
-)
+function(ds_add_zig_c_object OUTPUT_OBJ SOURCE_FILE COMMENT_TEXT)
+    set(options ALLOW_UNUSED_PARAM)
+    set(multiValueArgs EXTRA_INCLUDES DEPENDS_LIST)
+    cmake_parse_arguments(ARG "${options}" "" "${multiValueArgs}" ${ARGN})
+    set(DS_EXTRA_WARN_FLAGS "")
+    if(ARG_ALLOW_UNUSED_PARAM)
+        list(APPEND DS_EXTRA_WARN_FLAGS -Wno-unused-parameter)
+    endif()
+    set(DS_INCLUDE_FLAGS "-I${CMAKE_CURRENT_SOURCE_DIR}")
+    foreach(inc IN LISTS ARG_EXTRA_INCLUDES)
+        list(APPEND DS_INCLUDE_FLAGS "-I${inc}")
+    endforeach()
+    add_custom_command(
+        OUTPUT "${OUTPUT_OBJ}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${DS_ZIG_OBJECT_DIR}"
+        COMMAND ${CMAKE_COMMAND} -E env "${DS_ZIG_ENV}"
+                ${DS_ZIG_EXECUTABLE} cc
+                -target ${DS_ZIG_TARGET}
+                --sysroot=${CMAKE_SYSROOT}
+                -isystem ${CMAKE_SYSROOT}/usr/include
+                -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
+                ${DS_INCLUDE_FLAGS}
+                -std=c23 -O3 -Wall -Wextra ${DS_EXTRA_WARN_FLAGS} -Werror=deprecated-declarations
+                ${DS_ZIG_ABI_FLAGS}
+                -fPIC -ffunction-sections -fdata-sections -fstack-protector-strong
+                -DANDROID
+                -c "${SOURCE_FILE}"
+                -o "${OUTPUT_OBJ}"
+        DEPENDS "${SOURCE_FILE}" ${ARG_DEPENDS_LIST} "${DS_ZIG_EXECUTABLE}"
+        COMMENT "${COMMENT_TEXT} (${DS_ZIG_TARGET})"
+        VERBATIM
+    )
+endfunction()
 
-add_custom_command(
-    OUTPUT "${DS_VOICE_PLAYER_OBJECT}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${DS_ZIG_OBJECT_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E env "${DS_ZIG_ENV}"
-            ${DS_ZIG_EXECUTABLE} cc -target ${DS_ZIG_TARGET}
-            --sysroot=${CMAKE_SYSROOT}
-            -isystem ${CMAKE_SYSROOT}/usr/include
-            -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
-            -I${CMAKE_CURRENT_SOURCE_DIR}
-            -std=c23 -O3 -Wall -Wextra -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections -fstack-protector-strong
-            -DANDROID -c "${CMAKE_CURRENT_SOURCE_DIR}/voice_player.c"
-            -o "${DS_VOICE_PLAYER_OBJECT}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/voice_player.c" "${CMAKE_CURRENT_SOURCE_DIR}/voice_player.h" "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.h" "${DS_ZIG_EXECUTABLE}"
-    COMMENT "Compiling native audio voice player with Zig cc (${DS_ZIG_TARGET})"
-    VERBATIM
-)
+ds_add_zig_c_object("${DS_VOICE_OBJECT}" "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.c"
+    "Compiling formant voice synthesizer with Zig cc"
+    DEPENDS_LIST "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.h")
 
-add_custom_command(
-    OUTPUT "${DS_CUSTOM_WORDS_OBJECT}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${DS_ZIG_OBJECT_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E env "${DS_ZIG_ENV}"
-            ${DS_ZIG_EXECUTABLE} cc -target ${DS_ZIG_TARGET}
-            --sysroot=${CMAKE_SYSROOT}
-            -isystem ${CMAKE_SYSROOT}/usr/include
-            -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
-            -I${CMAKE_CURRENT_SOURCE_DIR}
-            -std=c23 -O3 -Wall -Wextra -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections -fstack-protector-strong
-            -DANDROID -c "${CMAKE_CURRENT_SOURCE_DIR}/custom_words.c"
-            -o "${DS_CUSTOM_WORDS_OBJECT}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/custom_words.c" "${CMAKE_CURRENT_SOURCE_DIR}/custom_words.h" "${DS_ZIG_EXECUTABLE}"
-    COMMENT "Compiling local custom word bank with Zig cc (${DS_ZIG_TARGET})"
-    VERBATIM
-)
+ds_add_zig_c_object("${DS_VOICE_PLAYER_OBJECT}" "${CMAKE_CURRENT_SOURCE_DIR}/voice_player.c"
+    "Compiling native audio voice player with Zig cc"
+    DEPENDS_LIST "${CMAKE_CURRENT_SOURCE_DIR}/voice_player.h" "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.h")
 
-add_custom_command(
-    OUTPUT "${DS_EXPLORE_OBJECT}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${DS_ZIG_OBJECT_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E env "${DS_ZIG_ENV}"
-            ${DS_ZIG_EXECUTABLE} cc
-            -target ${DS_ZIG_TARGET}
-            --sysroot=${CMAKE_SYSROOT}
-            -isystem ${CMAKE_SYSROOT}/usr/include
-            -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
-            -I${CMAKE_CURRENT_SOURCE_DIR}
-            -std=c23 -O3 -Wall -Wextra -Wno-unused-parameter -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections -fstack-protector-strong
-            -DANDROID
-            -c "${CMAKE_CURRENT_SOURCE_DIR}/explore.c"
-            -o "${DS_EXPLORE_OBJECT}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/explore.c" "${CMAKE_CURRENT_SOURCE_DIR}/explore.h" "${CMAKE_CURRENT_SOURCE_DIR}/jni_scope.h" "${DS_ZIG_EXECUTABLE}"
-    COMMENT "Compiling native Wikipedia Explore client with Zig cc (${DS_ZIG_TARGET})"
-    VERBATIM
-)
+ds_add_zig_c_object("${DS_CUSTOM_WORDS_OBJECT}" "${CMAKE_CURRENT_SOURCE_DIR}/custom_words.c"
+    "Compiling local custom word bank with Zig cc"
+    DEPENDS_LIST "${CMAKE_CURRENT_SOURCE_DIR}/custom_words.h")
 
-add_custom_command(
-    OUTPUT "${DS_VIDEO_OBJECT}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${DS_ZIG_OBJECT_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E env "${DS_ZIG_ENV}"
-            ${DS_ZIG_EXECUTABLE} cc
-            -target ${DS_ZIG_TARGET}
-            --sysroot=${CMAKE_SYSROOT}
-            -isystem ${CMAKE_SYSROOT}/usr/include
-            -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
-            -I${CMAKE_CURRENT_SOURCE_DIR}
-            -std=c23 -O3 -Wall -Wextra -Wno-unused-parameter -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections -fstack-protector-strong
-            -DANDROID
-            -c "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.c"
-            -o "${DS_VIDEO_OBJECT}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.c" "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.h" "${CMAKE_CURRENT_SOURCE_DIR}/preview_frame.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_orientation.h" "${DS_ZIG_EXECUTABLE}"
-    COMMENT "Compiling native Camera2 and MediaCodec capture with Zig cc (${DS_ZIG_TARGET})"
-    VERBATIM
-)
+ds_add_zig_c_object("${DS_EXPLORE_OBJECT}" "${CMAKE_CURRENT_SOURCE_DIR}/explore.c"
+    "Compiling native Wikipedia Explore client with Zig cc"
+    ALLOW_UNUSED_PARAM
+    DEPENDS_LIST "${CMAKE_CURRENT_SOURCE_DIR}/explore.h" "${CMAKE_CURRENT_SOURCE_DIR}/jni_scope.h")
 
-add_custom_command(
-    OUTPUT "${DS_MAIN_OBJECT}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${DS_ZIG_OBJECT_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E env "${DS_ZIG_ENV}"
-            ${DS_ZIG_EXECUTABLE} cc
-            -target ${DS_ZIG_TARGET}
-            --sysroot=${CMAKE_SYSROOT}
-            -isystem ${CMAKE_SYSROOT}/usr/include
-            -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
-            -I${CMAKE_CURRENT_SOURCE_DIR}
-            -I${ANDROID_NDK}/sources/android/native_app_glue
-            -std=c23 -O3 -Wall -Wextra -Wno-unused-parameter -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections -fstack-protector-strong
-            -DANDROID
-            -c "${CMAKE_CURRENT_SOURCE_DIR}/main.c"
-            -o "${DS_MAIN_OBJECT}"
-    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/main.c" "${CMAKE_CURRENT_SOURCE_DIR}/typography.h" "${CMAKE_CURRENT_SOURCE_DIR}/voice_player.h" "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.h" "${CMAKE_CURRENT_SOURCE_DIR}/motion_filter.h" "${CMAKE_CURRENT_SOURCE_DIR}/field_baseline.h" "${CMAKE_CURRENT_SOURCE_DIR}/camera_ui.h" "${CMAKE_CURRENT_SOURCE_DIR}/custom_words.h" "${CMAKE_CURRENT_SOURCE_DIR}/sensor_state.h" "${CMAKE_CURRENT_SOURCE_DIR}/engine.h" "${CMAKE_CURRENT_SOURCE_DIR}/explore.h" "${CMAKE_CURRENT_SOURCE_DIR}/jni_scope.h" "${CMAKE_CURRENT_SOURCE_DIR}/ui_layout.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.h" "${DS_ZIG_EXECUTABLE}"
-    COMMENT "Compiling DeadSpeak C platform layer with Zig cc (${DS_ZIG_TARGET})"
-    VERBATIM
-)
+ds_add_zig_c_object("${DS_VIDEO_OBJECT}" "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.c"
+    "Compiling native Camera2 and MediaCodec capture with Zig cc"
+    ALLOW_UNUSED_PARAM
+    DEPENDS_LIST "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.h" "${CMAKE_CURRENT_SOURCE_DIR}/preview_frame.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_orientation.h")
 
-add_custom_command(
-    OUTPUT "${DS_GLUE_OBJECT}"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${DS_ZIG_OBJECT_DIR}"
-    COMMAND ${CMAKE_COMMAND} -E env "${DS_ZIG_ENV}"
-            ${DS_ZIG_EXECUTABLE} cc
-            -target ${DS_ZIG_TARGET}
-            --sysroot=${CMAKE_SYSROOT}
-            -isystem ${CMAKE_SYSROOT}/usr/include
-            -isystem ${CMAKE_SYSROOT}/usr/include/${DS_ANDROID_INCLUDE}
-            -I${ANDROID_NDK}/sources/android/native_app_glue
-            -std=c23 -O3 -Wall -Wextra -Wno-unused-parameter -Werror=deprecated-declarations -fPIC -ffunction-sections -fdata-sections -fstack-protector-strong
-            -DANDROID
-            -c "${DS_NATIVE_GLUE}"
-            -o "${DS_GLUE_OBJECT}"
-    DEPENDS "${DS_NATIVE_GLUE}" "${CMAKE_CURRENT_SOURCE_DIR}/jni_scope.h"
-            "${DS_ZIG_EXECUTABLE}"
-            "${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c"
-            "${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.h"
-    COMMENT "Compiling Android native glue with Zig cc (${DS_ZIG_TARGET})"
-    VERBATIM
-)
+ds_add_zig_c_object("${DS_MAIN_OBJECT}" "${CMAKE_CURRENT_SOURCE_DIR}/main.c"
+    "Compiling DeadSpeak C platform layer with Zig cc"
+    ALLOW_UNUSED_PARAM
+    EXTRA_INCLUDES "${ANDROID_NDK}/sources/android/native_app_glue"
+    DEPENDS_LIST "${CMAKE_CURRENT_SOURCE_DIR}/typography.h" "${CMAKE_CURRENT_SOURCE_DIR}/voice_player.h" "${CMAKE_CURRENT_SOURCE_DIR}/voice_synth.h" "${CMAKE_CURRENT_SOURCE_DIR}/motion_filter.h" "${CMAKE_CURRENT_SOURCE_DIR}/field_baseline.h" "${CMAKE_CURRENT_SOURCE_DIR}/camera_ui.h" "${CMAKE_CURRENT_SOURCE_DIR}/custom_words.h" "${CMAKE_CURRENT_SOURCE_DIR}/sensor_state.h" "${CMAKE_CURRENT_SOURCE_DIR}/engine.h" "${CMAKE_CURRENT_SOURCE_DIR}/explore.h" "${CMAKE_CURRENT_SOURCE_DIR}/jni_scope.h" "${CMAKE_CURRENT_SOURCE_DIR}/ui_layout.h" "${CMAKE_CURRENT_SOURCE_DIR}/video_capture.h")
+
+ds_add_zig_c_object("${DS_GLUE_OBJECT}" "${DS_NATIVE_GLUE}"
+    "Compiling Android native glue with Zig cc"
+    ALLOW_UNUSED_PARAM
+    EXTRA_INCLUDES "${ANDROID_NDK}/sources/android/native_app_glue"
+    DEPENDS_LIST "${CMAKE_CURRENT_SOURCE_DIR}/jni_scope.h" "${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c" "${ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.h")
 
 add_custom_target(ds_c_objects DEPENDS "${DS_MAIN_OBJECT}" "${DS_GLUE_OBJECT}" "${DS_VIDEO_OBJECT}" "${DS_EXPLORE_OBJECT}" "${DS_CUSTOM_WORDS_OBJECT}" "${DS_VOICE_OBJECT}" "${DS_VOICE_PLAYER_OBJECT}")
 set_source_files_properties("${DS_MAIN_OBJECT}" "${DS_GLUE_OBJECT}" "${DS_VIDEO_OBJECT}" "${DS_EXPLORE_OBJECT}" "${DS_CUSTOM_WORDS_OBJECT}" "${DS_VOICE_OBJECT}" "${DS_VOICE_PLAYER_OBJECT}" PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)

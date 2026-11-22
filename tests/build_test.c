@@ -82,9 +82,11 @@ int main(void) {
     test_cert = X509_new();
     assert(test_cert && X509_set_version(test_cert, 2) == 1 && X509_set_pubkey(test_cert, test_key) == 1 &&
         X509_gmtime_adj(X509_getm_notBefore(test_cert), 0) && X509_gmtime_adj(X509_getm_notAfter(test_cert), 86400));
-    X509_NAME *name = X509_get_subject_name(test_cert);
-    assert(X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, BAD_CAST "Native build test", -1, -1, 0) == 1 &&
-        X509_set_issuer_name(test_cert, name) == 1 && X509_sign(test_cert, test_key, EVP_sha256()) > 0);
+    X509_NAME *name = X509_NAME_new();
+    assert(name && X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC, BAD_CAST "Native build test", -1, -1, 0) == 1 &&
+        X509_set_subject_name(test_cert, name) == 1 && X509_set_issuer_name(test_cert, name) == 1 &&
+        X509_sign(test_cert, test_key, EVP_sha256()) > 0);
+    X509_NAME_free(name);
 
     directory(".signing");
     assert(write_identity_file(".signing/cert.pem", NULL, test_cert));

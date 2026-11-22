@@ -29,8 +29,9 @@ DeadSpeak is a native Android fieldwork and evidence-recording app for paranorma
   - `SEPIA`: Vintage tone map.
   - `RAW`: Unfiltered native sensor stream.
 - **Viewfinder Gestures & Minimal HUD**:
-  - Horizontal swipe across camera viewfinder to cycle through all 6 video shader filters.
+  - Horizontal swipe across camera viewfinder or tap the bottom-left filter label to cycle through all 6 video shader filters.
   - Single tap on camera viewport toggles Minimal HUD mode to maximize viewfinder area.
+  - Live camera HUD includes a 3-word rolling history feed, graduated EMF meter with analog needle and peak-hold indicator, and a flashing `EMF ALERT` banner during elevated spikes.
 - **HUD Theme Modes & 7-Color Gradient Tint**:
   - `#ORIGINAL`: Classic 12-segment stacked hardware LED equalizer blocks with authentic tri-zone hardware color grading (Rows 0..7 Mint Green, Rows 8..9 Amber Warning, Rows 10..11 Red Peak) and live rolling phosphor-green oscilloscope trace.
   - `ABDUCTION`: Neon bio-luminescent alien curved waveform visualizer.

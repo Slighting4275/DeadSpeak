@@ -17,6 +17,6 @@ if [ -n "$zig_library_dir" ]; then
 fi
 mkdir -p build/host || exit 1
 # shellcheck disable=SC2046
-zig cc -std=c23 -O2 -Wall -Wextra -Werror -fPIE -pie -fstack-protector-strong tools/build.c \
+zig cc -std=c23 -O2 -Wall -Wextra -Werror -fPIE -pie -fstack-protector-strong -Wl,-z,relro,-z,now tools/build.c \
     $(pkg-config --cflags --libs libarchive openssl libxml-2.0) -o build/host/deadspeak-build || exit 1
 exec build/host/deadspeak-build "$@"

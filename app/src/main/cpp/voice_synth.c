@@ -27,9 +27,9 @@ typedef struct {
     float a1, a2;
 } DSResonator;
 
-static void resonator_init(DSResonator *r, float freq, float bw, float sample_rate) {
+static void resonator_set_coeffs(DSResonator *r, float freq, float bw, float sample_rate) {
     if (freq <= 0.0f || bw <= 0.0f || freq >= sample_rate * 0.48f) {
-        memset(r, 0, sizeof(*r));
+        r->b0 = r->b1 = r->b2 = r->a1 = r->a2 = 0.0f;
         return;
     }
     const float c = -expf(-2.0f * (float)M_PI * bw / sample_rate);
@@ -40,7 +40,11 @@ static void resonator_init(DSResonator *r, float freq, float bw, float sample_ra
     r->b2 = 0.0f;
     r->a1 = -b;
     r->a2 = -c;
+}
+
+static void resonator_init(DSResonator *r, float freq, float bw, float sample_rate) {
     r->x1 = r->x2 = r->y1 = r->y2 = 0.0f;
+    resonator_set_coeffs(r, freq, bw, sample_rate);
 }
 
 static inline float resonator_process(DSResonator *r, float in) {
@@ -54,6 +58,11 @@ static uint32_t rng_state = 0x12345678;
 static inline float next_noise(void) {
     rng_state = rng_state * 1664525u + 1013904223u;
     return ((float)(int32_t)rng_state / 2147483648.0f);
+}
+
+static inline float next_unit_random(void) {
+    const float u = next_noise() * 0.5f + 0.5f;
+    return u < 0.0f ? 0.0f : (u > 1.0f ? 1.0f : u);
 }
 
 static DSPhoneme get_phoneme_for_char(char c) {
@@ -261,8 +270,8 @@ size_t ds_voice_synthesize(const char *text, const DSVoiceConfig *config,
 
     /* Dynamic Voice Mode: per-word stochastic perturbation of playback speed [0.80, 1.10] and pitch [0.50, 1.30] */
     if (mode == DS_VOICE_MODE_DYNAMIC) {
-        const float rnd_speed = ((float)(rand() % 1000) / 1000.0f) * 0.30f + 0.80f;
-        const float rnd_pitch = ((float)(rand() % 1000) / 1000.0f) * 0.80f + 0.50f;
+        const float rnd_speed = next_unit_random() * 0.30f + 0.80f;
+        const float rnd_pitch = next_unit_random() * 0.80f + 0.50f;
         speed_mult *= rnd_speed;
         base_pitch *= rnd_pitch;
     }
@@ -318,6 +327,16 @@ size_t ds_voice_synthesize(const char *text, const DSVoiceConfig *config,
 
         for (size_t s = 0; s < num_samples && out_index < max_samples; ++s) {
             const float progress = (float)s / (float)num_samples;
+
+            /* Spirit Box mode: swept formant modulation every 16 samples without resetting resonator state */
+            if (mode == DS_VOICE_MODE_SPIRIT_BOX && (s & 15U) == 0U) {
+                const float sweep_phase = 2.0f * (float)M_PI * (3.5f * (float)out_index / sample_rate + progress * 0.75f);
+                const float sweep1 = sinf(sweep_phase);
+                const float sweep2 = cosf(sweep_phase * 1.3f);
+                resonator_set_coeffs(&r1, phoneme.f1 * (1.0f + 0.18f * sweep1), phoneme.bw1 * 1.15f, sample_rate);
+                resonator_set_coeffs(&r2, phoneme.f2 * (1.0f + 0.25f * sweep2), phoneme.bw2 * 1.15f, sample_rate);
+                resonator_set_coeffs(&r3, phoneme.f3 * (1.0f + 0.15f * sweep1), phoneme.bw3, sample_rate);
+            }
 
             /* Smooth Attack-Decay envelope */
             float env = 1.0f;

@@ -46,21 +46,13 @@ typedef struct {
     float triggered_y;
     float triggered_z;
     float triggered_delta;
-
-    /* Dynamic kinetic physical entropy pool derived from motion sensor permutation */
-    uint64_t kinetic_entropy;
-
-    /* Sub-microtesla fractional fluctuation acoustic modulation flag */
-    bool whisper_modulation;
 } DSFieldBaseline;
 
 static inline void ds_baseline_reset(DSFieldBaseline *baseline) {
     if (!baseline) return;
     const DSSensitivity sens = baseline->sensitivity;
-    const uint64_t kinetic = baseline->kinetic_entropy;
     *baseline = (DSFieldBaseline){0};
     baseline->sensitivity = sens;
-    baseline->kinetic_entropy = kinetic;
 }
 
 static inline int64_t ds_baseline_cooldown_ns(DSSensitivity sensitivity) {
@@ -110,21 +102,11 @@ static inline void ds_baseline_sample_3d(DSFieldBaseline *b, float x, float y, f
     const float threshold = ds_baseline_threshold(b->sensitivity);
     const float reset_threshold = threshold * 0.5f;
 
-    /* Device in motion suppresses any pending transient anomaly accumulation
-     * and seeds kinetic entropy via motion permutation */
+    /* Device in motion suppresses any pending transient anomaly accumulation */
     if (is_moving) {
         b->accumulating = false;
         b->peak_delta = 0.0f;
         b->peak_hold_count = 0;
-        uint32_t ux = 0, uy = 0, uz = 0;
-        memcpy(&ux, &x, sizeof(ux));
-        memcpy(&uy, &y, sizeof(uy));
-        memcpy(&uz, &z, sizeof(uz));
-        const uint64_t bits = (uint64_t)ux ^
-                              (((uint64_t)uy) << 16) ^
-                              (((uint64_t)uz) << 32) ^
-                              (uint64_t)now_ns;
-        b->kinetic_entropy = (b->kinetic_entropy ^ bits) * UINT64_C(6364136223846793005) + UINT64_C(1442695040888963407);
     }
 
     /* Adaptive baseline tracking: when device is stationary and environmental field is calm,
@@ -188,11 +170,6 @@ static inline bool ds_baseline_word_trigger_3d(DSFieldBaseline *b, float x, floa
             b->triggered_delta = b->peak_delta;
             b->last_word_ns = now_ns;
 
-            /* Sub-microtesla fractional fluctuation extraction for whisper modulation */
-            const float frac_part = b->peak_delta - floorf(b->peak_delta);
-            const uint32_t frac_digits = (uint32_t)(frac_part * 100000.0f);
-            b->whisper_modulation = ((frac_digits % 10) < 5);
-
             b->armed = false; /* Disarm: prevents continuous word repeats during sustained magnetic interference */
             b->accumulating = false;
             b->peak_delta = 0.0f;
@@ -210,14 +187,6 @@ static inline bool ds_baseline_word_trigger_3d(DSFieldBaseline *b, float x, floa
         }
     }
     return false;
-}
-
-static inline void ds_baseline_sample(DSFieldBaseline *b, float field) {
-    ds_baseline_sample_3d(b, field, 0.0f, 0.0f, false, 0);
-}
-
-static inline bool ds_baseline_word_trigger(DSFieldBaseline *b, float field, int64_t timestamp_ns) {
-    return ds_baseline_word_trigger_3d(b, field, 0.0f, 0.0f, false, timestamp_ns);
 }
 
 #endif

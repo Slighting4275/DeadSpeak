@@ -39,10 +39,18 @@ int main(void) {
     size_t dynamic_count = ds_voice_synthesize("DEMON", &config, pcm, DS_VOICE_MAX_SAMPLES);
     assert(dynamic_count > 1000);
 
-    /* Test 4: Spirit Box mode */
+    /* Test 4: Spirit Box mode (with swept formant modulation) */
+    int16_t classic_pcm[DS_VOICE_MAX_SAMPLES];
+    config.mode = DS_VOICE_MODE_CLASSIC;
+    size_t classic_ref_count = ds_voice_synthesize("GHOST", &config, classic_pcm, DS_VOICE_MAX_SAMPLES);
     config.mode = DS_VOICE_MODE_SPIRIT_BOX;
     size_t spirit_count = ds_voice_synthesize("GHOST", &config, pcm, DS_VOICE_MAX_SAMPLES);
-    assert(spirit_count > 1000);
+    assert(spirit_count > classic_ref_count && spirit_count > 1000);
+    size_t diff_samples = 0;
+    for (size_t i = 0; i < classic_ref_count; ++i) {
+        if (pcm[i] != classic_pcm[i]) ++diff_samples;
+    }
+    assert(diff_samples > 500);
 
     /* Test 5: Disabled config */
     config.enabled = false;
