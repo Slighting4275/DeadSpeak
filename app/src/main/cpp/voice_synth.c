@@ -224,7 +224,7 @@ static DSPhoneme get_next_phoneme(const char *text, size_t text_len, size_t *ind
     DSPhoneme p = {0};
     p.bw1 = 90.0f; p.bw2 = 110.0f; p.bw3 = 140.0f;
     p.gain1 = 1.0f; p.gain2 = 0.6f; p.gain3 = 0.3f;
-    p.duration_sec = 0.12f; p.voiced = true;
+    p.voiced = true;
 
     if (c0 == 'S' && c1 == 'H') {
         p.f1 = 300.0f; p.f2 = 2600.0f; p.f3 = 4800.0f;

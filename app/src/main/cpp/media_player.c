@@ -327,7 +327,8 @@ static void play_file_session(DSMediaPlayer *mp, const char *path) {
                     size_t acap = 0;
                     uint8_t *abuf = AMediaCodec_getOutputBuffer(adec, (size_t)ao, &acap);
                     if (abuf && ainfo.offset >= 0 && (size_t)(ainfo.offset + ainfo.size) <= acap) {
-                        const int32_t frames = ainfo.size / (int32_t)(sizeof(int16_t) * (size_t)(ch > 0 ? ch : 1));
+                        const size_t frame_bytes = sizeof(int16_t) * (size_t)(ch > 0 ? ch : 1);
+                        const int32_t frames = frame_bytes > 0 ? (int32_t)((size_t)ainfo.size / frame_bytes) : 0;
                         if (frames > 0) {
                             (void)AAudioStream_write(astream, abuf + ainfo.offset, frames, 20000000LL);
                         }
