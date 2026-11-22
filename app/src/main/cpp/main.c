@@ -2594,17 +2594,6 @@ static void draw_camera(DeadSpeak *state) {
     text_styled(state, primary_word, ui.word.x + 10, ui.word.y + 6, card_word_scale, DS_FONT_BOLD, word_r, word_g, word_b, 1);
     text_styled(state, sub_text, ui.word.x + 10, ui.word.y + 24, ds_fit_text_scale_styled(sub_text, ds_sp_to_scale(DS_FONT_SIZE_BADGE), ui.word.w - 20, DS_FONT_STANDARD), DS_FONT_STANDARD, 0.65f, 0.85f, 0.78f, 0.9f);
 
-    /* Framing reticle showing active MP4 export aspect crop */
-    if (preview_live) {
-        const DSRect frame = ds_camera_framing_rect((float)state->width, ui.navigation.y, state->video_aspect);
-        if (frame.w > 0.0f && frame.h > 0.0f) {
-            line(state, frame.x, frame.y, frame.x + frame.w, frame.y, accent.r, accent.g, accent.b, 0.35f);
-            line(state, frame.x, frame.y + frame.h, frame.x + frame.w, frame.y + frame.h, accent.r, accent.g, accent.b, 0.35f);
-            line(state, frame.x, frame.y, frame.x, frame.y + frame.h, accent.r, accent.g, accent.b, 0.35f);
-            line(state, frame.x + frame.w, frame.y, frame.x + frame.w, frame.y + frame.h, accent.r, accent.g, accent.b, 0.35f);
-        }
-    }
-
     /* 4. RECORD SHUTTER BUTTON */
     const float cx = ui.record.x + ui.record.w / 2, cy = ui.record.y + ui.record.h / 2;
     filled_circle(state, cx, cy, 30, 0.05f, 0.05f, 0.05f, 0.85f);
